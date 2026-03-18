@@ -1,0 +1,26 @@
+tools:
+  # Option A: REST API tool (default)
+  - class_name: "recipe.gui_agent.desktop_env_tool.DesktopEnvTool"
+    config:
+      type: native
+      api_base_url: ${oc.env:DESKTOP_API_BASE_URL,http://localhost:8000}
+      screen_width: 1000
+      screen_height: 1000
+      timeout: 30
+      step_reward: 0.0
+
+  # Option B: MCP tool (uncomment to use)
+  # - class_name: "recipe.gui_agent.mcp_desktop_env_tool.MCPDesktopEnvTool"
+  #   config:
+  #     type: native
+  #     allocator_base_url: ${oc.env:MCP_ALLOCATOR_URL}
+  #     allocator_env: "a4861800"
+  #     allocator_namespace: "Development"
+  #     expire_min: 60
+  #     auth_token: null
+  #     timeout: 30
+  #     reboot_max_retries: 12
+  #     reboot_retry_interval: 2.0
+  #     screen_width: 1000
+  #     screen_height: 1000
+  #     step_reward: 0.0

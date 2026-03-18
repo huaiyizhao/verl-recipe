@@ -1,0 +1,2 @@
+- name: gui_agent
+  _target_: recipe.gui_agent.gui_agent_loop.GUIAgentLoop
