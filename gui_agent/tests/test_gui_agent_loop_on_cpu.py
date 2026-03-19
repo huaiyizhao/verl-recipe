@@ -785,7 +785,7 @@ class TestMCPDesktopEnvTool:
             instance_id, response = await tool.create(
                 create_kwargs={
                     "task_id": "task-42",
-                    "ground_truth": {"seed": "s1", "qseed": "q1", "session": "sess1"},
+                    "ground_truth": {"seed": "s1", "qseed": "q1"},
                 }
             )
 
@@ -802,6 +802,9 @@ class TestMCPDesktopEnvTool:
         assert instance_id in tool._instances
         assert tool._instances[instance_id]["task_id"] == "task-42"
         assert tool._instances[instance_id]["ground_truth"]["seed"] == "s1"
+        # Session should be auto-generated
+        assert isinstance(tool._instances[instance_id]["ground_truth"]["session"], str)
+        assert len(tool._instances[instance_id]["ground_truth"]["session"]) > 0
 
     @pytest.mark.asyncio
     async def test_create_releases_on_reboot_failure(self):
@@ -938,7 +941,6 @@ class TestMCPDesktopEnvTool:
             "base_url": "http://mock-app",
             "seed": "s1",
             "qseed": "q1",
-            "session": "sess1",
         }
 
         # 1. CREATE
@@ -947,6 +949,10 @@ class TestMCPDesktopEnvTool:
                 create_kwargs={"task_id": "task-99", "ground_truth": ground_truth}
             )
         assert resp.image is not None
+        # Session should be auto-generated
+        stored_gt = tool._instances[instance_id]["ground_truth"]
+        assert isinstance(stored_gt["session"], str)
+        assert len(stored_gt["session"]) > 0
 
         # 2. EXECUTE (click)
         resp, reward, metrics = await tool.execute(
@@ -979,6 +985,387 @@ class TestMCPDesktopEnvTool:
         tool = self._make_mcp_tool()
         with pytest.raises(ValueError, match="Unknown instance_id"):
             await tool.execute("nonexistent", {"action": "left_click"})
+
+    @pytest.mark.asyncio
+    async def test_create_generates_session(self):
+        """create() should generate a session UUID and inject it into ground_truth."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        img = _make_image("green", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(
+                create_kwargs={
+                    "task_id": "task-1",
+                    "ground_truth": {"seed": "s1", "qseed": "q1"},
+                }
+            )
+
+        gt = tool._instances[instance_id]["ground_truth"]
+        assert "session" in gt
+        assert isinstance(gt["session"], str)
+        assert len(gt["session"]) > 0
+        # Original keys preserved
+        assert gt["seed"] == "s1"
+        assert gt["qseed"] == "q1"
+
+    @pytest.mark.asyncio
+    async def test_create_navigates_with_url_rewrite(self):
+        """create() should call browser_navigate with correct URL when url_rewrite is configured."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        img = _make_image("green", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        tool._address_client = mock_addr
+
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+
+        url_rewrite = {
+            "target": "http://localhost:3000/app",
+            "args": [
+                {"key": "seed", "param": "seed"},
+                {"key": "session", "param": "_session_"},
+                {"key": "mock_date", "param": "_mockdate_"},
+            ],
+        }
+
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(
+                create_kwargs={
+                    "task_id": "task-1",
+                    "ground_truth": {"seed": "abc", "mock_date": "2025-01-01"},
+                    "url_rewrite": url_rewrite,
+                }
+            )
+
+        # browser_navigate should have been called
+        mock_mcp.call_tool.assert_called_once()
+        call_args = mock_mcp.call_tool.call_args
+        assert call_args[0][0] == "browser_navigate"
+        nav_url = call_args[0][1]["url"]
+        assert "http://localhost:3000/app/?" in nav_url
+        assert "seed=abc" in nav_url
+        assert "_session_=" in nav_url
+        assert "_mockdate_=2025-01-01" in nav_url
+
+    @pytest.mark.asyncio
+    async def test_create_skips_navigation_without_url_rewrite(self):
+        """create() should not call browser_navigate when url_rewrite is absent."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        img = _make_image("green", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        tool._address_client = mock_addr
+
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(
+                create_kwargs={
+                    "task_id": "task-1",
+                    "ground_truth": {"seed": "s1"},
+                }
+            )
+
+        # browser_navigate should NOT have been called
+        mock_mcp.call_tool.assert_not_called()
+
+
+class TestBuildInitialUrl:
+    """Tests for the _build_initial_url helper function."""
+
+    def test_basic_url_construction(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        ground_truth = {"seed": "abc", "session": "sess-1", "mock_date": "2025-01-01"}
+        url_rewrite = {
+            "target": "http://localhost:3000/app",
+            "args": [
+                {"key": "seed", "param": "seed"},
+                {"key": "session", "param": "_session_"},
+                {"key": "mock_date", "param": "_mockdate_"},
+            ],
+        }
+        result = _build_initial_url(ground_truth, url_rewrite)
+        assert result == "http://localhost:3000/app/?seed=abc&_session_=sess-1&_mockdate_=2025-01-01"
+
+    def test_returns_none_without_url_rewrite(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        assert _build_initial_url({"seed": "abc"}, None) is None
+
+    def test_returns_none_without_target(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        assert _build_initial_url({"seed": "abc"}, {"args": []}) is None
+        assert _build_initial_url({"seed": "abc"}, {"target": "", "args": []}) is None
+
+    def test_skips_missing_ground_truth_keys(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        ground_truth = {"seed": "abc"}  # no session or mock_date
+        url_rewrite = {
+            "target": "http://localhost:3000/app",
+            "args": [
+                {"key": "seed", "param": "seed"},
+                {"key": "session", "param": "_session_"},
+            ],
+        }
+        result = _build_initial_url(ground_truth, url_rewrite)
+        assert result == "http://localhost:3000/app/?seed=abc"
+
+    def test_no_args_returns_bare_url(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        result = _build_initial_url({}, {"target": "http://localhost:3000/app", "args": []})
+        assert result == "http://localhost:3000/app/"
+
+    def test_trailing_slash_stripped_from_target(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        result = _build_initial_url(
+            {"seed": "x"}, {"target": "http://localhost:3000/app/", "args": [{"key": "seed", "param": "seed"}]}
+        )
+        assert result == "http://localhost:3000/app/?seed=x"
+
+    def test_real_meeting_data(self):
+        """Test with real production meeting booking data format."""
+        from recipe.gui_agent.mcp_desktop_env_tool import _build_initial_url
+
+        # Simulates ground_truth after session injection in create()
+        ground_truth = {
+            "base_url": "http://ns008-cu-meeting-svc",
+            "beg": "19:00",
+            "building_id": 436,
+            "building_name": "光启未来中心大厦A塔",
+            "city_name": "深圳",
+            "date": "大后天",
+            "end": "20:00",
+            "floor_id": 839,
+            "floor_name": "20",
+            "mock_date": "2026-03-19",
+            "people": "andyliu;",
+            "qseed": "974eb91672bb6db1",
+            "seed": "f41863987dbec585",
+            "title": "半年度客户沟通沟通",
+            "valid": True,
+            "session": "test-session-uuid",  # injected by create()
+        }
+        url_rewrite = {
+            "args": [
+                {"key": "seed", "param": "seed"},
+                {"key": "mock_date", "param": "_mockdate_"},
+                {"key": "session", "param": "_session_"},
+            ],
+            "source": "https://meeting.woa.com",
+            "target": "http://ns008-cu-meeting-svc",
+        }
+        result = _build_initial_url(ground_truth, url_rewrite)
+        assert result == (
+            "http://ns008-cu-meeting-svc/"
+            "?seed=f41863987dbec585&_mockdate_=2026-03-19&_session_=test-session-uuid"
+        )
+
+
+class TestMCPDesktopEnvToolRealData:
+    """End-to-end tests using real production data format (meeting booking)."""
+
+    def _make_mcp_tool(self):
+        from recipe.gui_agent.mcp_desktop_env_tool import MCPDesktopEnvTool
+
+        config = {
+            "allocator_base_url": "http://ns008-cu-manager-svc",
+            "allocator_env": "a4861800",
+            "allocator_namespace": "Development",
+            "expire_min": 60,
+            "screen_width": 1000,
+            "screen_height": 1000,
+            "timeout": 10,
+        }
+        MCPDesktopEnvTool._address_client = None
+        return MCPDesktopEnvTool(config=config)
+
+    @pytest.mark.asyncio
+    async def test_meeting_create_injects_session_and_navigates(self):
+        """Full create() flow with real meeting data: session injected, browser navigated."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        img = _make_image("green", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+
+        create_kwargs = {
+            "task_id": "meeting_f41863987dbec585_974eb91672bb6db1",
+            "ground_truth": {
+                "base_url": "http://ns008-cu-meeting-svc",
+                "beg": "19:00",
+                "building_id": 436,
+                "building_name": "光启未来中心大厦A塔",
+                "city_name": "深圳",
+                "date": "大后天",
+                "end": "20:00",
+                "floor_id": 839,
+                "floor_name": "20",
+                "mock_date": "2026-03-19",
+                "people": "andyliu;",
+                "qseed": "974eb91672bb6db1",
+                "seed": "f41863987dbec585",
+                "title": "半年度客户沟通沟通",
+                "valid": True,
+            },
+            "url_rewrite": {
+                "args": [
+                    {"key": "seed", "param": "seed"},
+                    {"key": "mock_date", "param": "_mockdate_"},
+                    {"key": "session", "param": "_session_"},
+                ],
+                "source": "https://meeting.woa.com",
+                "target": "http://ns008-cu-meeting-svc",
+            },
+        }
+
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(create_kwargs=create_kwargs)
+
+        # 1. Session should be auto-generated (UUID format)
+        gt = tool._instances[instance_id]["ground_truth"]
+        assert "session" in gt
+        session = gt["session"]
+        assert isinstance(session, str)
+        assert len(session) == 36  # UUID format: 8-4-4-4-12
+
+        # 2. Original ground_truth should NOT be mutated
+        assert "session" not in create_kwargs["ground_truth"]
+
+        # 3. browser_navigate should have been called with correct URL
+        mock_mcp.call_tool.assert_called_once()
+        call_args = mock_mcp.call_tool.call_args
+        assert call_args[0][0] == "browser_navigate"
+        nav_url = call_args[0][1]["url"]
+        assert nav_url == (
+            f"http://ns008-cu-meeting-svc/?seed=f41863987dbec585"
+            f"&_mockdate_=2026-03-19&_session_={session}"
+        )
+
+        # 4. Screenshot should be returned
+        assert resp.image is not None
+        assert len(resp.image) == 1
+
+    @pytest.mark.asyncio
+    async def test_meeting_full_lifecycle_with_reward(self):
+        """Full lifecycle: create → calc_reward with real meeting data.
+
+        Verifies that the auto-generated session flows through to the
+        validation API call in calc_reward().
+        """
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        img = _make_image("red", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+        mock_mcp.close = AsyncMock()
+
+        create_kwargs = {
+            "task_id": "meeting_f41863987dbec585_974eb91672bb6db1",
+            "ground_truth": {
+                "base_url": "http://ns008-cu-meeting-svc",
+                "mock_date": "2026-03-19",
+                "qseed": "974eb91672bb6db1",
+                "seed": "f41863987dbec585",
+            },
+            "url_rewrite": {
+                "args": [
+                    {"key": "seed", "param": "seed"},
+                    {"key": "mock_date", "param": "_mockdate_"},
+                    {"key": "session", "param": "_session_"},
+                ],
+                "target": "http://ns008-cu-meeting-svc",
+            },
+        }
+
+        # CREATE
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(create_kwargs=create_kwargs)
+
+        session = tool._instances[instance_id]["ground_truth"]["session"]
+
+        # CALC_REWARD — verify session is passed to the validation API
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._check_task", return_value={"score": 100, "reward": 1.0}) as mock_check, \
+             patch("recipe.gui_agent.mcp_desktop_env_tool._reset_task") as mock_reset:
+            reward = await tool.calc_reward(instance_id)
+
+        assert reward == 1.0
+        # Session should be the auto-generated one, not empty
+        mock_check.assert_called_once_with(
+            "http://ns008-cu-meeting-svc", "f41863987dbec585", "974eb91672bb6db1", session, "2026-03-19"
+        )
+        mock_reset.assert_called_once_with(
+            "http://ns008-cu-meeting-svc", "f41863987dbec585", "974eb91672bb6db1", session, "2026-03-19"
+        )
+
+        # RELEASE
+        await tool.release(instance_id)
+        assert instance_id not in tool._instances
 
 
 # ===========================================================================

@@ -53,6 +53,23 @@ def _to_base_url(address: str) -> str:
     return f"http://{address}"
 
 
+def _build_initial_url(ground_truth: dict, url_rewrite: dict | None) -> str | None:
+    """Build initial navigation URL from url_rewrite config, or None."""
+    if not url_rewrite:
+        return None
+    target = url_rewrite.get("target", "").rstrip("/")
+    if not target:
+        return None
+    params = []
+    for arg in url_rewrite.get("args", []):
+        key = arg.get("key", "")
+        param = arg.get("param", key)
+        value = ground_truth.get(key, "")
+        if value:
+            params.append(f"{param}={value}")
+    return f"{target}/?{'&'.join(params)}" if params else f"{target}/"
+
+
 def _base64_to_pil(data_uri: str) -> Image.Image:
     """Decode a base64 (or ``data:image/…;base64,…``) string to a PIL Image."""
     encoded = data_uri.split(",", 1)[1] if data_uri.startswith("data:") else data_uri
@@ -304,12 +321,22 @@ class MCPDesktopEnvTool(BaseTool):
         if not task_id:
             raise ValueError("create_kwargs must contain 'task_id'")
 
+        # Generate session and inject into ground_truth
+        ground_truth = dict(create_kwargs.get("ground_truth", {}))
+        ground_truth["session"] = str(uuid4())
+
         addr_client = self._address_client
         address = await addr_client.allocate(instance_id)
 
         try:
             await addr_client.reboot(address, self.reboot_max_retries, self.reboot_retry_interval, self.timeout)
             mcp = _MCPClient(_AddressClient.to_mcp_url(address), auth_token=self.auth_token)
+
+            # Navigate browser to initial URL if url_rewrite is configured
+            initial_url = _build_initial_url(ground_truth, create_kwargs.get("url_rewrite"))
+            if initial_url:
+                await mcp.call_tool("browser_navigate", {"url": initial_url})
+
             screenshot_b64 = await mcp.take_screenshot()
             if screenshot_b64 is None:
                 raise RuntimeError(f"Failed to take initial screenshot from {address}")
@@ -324,7 +351,7 @@ class MCPDesktopEnvTool(BaseTool):
             "address": address,
             "mcp_client": mcp,
             "task_id": task_id,
-            "ground_truth": create_kwargs.get("ground_truth", {}),
+            "ground_truth": ground_truth,
         }
         return instance_id, ToolResponse(image=[_base64_to_pil(screenshot_b64)])
 
