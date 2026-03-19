@@ -24,11 +24,8 @@ Tests:
 """
 
 import asyncio
-import copy
 import io
-import json
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
@@ -664,13 +661,6 @@ class TestFatalErrorHandling:
 class TestMCPDesktopEnvTool:
     """Tests for MCPDesktopEnvTool with fully mocked MCP dependencies."""
 
-    _mock_modules = {
-        "cua": MagicMock(),
-        "cua.galileo": MagicMock(),
-        "cua.galileo.tools": MagicMock(),
-        "cua.galileo.tools.utils": MagicMock(),
-    }
-
     def _make_mcp_tool(self):
         """Create an MCPDesktopEnvTool instance."""
         from recipe.gui_agent.mcp_desktop_env_tool import MCPDesktopEnvTool
@@ -690,40 +680,305 @@ class TestMCPDesktopEnvTool:
 
     def test_tool_schema(self):
         """MCPDesktopEnvTool should have computer_use schema."""
-        with patch.dict("sys.modules", self._mock_modules):
-            tool = self._make_mcp_tool()
-            schema = tool.get_openai_tool_schema()
-            assert schema.function.name == "computer_use"
-            assert "1000x1000" in schema.function.description
+        tool = self._make_mcp_tool()
+        schema = tool.get_openai_tool_schema()
+        assert schema.function.name == "computer_use"
+        assert "1000x1000" in schema.function.description
 
     def test_step_reward_config(self):
         """MCPDesktopEnvTool should respect step_reward config."""
-        with patch.dict("sys.modules", self._mock_modules):
-            tool = self._make_mcp_tool()
-            assert tool.step_reward == 0.1
+        tool = self._make_mcp_tool()
+        assert tool.step_reward == 0.1
 
     @pytest.mark.asyncio
     async def test_calc_reward_unknown_instance(self):
         """calc_reward for unknown instance returns 0.0."""
-        with patch.dict("sys.modules", self._mock_modules):
-            tool = self._make_mcp_tool()
-            reward = await tool.calc_reward("nonexistent")
-            assert reward == 0.0
+        tool = self._make_mcp_tool()
+        reward = await tool.calc_reward("nonexistent")
+        assert reward == 0.0
 
     @pytest.mark.asyncio
     async def test_release_unknown_instance(self):
         """release for unknown instance is a no-op."""
-        with patch.dict("sys.modules", self._mock_modules):
-            tool = self._make_mcp_tool()
-            await tool.release("nonexistent")
+        tool = self._make_mcp_tool()
+        await tool.release("nonexistent")
 
     @pytest.mark.asyncio
     async def test_create_missing_task_id_raises(self):
         """create() without task_id should raise ValueError."""
-        with patch.dict("sys.modules", self._mock_modules):
-            tool = self._make_mcp_tool()
-            with pytest.raises(ValueError, match="task_id"):
-                await tool.create(create_kwargs={})
+        tool = self._make_mcp_tool()
+        with pytest.raises(ValueError, match="task_id"):
+            await tool.create(create_kwargs={})
+
+    @pytest.mark.asyncio
+    async def test_calc_reward_missing_ground_truth_keys(self):
+        """calc_reward returns 0.0 when ground_truth lacks required keys."""
+        tool = self._make_mcp_tool()
+        tool._instances["inst-1"] = {
+            "ground_truth": {"seed": "abc"},  # missing qseed, session
+        }
+        reward = await tool.calc_reward("inst-1")
+        assert reward == 0.0
+
+    @pytest.mark.asyncio
+    async def test_calc_reward_calls_validation_api(self):
+        """calc_reward should call check_task and return the reward."""
+        tool = self._make_mcp_tool()
+        tool._instances["inst-1"] = {
+            "ground_truth": {
+                "base_url": "http://mock",
+                "seed": "s1",
+                "qseed": "q1",
+                "session": "sess1",
+                "mock_date": "2025-01-01",
+            },
+        }
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._check_task", return_value={"score": 75, "reward": 0.75}) as mock_check, \
+             patch("recipe.gui_agent.mcp_desktop_env_tool._reset_task") as mock_reset:
+            reward = await tool.calc_reward("inst-1")
+
+        assert reward == 0.75
+        mock_check.assert_called_once_with("http://mock", "s1", "q1", "sess1", "2025-01-01")
+        mock_reset.assert_called_once_with("http://mock", "s1", "q1", "sess1", "2025-01-01")
+
+    @pytest.mark.asyncio
+    async def test_release_always_releases_address(self):
+        """release should release the address even if mcp_client.close() fails."""
+        tool = self._make_mcp_tool()
+        mock_client = AsyncMock()
+        mock_client.close.side_effect = RuntimeError("close failed")
+        tool._instances["inst-1"] = {"mcp_client": mock_client}
+        tool._address_client = AsyncMock()
+
+        await tool.release("inst-1")
+
+        mock_client.close.assert_called_once()
+        tool._address_client.release.assert_called_once_with("inst-1")
+
+    @pytest.mark.asyncio
+    async def test_create_full_lifecycle(self):
+        """create() should allocate, reboot, screenshot, and register instance."""
+        import base64
+
+        from recipe.gui_agent.mcp_desktop_env_tool import MCPDesktopEnvTool
+
+        tool = self._make_mcp_tool()
+
+        # Build a valid base64 screenshot
+        img = _make_image("green", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        # Mock address client
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        # Mock _MCPClient construction and take_screenshot
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, response = await tool.create(
+                create_kwargs={
+                    "task_id": "task-42",
+                    "ground_truth": {"seed": "s1", "qseed": "q1", "session": "sess1"},
+                }
+            )
+
+        # Verify address allocation & reboot
+        mock_addr.allocate.assert_called_once_with(instance_id)
+        mock_addr.reboot.assert_called_once()
+
+        # Verify response has screenshot
+        assert response.image is not None
+        assert len(response.image) == 1
+        assert isinstance(response.image[0], Image.Image)
+
+        # Verify instance registered
+        assert instance_id in tool._instances
+        assert tool._instances[instance_id]["task_id"] == "task-42"
+        assert tool._instances[instance_id]["ground_truth"]["seed"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_create_releases_on_reboot_failure(self):
+        """If reboot fails, the address should be released."""
+        tool = self._make_mcp_tool()
+
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock(side_effect=TimeoutError("reboot failed"))
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        with pytest.raises(TimeoutError, match="reboot failed"):
+            await tool.create(create_kwargs={"task_id": "task-1"})
+
+        mock_addr.release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_click_action(self):
+        """execute() should call computer_use via MCP and return screenshot."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        # Build a screenshot response
+        img = _make_image("blue", (50, 50))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        mock_mcp = AsyncMock()
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+
+        tool._instances["inst-1"] = {
+            "address": "10.0.0.1:5000",
+            "mcp_client": mock_mcp,
+            "task_id": "task-1",
+            "ground_truth": {},
+        }
+
+        response, reward, metrics = await tool.execute(
+            "inst-1", {"action": "left_click", "coordinate": [500, 300]}
+        )
+
+        # Verify MCP call
+        mock_mcp.call_tool.assert_called_once_with(
+            "computer_use", {"action": "left_click", "coordinate": [500, 300]}
+        )
+        # Verify screenshot taken
+        mock_mcp.take_screenshot.assert_called_once()
+
+        # Verify response
+        assert response.image is not None
+        assert len(response.image) == 1
+        assert "left_click" in response.text
+        assert "[500, 300]" in response.text
+        assert reward == 0.1  # step_reward from config
+        assert metrics["action"] == "left_click"
+
+    @pytest.mark.asyncio
+    async def test_execute_terminate_action(self):
+        """execute() with terminate should return text only, no MCP call."""
+        tool = self._make_mcp_tool()
+
+        mock_mcp = AsyncMock()
+        tool._instances["inst-1"] = {
+            "address": "10.0.0.1:5000",
+            "mcp_client": mock_mcp,
+            "task_id": "task-1",
+            "ground_truth": {},
+        }
+
+        response, reward, metrics = await tool.execute(
+            "inst-1", {"action": "terminate", "status": "success"}
+        )
+
+        assert "terminated" in response.text.lower()
+        assert reward == 0.0
+        mock_mcp.call_tool.assert_not_called()
+        mock_mcp.take_screenshot.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_screenshot_unavailable(self):
+        """execute() should handle screenshot failure gracefully."""
+        tool = self._make_mcp_tool()
+
+        mock_mcp = AsyncMock()
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+        mock_mcp.take_screenshot = AsyncMock(return_value=None)  # screenshot fails
+
+        tool._instances["inst-1"] = {
+            "address": "10.0.0.1:5000",
+            "mcp_client": mock_mcp,
+            "task_id": "task-1",
+            "ground_truth": {},
+        }
+
+        response, reward, metrics = await tool.execute(
+            "inst-1", {"action": "scroll", "coordinate": [500, 300], "direction": "down", "amount": 3}
+        )
+
+        assert response.image is None
+        assert "screenshot unavailable" in response.text
+        assert reward == 0.1  # step_reward still returned
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle_create_execute_reward_release(self):
+        """End-to-end: create → execute → calc_reward → release."""
+        import base64
+
+        tool = self._make_mcp_tool()
+
+        # Screenshot data
+        img = _make_image("red", (100, 100))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_screenshot = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+        # Mock address client
+        mock_addr = AsyncMock()
+        mock_addr.allocate = AsyncMock(return_value="10.0.0.1:5000")
+        mock_addr.reboot = AsyncMock()
+        mock_addr.release = AsyncMock()
+        tool._address_client = mock_addr
+
+        # Mock MCP client
+        mock_mcp = AsyncMock()
+        mock_mcp.take_screenshot = AsyncMock(return_value=b64_screenshot)
+        mock_mcp.call_tool = AsyncMock(return_value=None)
+        mock_mcp.close = AsyncMock()
+
+        ground_truth = {
+            "base_url": "http://mock-app",
+            "seed": "s1",
+            "qseed": "q1",
+            "session": "sess1",
+        }
+
+        # 1. CREATE
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._MCPClient", return_value=mock_mcp):
+            instance_id, resp = await tool.create(
+                create_kwargs={"task_id": "task-99", "ground_truth": ground_truth}
+            )
+        assert resp.image is not None
+
+        # 2. EXECUTE (click)
+        resp, reward, metrics = await tool.execute(
+            instance_id, {"action": "left_click", "coordinate": [100, 200]}
+        )
+        assert resp.image is not None
+        assert reward == 0.1
+
+        # 3. EXECUTE (terminate)
+        resp, reward, metrics = await tool.execute(
+            instance_id, {"action": "terminate", "status": "success"}
+        )
+        assert reward == 0.0
+
+        # 4. CALC_REWARD
+        with patch("recipe.gui_agent.mcp_desktop_env_tool._check_task", return_value={"score": 100, "reward": 1.0}), \
+             patch("recipe.gui_agent.mcp_desktop_env_tool._reset_task"):
+            reward = await tool.calc_reward(instance_id)
+        assert reward == 1.0
+
+        # 5. RELEASE
+        await tool.release(instance_id)
+        mock_mcp.close.assert_called_once()
+        mock_addr.release.assert_called_once_with(instance_id)
+        assert instance_id not in tool._instances
+
+    @pytest.mark.asyncio
+    async def test_execute_unknown_instance_raises(self):
+        """execute() with unknown instance_id should raise ValueError."""
+        tool = self._make_mcp_tool()
+        with pytest.raises(ValueError, match="Unknown instance_id"):
+            await tool.execute("nonexistent", {"action": "left_click"})
 
 
 # ===========================================================================
@@ -736,48 +991,31 @@ class TestBase64ToPil:
 
     def test_raw_base64(self):
         """Should decode raw base64 string to PIL Image."""
-        import sys
+        import base64
 
-        with patch.dict("sys.modules", {
-            "cua": MagicMock(),
-            "cua.galileo": MagicMock(),
-            "cua.galileo.tools": MagicMock(),
-            "cua.galileo.tools.utils": MagicMock(),
-        }):
-            from recipe.gui_agent.mcp_desktop_env_tool import _base64_to_pil
+        from recipe.gui_agent.mcp_desktop_env_tool import _base64_to_pil
 
-            # Create a small image and encode it
-            import base64
+        img = _make_image("red", (5, 5))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-            img = _make_image("red", (5, 5))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-            result = _base64_to_pil(b64)
-            assert isinstance(result, Image.Image)
-            assert result.size == (5, 5)
+        result = _base64_to_pil(b64)
+        assert isinstance(result, Image.Image)
+        assert result.size == (5, 5)
 
     def test_data_uri(self):
         """Should decode data URI formatted base64 to PIL Image."""
-        import sys
+        import base64
 
-        with patch.dict("sys.modules", {
-            "cua": MagicMock(),
-            "cua.galileo": MagicMock(),
-            "cua.galileo.tools": MagicMock(),
-            "cua.galileo.tools.utils": MagicMock(),
-        }):
-            from recipe.gui_agent.mcp_desktop_env_tool import _base64_to_pil
+        from recipe.gui_agent.mcp_desktop_env_tool import _base64_to_pil
 
-            import base64
+        img = _make_image("blue", (8, 8))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_uri = f"data:image/png;base64,{b64}"
 
-            img = _make_image("blue", (8, 8))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            data_uri = f"data:image/png;base64,{b64}"
-
-            result = _base64_to_pil(data_uri)
-            assert isinstance(result, Image.Image)
-            assert result.size == (8, 8)
+        result = _base64_to_pil(data_uri)
+        assert isinstance(result, Image.Image)
+        assert result.size == (8, 8)
