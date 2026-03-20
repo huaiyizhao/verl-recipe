@@ -69,7 +69,6 @@ from verl.experimental.agent_loop.agent_loop import (
 from recipe.gui_agent.context_manager import (
     BaseContextStrategy,
     KeepLastKImagesStrategy,
-    SlidingWindowStrategy,
     keep_last_k_images,
 )
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
@@ -114,24 +113,11 @@ class GUIAgentLoop(AgentLoopBase):
         # Config: multi_turn settings
         self.max_turns = self.rollout_config.multi_turn.max_assistant_turns or 20
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
-        self.keep_last_k = getattr(self.rollout_config.multi_turn, "keep_last_k_images", 3)
+        self.keep_last_k = 3  # default, can be overridden per-task from data
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
-
-        # --- Context strategy ---
-        strategy_name = getattr(self.rollout_config.multi_turn, "context_strategy", "keep_last_k")
-        if strategy_name == "sliding_window":
-            max_conv = getattr(self.rollout_config.multi_turn, "max_conversation_rounds", 10)
-            max_img = getattr(self.rollout_config.multi_turn, "max_image_rounds", 5)
-            self.context_strategy: BaseContextStrategy = SlidingWindowStrategy(
-                max_conversation_rounds=max_conv,
-                max_image_rounds=max_img,
-            )
-        else:
-            # Default: keep_last_k
-            self.context_strategy = KeepLastKImagesStrategy(k=self.keep_last_k)
 
         # Initialize tool(s) from config
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -169,9 +155,13 @@ class GUIAgentLoop(AgentLoopBase):
         metrics: dict[str, Any] = {}
         trajectories: list[AgentLoopOutput] = []
 
-        # --- Create env and get initial screenshot ---
+        # --- Build context strategy from per-task data ---
         desktop_kwargs = tools_kwargs.get("computer_use", {})
         create_kwargs = desktop_kwargs.get("create_kwargs", {})
+        keep_last_k = create_kwargs.get("keep_last_k_images", self.keep_last_k)
+        context_strategy: BaseContextStrategy = KeepLastKImagesStrategy(k=keep_last_k)
+
+        # --- Create env and get initial screenshot ---
         create_kwargs.setdefault("task_id", task_id)
 
         instance_id, initial_response = await self.desktop_tool.create(
@@ -205,7 +195,7 @@ class GUIAgentLoop(AgentLoopBase):
                 turn += 1
 
                 # 1. Prune old images using the pluggable context strategy
-                messages, image_data = self.context_strategy.prepare_context(messages, image_data)
+                messages, image_data = context_strategy.prepare_context(messages, image_data)
 
                 # 2. Tokenize prompt for THIS turn
                 prompt_ids = await self.apply_chat_template(

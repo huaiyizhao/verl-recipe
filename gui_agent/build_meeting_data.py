@@ -11,7 +11,7 @@ Usage:
         --address_base_url http://your-mcp-manager
 
     python -m recipe.gui_agent.build_meeting_data \
-        --max_count 256 --local_save_dir ~/data/meeting
+        --max_count 256 --split train --local_save_dir /efs/data/cua/rl
 """
 
 import argparse
@@ -141,6 +141,7 @@ def _build_dataset_sample(
     sample: dict,
     base_url: str,
     address_config: dict,
+    split: str = "train",
 ) -> dict:
     """Convert a raw API sample to the verl dataset schema.
 
@@ -158,6 +159,7 @@ def _build_dataset_sample(
     create_kwargs = {
         "ground_truth": gt,
         "address_config": address_config,
+        "keep_last_k_images": 3,
         "url_rewrite": {
             "source": DEFAULT_SOURCE_URL,
             "target": base_url,
@@ -188,7 +190,7 @@ def _build_dataset_sample(
         },
         # --- extra_info: consumed by RLHFDataset + GUIAgentLoop ---
         "extra_info": {
-            "split": "train",
+            "split": split,
             "index": idx,
             "task_id": f"meeting_{gt['seed']}_{gt['qseed']}",
             "question": query,
@@ -218,7 +220,9 @@ if __name__ == "__main__":
     parser.add_argument("--address_expire_min", type=int, default=60)
     parser.add_argument("--address_retry_interval", type=float, default=1.0)
     parser.add_argument("--address_max_retries", type=int, default=60)
-    parser.add_argument("--local_save_dir", default="~/data/meeting")
+    parser.add_argument("--local_save_dir", default="/efs/data/cua/rl")
+    parser.add_argument("--split", default="train", choices=["train", "test"],
+                        help="Dataset split name (train or test)")
     parser.add_argument("--max_count", type=int, default=128)
     parser.add_argument("--concurrency", type=int, default=32)
     args = parser.parse_args()
@@ -246,12 +250,12 @@ if __name__ == "__main__":
     }
 
     dataset_samples = [
-        _build_dataset_sample(i, s, args.base_url, address_config)
+        _build_dataset_sample(i, s, args.base_url, address_config, split=args.split)
         for i, s in enumerate(valid_samples)
     ]
     dataset = datasets.Dataset.from_list(dataset_samples)
 
-    output_path = os.path.join(save_dir, "train.parquet")
+    output_path = os.path.join(save_dir, f"{args.split}.parquet")
     dataset.to_parquet(output_path)
     print(f"\nDataset saved to: {output_path}")
     print(f"Total samples: {len(dataset_samples)}")

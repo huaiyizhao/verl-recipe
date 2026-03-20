@@ -44,8 +44,8 @@ DATA_ROOT=${DATA_ROOT:-$PWD}
 
 model_path=${model_path:-Qwen/Qwen2.5-VL-3B-Instruct}
 
-train_files=${train_files:-$DATA_ROOT/data/gui_agent/train.parquet}
-test_files=${test_files:-$DATA_ROOT/data/gui_agent/test.parquet}
+train_files=${train_files:-/efs/data/cua/rl/train.parquet}
+test_files=${test_files:-/efs/data/cua/rl/test.parquet}
 
 # Desktop env pool
 export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://localhost:8000}
@@ -114,7 +114,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
-    actor_rollout_ref.rollout.multi_turn.keep_last_k_images=3 \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
