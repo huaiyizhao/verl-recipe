@@ -205,6 +205,8 @@ class GUIAgentLoop(AgentLoopBase):
                 messages, image_data = context_strategy.prepare_context(messages, image_data)
 
                 # 2. Tokenize prompt for THIS turn
+                if turn == 1:
+                    logger.info("[GUI-%s] tool_schemas=%s", task_id, json.dumps(self.tool_schemas, indent=2, ensure_ascii=False)[:2000])
                 prompt_ids = await self.apply_chat_template(
                     messages,
                     tools=self.tool_schemas,
