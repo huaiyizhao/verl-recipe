@@ -68,9 +68,9 @@ max_prompt_length=16384
 max_response_length=2048
 actor_lr=1e-6
 
-train_batch_size=8
-ppo_mini_batch_size=4
-n_resp_per_prompt=1
+train_batch_size=2
+ppo_mini_batch_size=2
+n_resp_per_prompt=2
 n_resp_per_prompt_val=1
 
 # ================= performance =================
@@ -119,6 +119,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger='["console","wandb"]' \
+    actor_rollout_ref.rollout.trace.backend=weave
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \

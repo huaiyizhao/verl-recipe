@@ -107,7 +107,6 @@ class _AddressClient:
             return self._mapping[instance_id]
 
         payload = {"env": self.env, "namespace": self.namespace, "expire_min": self.expire_min}
-        logger.info("Allocating address for %s: POST %s/mcp-assign payload=%s", instance_id, self.base_url, payload)
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with aiohttp.ClientSession() as session:
@@ -117,20 +116,16 @@ class _AddressClient:
                             address = data.get("address") if isinstance(data, dict) else None
                             if address:
                                 self._mapping[instance_id] = address
-                                logger.info("Allocated %s -> %s (attempt %s)", address, instance_id, attempt)
+                                logger.info("Allocated %s -> %s", address, instance_id)
                                 return address
-                            logger.warning(
-                                "Allocate: no address in response (attempt %s/%s): %s",
-                                attempt, self.max_retries, data,
-                            )
                         else:
                             body = await resp.text()
                             logger.warning(
-                                "Allocate: HTTP %s (attempt %s/%s) url=%s body=%s",
-                                resp.status, attempt, self.max_retries, self.base_url, body[:200],
+                                "Allocate: HTTP %s (attempt %s/%s): %s",
+                                resp.status, attempt, self.max_retries, body[:200],
                             )
             except Exception as exc:
-                logger.warning("Allocate error (attempt %s/%s) url=%s: %s", attempt, self.max_retries, self.base_url, exc)
+                logger.warning("Allocate error (attempt %s/%s): %s", attempt, self.max_retries, exc)
             await asyncio.sleep(self.retry_interval)
 
         raise RuntimeError(f"Failed to allocate address for {instance_id} after {self.max_retries} attempts")
@@ -142,7 +137,8 @@ class _AddressClient:
 
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{base}/instruction/reboot", json={}, timeout=to) as resp:
-                logger.info("Reboot %s -> HTTP %s", address, resp.status)
+                if resp.status != 200:
+                    logger.warning("Reboot %s -> HTTP %s", address, resp.status)
 
         await asyncio.sleep(5)  # wait for reboot to begin
 
@@ -151,8 +147,6 @@ class _AddressClient:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"{base}/instruction/status", timeout=to) as resp:
                         if resp.status == 200:
-                            logger.info("Node %s back online", address)
-                            await asyncio.sleep(2)
                             return
             except Exception as exc:
                 logger.debug("Waiting for %s (%s/%s): %s", address, attempt, max_retries, exc)
@@ -254,19 +248,16 @@ class _MCPClient:
 def _check_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 15) -> dict[str, Any]:
     """``GET <base_url>/api/__task__?…&check=true`` → ``{"score": int, "reward": float}``."""
     url = f"{base_url}/api/__task__?seed={seed}&qseed={qseed}&_session_={session}&_mockdate_={mock_date}&check=true"
-    logger.info("_check_task: GET %s", url)
     try:
         resp = requests.get(url, timeout=timeout, verify=False)
         resp.raise_for_status()
         data = resp.json()
-        logger.info("_check_task response: %s", str(data)[:500])
         if data.get("code") != 0:
-            logger.warning("Validation API code=%s message=%s", data.get("code"), data.get("message"))
+            logger.warning("Validation API error: code=%s", data.get("code"))
             return {"score": 0, "reward": 0.0}
         result = data.get("result", {})
         score = result.get("score", 0)
         reward = max(0.0, min(score / 100.0, 1.0))
-        logger.info("Validation: score=%s reward=%s", score, reward)
         return {"score": score, "reward": reward}
     except Exception as exc:
         logger.error("check_task failed: %s", exc, exc_info=True)
@@ -338,9 +329,9 @@ class MCPDesktopEnvTool(BaseTool):
         ground_truth["session"] = str(uuid4())
 
         logger.info(
-            "create(%s): ground_truth keys=%s, session=%s, base_url=%s, seed=%s, qseed=%s",
-            task_id, list(ground_truth.keys()), ground_truth["session"],
-            ground_truth.get("base_url", "N/A"), ground_truth.get("seed", "N/A"),
+            "create(%s): session=%s, seed=%s, qseed=%s",
+            task_id, ground_truth["session"],
+            ground_truth.get("seed", "N/A"),
             ground_truth.get("qseed", "N/A"),
         )
 
@@ -353,7 +344,6 @@ class MCPDesktopEnvTool(BaseTool):
 
             # Navigate browser to initial URL if url_rewrite is configured
             initial_url = _build_initial_url(ground_truth, create_kwargs.get("url_rewrite"))
-            logger.info("create(%s): initial_url=%s", task_id, initial_url)
             if initial_url:
                 await mcp.call_tool("browser_navigate", {"url": initial_url})
 
@@ -413,21 +403,16 @@ class MCPDesktopEnvTool(BaseTool):
 
         gt = info.get("ground_truth", {})
         base_url, seed, qseed, session = gt.get("base_url", ""), gt.get("seed"), gt.get("qseed"), gt.get("session")
-        logger.info(
-            "calc_reward for %s: base_url=%s, seed=%s, qseed=%s, session=%s, mock_date=%s",
-            instance_id, base_url, seed, qseed, session, gt.get("mock_date", ""),
-        )
         if not (seed and qseed and session):
-            logger.warning("calc_reward: missing required keys (seed=%s, qseed=%s, session=%s)", seed, qseed, session)
+            logger.warning("calc_reward(%s): missing required keys", instance_id)
             return 0.0
         if not base_url:
-            logger.warning("calc_reward: base_url is empty, cannot validate")
+            logger.warning("calc_reward(%s): base_url is empty", instance_id)
             return 0.0
 
         mock_date = gt.get("mock_date", "")
         result = _check_task(base_url, seed, qseed, session, mock_date)
         _reset_task(base_url, seed, qseed, session, mock_date)
-        logger.info("calc_reward for %s: score=%s reward=%s", instance_id, result.get("score"), result["reward"])
         return result["reward"]
 
     async def release(self, instance_id: str, **kwargs) -> None:

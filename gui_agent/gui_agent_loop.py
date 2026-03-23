@@ -54,7 +54,7 @@ import json
 import logging
 import os
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from PIL import Image
@@ -69,9 +69,8 @@ from verl.experimental.agent_loop.agent_loop import (
 from recipe.gui_agent.context_manager import (
     BaseContextStrategy,
     KeepLastKImagesStrategy,
-    keep_last_k_images,
 )
-from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
+from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
@@ -155,18 +154,13 @@ class GUIAgentLoop(AgentLoopBase):
         metrics: dict[str, Any] = {}
         trajectories: list[AgentLoopOutput] = []
 
-        logger.info("[GUI-%s] Starting agent loop, messages=%d", task_id, len(messages))
+        logger.info("[GUI-%s] Starting agent loop", task_id)
 
         # --- Build context strategy from per-task data ---
         desktop_kwargs = tools_kwargs.get("computer_use", {})
         create_kwargs = desktop_kwargs.get("create_kwargs", {})
         keep_last_k = create_kwargs.get("keep_last_k_images", self.keep_last_k)
         context_strategy: BaseContextStrategy = KeepLastKImagesStrategy(k=keep_last_k)
-
-        logger.info(
-            "[GUI-%s] Context strategy: keep_last_k=%d, create_kwargs keys=%s",
-            task_id, keep_last_k, list(create_kwargs.keys()),
-        )
 
         # --- Create env and get initial screenshot ---
         create_kwargs.setdefault("task_id", task_id)
@@ -205,19 +199,10 @@ class GUIAgentLoop(AgentLoopBase):
                 messages, image_data = context_strategy.prepare_context(messages, image_data)
 
                 # 2. Tokenize prompt for THIS turn
-                if turn == 1:
-                    logger.info("[GUI-%s] tool_schemas=%s", task_id, json.dumps(self.tool_schemas, indent=2, ensure_ascii=False)[:2000])
                 prompt_ids = await self.apply_chat_template(
                     messages,
                     tools=self.tool_schemas,
                     images=image_data if image_data else None,
-                )
-
-                # Log full decoded prompt before generation
-                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                logger.info(
-                    "[GUI-%s] Turn %d/%d: PROMPT (%d tokens):\n%s",
-                    task_id, turn, self.max_turns, len(prompt_ids), decoded_prompt,
                 )
 
                 # Truncate prompt if too long
@@ -243,9 +228,7 @@ class GUIAgentLoop(AgentLoopBase):
                 response_mask = [1] * len(response_ids)
                 response_logprobs = output.log_probs[: len(response_ids)] if output.log_probs else None
 
-                # Log full decoded response after generation
-                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
-                logger.info("[GUI-%s] Turn %d/%d: RESPONSE (%d tokens):\n%s", task_id, turn, self.max_turns, len(response_ids), response_text)
+                logger.info("[GUI-%s] Turn %d/%d: %d prompt tokens, %d response tokens", task_id, turn, self.max_turns, len(prompt_ids), len(response_ids))
 
                 # Build extra_fields from async training metadata
                 extra_fields: dict[str, Any] = {}
