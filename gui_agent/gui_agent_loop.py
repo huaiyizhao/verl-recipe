@@ -335,8 +335,12 @@ class GUIAgentLoop(AgentLoopBase):
                 reward = await self.desktop_tool.calc_reward(instance_id)
 
             # Mark the last trajectory as "final"
+            # Set reward_score on ALL trajectories so the async reward loop
+            # (RewardLoopWorker) is not invoked — it doesn't know data_source='meeting'.
             if trajectories:
                 trajectories[-1].extra_fields["trajectory_role"] = "final"
+                for traj in trajectories:
+                    traj.reward_score = reward
 
             logger.info(
                 f"GUI agent loop completed: {len(trajectories)} turns, "

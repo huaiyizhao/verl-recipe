@@ -13,7 +13,7 @@ tools:
   - class_name: "recipe.gui_agent.mcp_desktop_env_tool.MCPDesktopEnvTool"
     config:
       type: native
-      allocator_base_url: ${oc.env:MCP_ALLOCATOR_URL}
+      allocator_base_url: ${oc.env:MCP_ALLOCATOR_URL,http://ns008-cu-manager-svc}
       allocator_env: "a4861800"
       allocator_namespace: "Development"
       expire_min: 60
