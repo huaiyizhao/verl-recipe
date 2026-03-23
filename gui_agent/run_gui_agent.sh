@@ -58,7 +58,7 @@ tool_config_path=recipe/gui_agent/config/tool_config.yaml
 
 # =================== wandb ===================
 project_name=gui_agent_training
-experiment_name=qwen2.5-vl-3b-gui-agent
+experiment_name=qwen3-vl-8b-gui-agent
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -119,8 +119,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger='["console","mlflow"]' \
-    actor_rollout_ref.rollout.trace.backend=mlflow \
+    trainer.logger='["console","wandb"]' \
+    actor_rollout_ref.rollout.trace.backend=weave \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \

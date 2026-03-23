@@ -147,6 +147,7 @@ class _AddressClient:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"{base}/instruction/status", timeout=to) as resp:
                         if resp.status == 200:
+                            await asyncio.sleep(2)  # let browser stabilize
                             return
             except Exception as exc:
                 logger.debug("Waiting for %s (%s/%s): %s", address, attempt, max_retries, exc)
@@ -347,9 +348,16 @@ class MCPDesktopEnvTool(BaseTool):
             if initial_url:
                 await mcp.call_tool("browser_navigate", {"url": initial_url})
 
-            screenshot_b64 = await mcp.take_screenshot()
+            # Take initial screenshot with retries (browser may need time to stabilize)
+            screenshot_b64 = None
+            for attempt in range(1, 4):
+                screenshot_b64 = await mcp.take_screenshot()
+                if screenshot_b64 is not None:
+                    break
+                logger.warning("Screenshot attempt %d/3 failed for %s, retrying...", attempt, address)
+                await asyncio.sleep(3)
             if screenshot_b64 is None:
-                raise RuntimeError(f"Failed to take initial screenshot from {address}")
+                raise RuntimeError(f"Failed to take initial screenshot from {address} after 3 attempts")
         except Exception:
             try:
                 await addr_client.release(instance_id)
