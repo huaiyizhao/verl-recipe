@@ -31,6 +31,7 @@ NNODES=${SLURM_JOB_NUM_NODES:-${NNODES:-1}}
 export NNODES
 export RAY_NUM_NODES=$NNODES
 export WANDB_API_KEY=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
+export MLFLOW_TRACKING_URI="http://mlflow-tracking:5000"
 
 TOTAL_GPUS=$((GPUS_PER_NODE * NNODES))
 if [ "$TOTAL_GPUS" -lt 2 ]; then
@@ -118,8 +119,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger='["console","wandb"]' \
-    actor_rollout_ref.rollout.trace.backend=weave
+    trainer.logger='["console","mlflow"]' \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \
