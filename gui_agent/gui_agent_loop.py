@@ -220,6 +220,25 @@ class GUIAgentLoop(AgentLoopBase):
                     task_id, turn, prev_image_count, len(image_data), len(messages),
                 )
 
+                # Log model input (messages) with image placeholders
+                def _fmt_msg(msg):
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        parts = []
+                        for part in content:
+                            if part.get("type") == "image":
+                                parts.append("[IMAGE]")
+                            elif part.get("type") == "text":
+                                parts.append(part.get("text", ""))
+                            else:
+                                parts.append(str(part))
+                        return f"[{role}] {'  '.join(parts)}"
+                    return f"[{role}] {content}"
+
+                msg_summary = "\n".join(_fmt_msg(m) for m in messages)
+                logger.info("[GUI-%s] Turn %d: MODEL INPUT (%d messages):\n%s", task_id, turn, len(messages), msg_summary)
+
                 # 2. Tokenize prompt for THIS turn
                 prompt_ids = await self.apply_chat_template(
                     messages,
@@ -258,6 +277,10 @@ class GUIAgentLoop(AgentLoopBase):
                 response_logprobs = output.log_probs[: len(response_ids)] if output.log_probs else None
 
                 logger.info("[GUI-%s] Turn %d: response_ids length=%d", task_id, turn, len(response_ids))
+
+                # Decode and log model response text
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+                logger.info("[GUI-%s] Turn %d: MODEL RESPONSE:\n%s", task_id, turn, response_text)
 
                 # Build extra_fields from async training metadata
                 extra_fields: dict[str, Any] = {}
