@@ -30,6 +30,7 @@ export GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${GPUS_PER_NODE:-8}}
 NNODES=${SLURM_JOB_NUM_NODES:-${NNODES:-1}}
 export NNODES
 export RAY_NUM_NODES=$NNODES
+export WANDB_API_KEY=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
 
 TOTAL_GPUS=$((GPUS_PER_NODE * NNODES))
 if [ "$TOTAL_GPUS" -lt 2 ]; then
@@ -63,7 +64,7 @@ default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 adv_estimator=grpo
 
 max_turns=20
-max_prompt_length=4096
+max_prompt_length=16384
 max_response_length=2048
 actor_lr=1e-6
 
@@ -73,8 +74,6 @@ n_resp_per_prompt=4
 n_resp_per_prompt_val=1
 
 # ================= performance =================
-export VLLM_USE_V1=1
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 infer_tp=2
 train_sp=4
@@ -108,7 +107,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$offload \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$log_prob_max_token_len_per_gpu \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.mode=sync \
+    actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$infer_tp \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \

@@ -11,12 +11,13 @@ Usage:
         --address_base_url http://your-mcp-manager
 
     python -m recipe.gui_agent.build_meeting_data \
-        --max_count 256 --split train --local_save_dir /efs/data/cua/rl
+        --max_count 256 --test_ratio 0.1 --local_save_dir /efs/data/cua/rl
 """
 
 import argparse
 import asyncio
 import os
+import random
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
@@ -221,9 +222,10 @@ if __name__ == "__main__":
     parser.add_argument("--address_retry_interval", type=float, default=1.0)
     parser.add_argument("--address_max_retries", type=int, default=60)
     parser.add_argument("--local_save_dir", default="/efs/data/cua/rl")
-    parser.add_argument("--split", default="train", choices=["train", "test"],
-                        help="Dataset split name (train or test)")
-    parser.add_argument("--max_count", type=int, default=128)
+    parser.add_argument("--max_count", type=int, default=128,
+                        help="Total number of samples to collect (split into train + test)")
+    parser.add_argument("--test_ratio", type=float, default=0.1,
+                        help="Fraction of samples to use for test split (default: 0.1)")
     parser.add_argument("--concurrency", type=int, default=32)
     args = parser.parse_args()
 
@@ -249,20 +251,26 @@ if __name__ == "__main__":
         "max_retries": args.address_max_retries,
     }
 
-    dataset_samples = [
-        _build_dataset_sample(i, s, args.base_url, address_config, split=args.split)
-        for i, s in enumerate(valid_samples)
-    ]
-    dataset = datasets.Dataset.from_list(dataset_samples)
+    # Split into train / test
+    random.seed(42)
+    random.shuffle(valid_samples)
+    n_test = max(1, int(len(valid_samples) * args.test_ratio))
+    test_samples = valid_samples[:n_test]
+    train_samples = valid_samples[n_test:]
 
-    output_path = os.path.join(save_dir, f"{args.split}.parquet")
-    dataset.to_parquet(output_path)
-    print(f"\nDataset saved to: {output_path}")
-    print(f"Total samples: {len(dataset_samples)}")
+    for split_name, samples in [("train", train_samples), ("test", test_samples)]:
+        dataset_rows = [
+            _build_dataset_sample(i, s, args.base_url, address_config, split=split_name)
+            for i, s in enumerate(samples)
+        ]
+        ds = datasets.Dataset.from_list(dataset_rows)
+        output_path = os.path.join(save_dir, f"{split_name}.parquet")
+        ds.to_parquet(output_path)
+        print(f"\n{split_name} dataset saved to: {output_path}  ({len(dataset_rows)} samples)")
 
     # Print a sample for verification
-    print("\n--- Sample row ---")
-    s = dataset_samples[0]
+    print("\n--- Sample train row ---")
+    s = _build_dataset_sample(0, train_samples[0], args.base_url, address_config, split="train")
     print(f"  data_source: {s['data_source']}")
     print(f"  agent_name:  {s['agent_name']}")
     print(f"  prompt:      {s['prompt']}")
