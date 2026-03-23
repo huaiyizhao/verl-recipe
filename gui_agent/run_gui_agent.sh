@@ -43,7 +43,7 @@ echo "Using $NNODES nodes and $GPUS_PER_NODE GPUs per node..."
 # ================= data / model / tool =================
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-model_path=${model_path:-Qwen/Qwen2.5-VL-3B-Instruct}
+model_path=${model_path:-Qwen/Qwen3-VL-8B-Instruct}
 
 train_files=${train_files:-/efs/data/cua/rl/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/test.parquet}
