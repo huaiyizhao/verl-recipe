@@ -41,9 +41,9 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
-_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 def _to_base_url(address: str) -> str:
@@ -107,6 +107,7 @@ class _AddressClient:
             return self._mapping[instance_id]
 
         payload = {"env": self.env, "namespace": self.namespace, "expire_min": self.expire_min}
+        logger.info("Allocating address for %s: POST %s/mcp-assign payload=%s", instance_id, self.base_url, payload)
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with aiohttp.ClientSession() as session:
@@ -118,9 +119,18 @@ class _AddressClient:
                                 self._mapping[instance_id] = address
                                 logger.info("Allocated %s -> %s (attempt %s)", address, instance_id, attempt)
                                 return address
-                        logger.warning("Allocate failed (attempt %s/%s)", attempt, self.max_retries)
+                            logger.warning(
+                                "Allocate: no address in response (attempt %s/%s): %s",
+                                attempt, self.max_retries, data,
+                            )
+                        else:
+                            body = await resp.text()
+                            logger.warning(
+                                "Allocate: HTTP %s (attempt %s/%s) url=%s body=%s",
+                                resp.status, attempt, self.max_retries, self.base_url, body[:200],
+                            )
             except Exception as exc:
-                logger.warning("allocate error: %s (attempt %s/%s)", exc, attempt, self.max_retries)
+                logger.warning("Allocate error (attempt %s/%s) url=%s: %s", attempt, self.max_retries, self.base_url, exc)
             await asyncio.sleep(self.retry_interval)
 
         raise RuntimeError(f"Failed to allocate address for {instance_id} after {self.max_retries} attempts")
