@@ -79,7 +79,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +155,29 @@ class GUIAgentLoop(AgentLoopBase):
         metrics: dict[str, Any] = {}
         trajectories: list[AgentLoopOutput] = []
 
+        logger.info("[GUI-%s] === Starting GUI agent loop === messages=%d", task_id, len(messages))
+
         # --- Build context strategy from per-task data ---
         desktop_kwargs = tools_kwargs.get("computer_use", {})
         create_kwargs = desktop_kwargs.get("create_kwargs", {})
         keep_last_k = create_kwargs.get("keep_last_k_images", self.keep_last_k)
         context_strategy: BaseContextStrategy = KeepLastKImagesStrategy(k=keep_last_k)
 
+        logger.info(
+            "[GUI-%s] Context strategy: keep_last_k=%d, create_kwargs keys=%s",
+            task_id, keep_last_k, list(create_kwargs.keys()),
+        )
+
         # --- Create env and get initial screenshot ---
         create_kwargs.setdefault("task_id", task_id)
 
+        logger.info("[GUI-%s] Creating desktop env...", task_id)
         instance_id, initial_response = await self.desktop_tool.create(
             create_kwargs=create_kwargs,
+        )
+        logger.info(
+            "[GUI-%s] Desktop env created: instance_id=%s, has_image=%s",
+            task_id, instance_id, bool(initial_response.image),
         )
 
         try:
@@ -185,6 +197,11 @@ class GUIAgentLoop(AgentLoopBase):
                         ],
                     }
                 )
+                logger.info(
+                    "[GUI-%s] Initial screenshot added: image_count=%d, image_size=%s",
+                    task_id, len(image_data),
+                    f"{image_data[0].size}" if image_data else "N/A",
+                )
 
             # --- Multi-turn loop ---
             turn = 0
@@ -193,9 +210,15 @@ class GUIAgentLoop(AgentLoopBase):
 
             while turn < self.max_turns and not terminated and not fatal_error:
                 turn += 1
+                logger.info("[GUI-%s] === Turn %d/%d ===", task_id, turn, self.max_turns)
 
                 # 1. Prune old images using the pluggable context strategy
+                prev_image_count = len(image_data)
                 messages, image_data = context_strategy.prepare_context(messages, image_data)
+                logger.info(
+                    "[GUI-%s] Turn %d: context pruned images %d -> %d, messages=%d",
+                    task_id, turn, prev_image_count, len(image_data), len(messages),
+                )
 
                 # 2. Tokenize prompt for THIS turn
                 prompt_ids = await self.apply_chat_template(
@@ -206,9 +229,16 @@ class GUIAgentLoop(AgentLoopBase):
 
                 # Truncate prompt if too long
                 if len(prompt_ids) > self.prompt_length:
+                    logger.warning(
+                        "[GUI-%s] Turn %d: prompt truncated %d -> %d tokens",
+                        task_id, turn, len(prompt_ids), self.prompt_length,
+                    )
                     prompt_ids = prompt_ids[-self.prompt_length:]
 
+                logger.info("[GUI-%s] Turn %d: prompt_ids length=%d", task_id, turn, len(prompt_ids))
+
                 # 3. Generate LLM response
+                logger.info("[GUI-%s] Turn %d: generating LLM response...", task_id, turn)
                 with simple_timer("generate_sequences", metrics):
                     output: TokenOutput = await self.server_manager.generate(
                         request_id=request_id,
@@ -226,6 +256,8 @@ class GUIAgentLoop(AgentLoopBase):
                 response_ids = output.token_ids[: self.response_length]
                 response_mask = [1] * len(response_ids)
                 response_logprobs = output.log_probs[: len(response_ids)] if output.log_probs else None
+
+                logger.info("[GUI-%s] Turn %d: response_ids length=%d", task_id, turn, len(response_ids))
 
                 # Build extra_fields from async training metadata
                 extra_fields: dict[str, Any] = {}
@@ -260,8 +292,15 @@ class GUIAgentLoop(AgentLoopBase):
                 tools = [tool.tool_schema for tool in self.tools.values()]
                 _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids, tools)
 
+                logger.info(
+                    "[GUI-%s] Turn %d: parsed %d tool call(s)%s",
+                    task_id, turn, len(tool_calls) if tool_calls else 0,
+                    f" -> {tool_calls[0].name}({tool_calls[0].arguments[:200]})" if tool_calls else " (no tool call)",
+                )
+
                 if not tool_calls:
                     # No tool call → model chose to stop
+                    logger.info("[GUI-%s] Turn %d: no tool call, terminating", task_id, turn)
                     terminated = True
                     continue
 
@@ -275,9 +314,11 @@ class GUIAgentLoop(AgentLoopBase):
                     continue
 
                 action = tool_args.get("action", "")
+                logger.info("[GUI-%s] Turn %d: action=%s args=%s", task_id, turn, action, str(tool_args)[:200])
 
                 # Check for terminate action
                 if action == "terminate":
+                    logger.info("[GUI-%s] Turn %d: terminate action, ending loop", task_id, turn)
                     terminated = True
                     # Decode assistant response and add to messages
                     assistant_text = await self.loop.run_in_executor(
@@ -288,10 +329,17 @@ class GUIAgentLoop(AgentLoopBase):
 
                 # Execute action on desktop
                 try:
+                    logger.info("[GUI-%s] Turn %d: executing tool action '%s'...", task_id, turn, action)
                     tool_response, tool_reward, tool_metrics = await self.desktop_tool.execute(
                         instance_id, tool_args
                     )
                     extra_fields["tool_rewards"].append(tool_reward)
+                    logger.info(
+                        "[GUI-%s] Turn %d: tool executed, reward=%.2f, has_image=%s, text=%s",
+                        task_id, turn, tool_reward,
+                        bool(tool_response.image),
+                        (tool_response.text or "")[:100],
+                    )
                 except TimeoutError:
                     # Fatal: env is broken (MCP timeout, env crash, etc.)
                     logger.error(f"Fatal: timeout executing tool for {task_id}, aborting rollout")
@@ -328,11 +376,13 @@ class GUIAgentLoop(AgentLoopBase):
                 # Fatal tool error: env is broken, reward is 0
                 reward = 0.0
                 logger.warning(
-                    f"GUI agent loop aborted due to fatal error: "
-                    f"{len(trajectories)} turns, task_id={task_id}"
+                    f"[GUI-{task_id}] Agent loop aborted due to fatal error: "
+                    f"{len(trajectories)} turns"
                 )
             else:
+                logger.info("[GUI-%s] Computing final reward via calc_reward (instance=%s)...", task_id, instance_id)
                 reward = await self.desktop_tool.calc_reward(instance_id)
+                logger.info("[GUI-%s] Final reward = %.4f", task_id, reward)
 
             # Mark the last trajectory as "final"
             # Set reward_score on ALL trajectories so the async reward loop
@@ -343,8 +393,8 @@ class GUIAgentLoop(AgentLoopBase):
                     traj.reward_score = reward
 
             logger.info(
-                f"GUI agent loop completed: {len(trajectories)} turns, "
-                f"reward={reward}, task_id={task_id}, fatal_error={fatal_error}"
+                f"[GUI-{task_id}] === Loop completed: {len(trajectories)} turns, "
+                f"reward={reward}, fatal_error={fatal_error} ==="
             )
 
             return AgentLoopGroupOutput(

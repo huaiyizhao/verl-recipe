@@ -254,10 +254,12 @@ class _MCPClient:
 def _check_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 15) -> dict[str, Any]:
     """``GET <base_url>/api/__task__?…&check=true`` → ``{"score": int, "reward": float}``."""
     url = f"{base_url}/api/__task__?seed={seed}&qseed={qseed}&_session_={session}&_mockdate_={mock_date}&check=true"
+    logger.info("_check_task: GET %s", url)
     try:
         resp = requests.get(url, timeout=timeout, verify=False)
         resp.raise_for_status()
         data = resp.json()
+        logger.info("_check_task response: %s", str(data)[:500])
         if data.get("code") != 0:
             logger.warning("Validation API code=%s message=%s", data.get("code"), data.get("message"))
             return {"score": 0, "reward": 0.0}
@@ -335,6 +337,13 @@ class MCPDesktopEnvTool(BaseTool):
         ground_truth = dict(create_kwargs.get("ground_truth", {}))
         ground_truth["session"] = str(uuid4())
 
+        logger.info(
+            "create(%s): ground_truth keys=%s, session=%s, base_url=%s, seed=%s, qseed=%s",
+            task_id, list(ground_truth.keys()), ground_truth["session"],
+            ground_truth.get("base_url", "N/A"), ground_truth.get("seed", "N/A"),
+            ground_truth.get("qseed", "N/A"),
+        )
+
         addr_client = self._address_client
         address = await addr_client.allocate(instance_id)
 
@@ -344,6 +353,7 @@ class MCPDesktopEnvTool(BaseTool):
 
             # Navigate browser to initial URL if url_rewrite is configured
             initial_url = _build_initial_url(ground_truth, create_kwargs.get("url_rewrite"))
+            logger.info("create(%s): initial_url=%s", task_id, initial_url)
             if initial_url:
                 await mcp.call_tool("browser_navigate", {"url": initial_url})
 
@@ -398,11 +408,20 @@ class MCPDesktopEnvTool(BaseTool):
         """
         info = self._instances.get(instance_id)
         if info is None:
+            logger.warning("calc_reward: unknown instance_id %s", instance_id)
             return 0.0
 
         gt = info.get("ground_truth", {})
         base_url, seed, qseed, session = gt.get("base_url", ""), gt.get("seed"), gt.get("qseed"), gt.get("session")
+        logger.info(
+            "calc_reward for %s: base_url=%s, seed=%s, qseed=%s, session=%s, mock_date=%s",
+            instance_id, base_url, seed, qseed, session, gt.get("mock_date", ""),
+        )
         if not (seed and qseed and session):
+            logger.warning("calc_reward: missing required keys (seed=%s, qseed=%s, session=%s)", seed, qseed, session)
+            return 0.0
+        if not base_url:
+            logger.warning("calc_reward: base_url is empty, cannot validate")
             return 0.0
 
         mock_date = gt.get("mock_date", "")
