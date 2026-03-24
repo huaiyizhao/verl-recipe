@@ -122,6 +122,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger='["console","wandb"]' \
     actor_rollout_ref.rollout.trace.backend=weave \
+    actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \
