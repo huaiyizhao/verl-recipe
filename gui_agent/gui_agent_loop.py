@@ -114,6 +114,7 @@ class GUIAgentLoop(AgentLoopBase):
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
         self.keep_last_k = 3  # default, can be overridden per-task from data
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
+        self.tool_execute_retries = 2  # retry transient env errors before telling the model
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -148,6 +149,7 @@ class GUIAgentLoop(AgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         extra_info = kwargs.get("extra_info", {})
         task_id = extra_info.get("task_id", "unknown")
+        task_query = extra_info.get("question", "")
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
         request_id = uuid4().hex
@@ -176,13 +178,13 @@ class GUIAgentLoop(AgentLoopBase):
                 for img in initial_response.image:
                     if img is not None:
                         image_data.append(img)
-                # Append initial observation as a tool/user message with screenshot
+                # Append initial observation as a user message with screenshot
                 messages.append(
                     {
                         "role": "user",
                         "content": [
                             {"type": "image"},
-                            {"type": "text", "text": "Here is the current screenshot of the desktop. Complete the task."},
+                            {"type": "text", "text": f"{task_query}\nPlease continue"},
                         ],
                     }
                 )
@@ -290,22 +292,32 @@ class GUIAgentLoop(AgentLoopBase):
                     messages.append({"role": "assistant", "content": assistant_text})
                     continue
 
-                # Execute action on desktop
-                try:
-                    tool_response, tool_reward, tool_metrics = await self.desktop_tool.execute(
-                        instance_id, tool_args
-                    )
-                    extra_fields["tool_rewards"].append(tool_reward)
-                except TimeoutError:
-                    # Fatal: env is broken (MCP timeout, env crash, etc.)
-                    logger.error(f"Fatal: timeout executing tool for {task_id}, aborting rollout")
-                    fatal_error = True
+                # Execute action on desktop with retry for transient env errors
+                tool_response = None
+                tool_error = None
+                for attempt in range(1, self.tool_execute_retries + 1):
+                    try:
+                        tool_response, tool_reward, tool_metrics = await self.desktop_tool.execute(
+                            instance_id, tool_args
+                        )
+                        extra_fields["tool_rewards"].append(tool_reward)
+                        tool_error = None
+                        break
+                    except TimeoutError:
+                        # Fatal: env is broken (MCP timeout, env crash, etc.)
+                        logger.error(f"Fatal: timeout executing tool for {task_id}, aborting rollout")
+                        fatal_error = True
+                        break
+                    except Exception as e:
+                        tool_error = e
+                        if attempt < self.tool_execute_retries:
+                            logger.warning(f"Tool execution failed (attempt {attempt}), retrying: {e}")
+                        else:
+                            logger.warning(f"Tool execution failed after {self.tool_execute_retries} attempts: {e}")
+                            extra_fields["tool_rewards"].append(0.0)
+
+                if fatal_error:
                     break
-                except Exception as e:
-                    # Recoverable: continue with error message
-                    logger.warning(f"Tool execution failed: {e}")
-                    tool_response = ToolResponse(text=f"Error: {e}")
-                    extra_fields["tool_rewards"].append(0.0)
 
                 # 7. Update message history with assistant response + tool result
                 assistant_text = await self.loop.run_in_executor(
@@ -313,19 +325,45 @@ class GUIAgentLoop(AgentLoopBase):
                 )
                 messages.append({"role": "assistant", "content": assistant_text})
 
-                # Build tool message
-                if tool_response.image:
-                    tool_content: list[dict[str, Any]] = [{"type": "image"}]
-                    if tool_response.text:
-                        tool_content.append({"type": "text", "text": tool_response.text})
-                    messages.append({"role": "tool", "content": tool_content})
+                if tool_error is not None:
+                    # All retries exhausted — tell the model what went wrong
+                    error_text = f"Action failed: {tool_error}\n{task_query}\nPlease continue"
+                    if image_data:
+                        # Re-use the last known screenshot so the model has visual context
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image"},
+                                    {"type": "text", "text": error_text},
+                                ],
+                            }
+                        )
+                        image_data.append(image_data[-1])
+                    else:
+                        messages.append({"role": "user", "content": error_text})
+                elif tool_response.image:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": f"{task_query}\nPlease continue"},
+                            ],
+                        }
+                    )
 
                     # Add new screenshot to image_data
                     for img in tool_response.image:
                         if img is not None:
                             image_data.append(img)
                 else:
-                    messages.append({"role": "tool", "content": tool_response.text or ""})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": f"{task_query}\nPlease continue",
+                        }
+                    )
 
             # --- Compute final reward ---
             if fatal_error:
