@@ -228,7 +228,8 @@ class GUIAgentLoop(AgentLoopBase):
                 response_mask = [1] * len(response_ids)
                 response_logprobs = output.log_probs[: len(response_ids)] if output.log_probs else None
 
-                logger.info("[GUI-%s] Turn %d/%d: %d prompt tokens, %d response tokens", task_id, turn, self.max_turns, len(prompt_ids), len(response_ids))
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+                logger.info("[GUI-%s] Turn %d/%d: %d prompt tokens, %d response tokens\n%s", task_id, turn, self.max_turns, len(prompt_ids), len(response_ids), response_text)
 
                 # Build extra_fields from async training metadata
                 extra_fields: dict[str, Any] = {}
