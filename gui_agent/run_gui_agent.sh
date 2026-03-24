@@ -124,7 +124,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.nnodes="$NNODES" \
     trainer.save_freq=-1 \
     trainer.default_local_dir="$default_local_dir" \
