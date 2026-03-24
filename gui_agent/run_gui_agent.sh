@@ -61,6 +61,12 @@ project_name=gui_agent_training
 experiment_name=qwen3-vl-8b-gui-agent
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
+# ================= cleanup stale MCP addresses =================
+MCP_ALLOCATOR_URL=${MCP_ALLOCATOR_URL:-http://ns008-cu-manager-svc}
+MCP_ENV=${MCP_ENV:-huaiyizhao}
+echo "Releasing stale MCP addresses for env=$MCP_ENV ..."
+python3 -m recipe.gui_agent.scripts.mcp_manage release --base-url "$MCP_ALLOCATOR_URL" --env "$MCP_ENV" || true
+
 # ================= algorithm =================
 adv_estimator=grpo
 
