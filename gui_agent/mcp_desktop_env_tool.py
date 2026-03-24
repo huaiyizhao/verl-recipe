@@ -118,6 +118,7 @@ class _AddressClient:
                                 self._mapping[instance_id] = address
                                 logger.info("Allocated %s -> %s", address, instance_id)
                                 return address
+                            logger.warning("Allocate: no address in response (attempt %s/%s): %s", attempt, self.max_retries, data)
                         else:
                             body = await resp.text()
                             logger.warning(
