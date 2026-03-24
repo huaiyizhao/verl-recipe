@@ -65,7 +65,13 @@ default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 MCP_ALLOCATOR_URL=${MCP_ALLOCATOR_URL:-http://ns008-cu-manager-svc}
 MCP_ENV=${MCP_ENV:-huaiyizhao}
 echo "Releasing stale MCP addresses for env=$MCP_ENV ..."
-python3 -m recipe.gui_agent.scripts.mcp_manage release --base-url "$MCP_ALLOCATOR_URL" --env "$MCP_ENV" || true
+python3 -c "
+import asyncio
+from recipe.gui_agent.mcp_desktop_env_tool import _AddressClient
+c = _AddressClient(base_url='$MCP_ALLOCATOR_URL', env='$MCP_ENV')
+r = asyncio.run(c.unlock_all())
+print(f\"Released {r['unlocked']}/{r['total']}, failed {r['failed']}\")
+" || true
 
 # ================= algorithm =================
 adv_estimator=grpo

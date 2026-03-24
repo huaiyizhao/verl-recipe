@@ -131,6 +131,46 @@ class _AddressClient:
 
         raise RuntimeError(f"Failed to allocate address for {instance_id} after {self.max_retries} attempts")
 
+    async def list_all(self) -> list[dict]:
+        """List all allocated addresses via ``POST /mcp-list``."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/mcp-list",
+                json={"env": self.env, "namespace": self.namespace},
+                timeout=_HTTP_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Failed to list addresses: HTTP {resp.status}")
+                return await resp.json()
+
+    async def unlock_all(self) -> dict:
+        """Release all allocated addresses for the current env. Returns summary dict."""
+        addresses = await self.list_all()
+        if not addresses:
+            return {"total": 0, "unlocked": 0, "failed": 0}
+        unlocked = failed = 0
+        for addr_info in addresses:
+            address = addr_info["address"]
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.base_url}/mcp-lock",
+                        json={"address": address, "unlock": True},
+                        timeout=_HTTP_TIMEOUT,
+                    ) as resp:
+                        if resp.status == 200 and (await resp.json()).get("code") == 0:
+                            logger.info("Unlocked %s", address)
+                            unlocked += 1
+                        else:
+                            logger.warning("Failed to unlock %s: HTTP %s", address, resp.status)
+                            failed += 1
+            except Exception as exc:
+                logger.warning("Error unlocking %s: %s", address, exc)
+                failed += 1
+        # Clear local mapping since all addresses are released
+        self._mapping.clear()
+        return {"total": len(addresses), "unlocked": unlocked, "failed": failed}
+
     async def reboot(self, address: str, max_retries: int = 30, retry_interval: float = 2.0, timeout: int = 10) -> None:
         """POST ``/instruction/reboot`` then poll ``/instruction/status`` until 200."""
         base = _to_base_url(address)
