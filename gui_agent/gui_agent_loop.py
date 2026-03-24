@@ -146,6 +146,8 @@ class GUIAgentLoop(AgentLoopBase):
         Returns:
             AgentLoopGroupOutput with one trajectory per turn and shared reward.
         """
+        # raw_prompt contains only the system prompt (if any); the task query
+        # comes from extra_info["question"] and is included in every user turn.
         messages = list(kwargs["raw_prompt"])
         extra_info = kwargs.get("extra_info", {})
         task_id = extra_info.get("task_id", "unknown")

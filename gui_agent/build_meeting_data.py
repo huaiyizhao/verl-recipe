@@ -176,9 +176,7 @@ def _build_dataset_sample(
         # --- verl core fields ---
         "data_source": "meeting",
         "agent_name": "gui_agent",  # matches @register("gui_agent") in gui_agent_loop.py
-        "prompt": [
-            {"role": "user", "content": query},
-        ],
+        "prompt": [],  # GUI agent loop constructs all messages; task query is in extra_info["question"]
         "ability": "cu",
         "reward_model": {
             "style": "rule",
