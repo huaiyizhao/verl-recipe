@@ -14,7 +14,7 @@ tools:
     config:
       type: native
       allocator_base_url: ${oc.env:MCP_ALLOCATOR_URL,http://ns008-cu-manager-svc}
-      allocator_env: "a4861800"
+      allocator_env: "huaiyizhao"
       allocator_namespace: "Development"
       expire_min: 60
       auth_token: null
