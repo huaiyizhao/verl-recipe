@@ -53,8 +53,8 @@ class TestKeepLastKImages:
     def test_no_pruning_when_under_k(self):
         """When total images <= k, nothing changes."""
         messages = [
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}, {"type": "text", "text": "hi"}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "user", "content": [{"type": "image", "image": "data:image/png;base64,fake"}, {"type": "text", "text": "hi"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("blue")]
 
@@ -62,16 +62,16 @@ class TestKeepLastKImages:
 
         # Nothing should change
         # Both image blocks should be preserved
-        assert result_msgs[0]["content"][0]["type"] == "image_url"
-        assert result_msgs[1]["content"][0]["type"] == "image_url"
+        assert result_msgs[0]["content"][0]["type"] == "image"
+        assert result_msgs[1]["content"][0]["type"] == "image"
 
     def test_prune_oldest_images(self):
         """When total images > k, oldest are replaced with placeholders."""
         messages = [
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}, {"type": "text", "text": "turn 1"}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "user", "content": [{"type": "image", "image": "data:image/png;base64,fake"}, {"type": "text", "text": "turn 1"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("green"), _make_image("blue"), _make_image("orange")]
 
@@ -84,15 +84,15 @@ class TestKeepLastKImages:
         assert result_msgs[1]["content"][0] == {"type": "text", "text": "[screenshot omitted]"}
 
         # Last two should be preserved
-        assert result_msgs[2]["content"][0]["type"] == "image_url"
-        assert result_msgs[3]["content"][0]["type"] == "image_url"
+        assert result_msgs[2]["content"][0]["type"] == "image"
+        assert result_msgs[3]["content"][0]["type"] == "image"
 
     def test_prune_with_k_equals_1(self):
         """Only keep the very last image."""
         messages = [
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("green"), _make_image("blue")]
 
@@ -101,7 +101,7 @@ class TestKeepLastKImages:
         # Only last message should have an image
         assert result_msgs[0]["content"][0]["type"] == "text"
         assert result_msgs[1]["content"][0]["type"] == "text"
-        assert result_msgs[2]["content"][0]["type"] == "image_url"
+        assert result_msgs[2]["content"][0]["type"] == "image"
 
     def test_mixed_content_preserved(self):
         """Non-image content blocks in the same message are untouched."""
@@ -109,14 +109,14 @@ class TestKeepLastKImages:
             {
                 "role": "tool",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}},
+                    {"type": "image", "image": "data:image/png;base64,fake"},
                     {"type": "text", "text": "action result"},
                 ],
             },
             {
                 "role": "tool",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}},
+                    {"type": "image", "image": "data:image/png;base64,fake"},
                     {"type": "text", "text": "latest result"},
                 ],
             },
@@ -130,7 +130,7 @@ class TestKeepLastKImages:
         assert result_msgs[0]["content"][1] == {"type": "text", "text": "action result"}
 
         # Second message: image preserved, text preserved
-        assert result_msgs[1]["content"][0]["type"] == "image_url"
+        assert result_msgs[1]["content"][0]["type"] == "image"
         assert result_msgs[1]["content"][1]["type"] == "text"
 
     def test_invalid_k_raises(self):
@@ -153,8 +153,8 @@ class TestKeepLastKImages:
         """Messages with string content (not list) are skipped."""
         messages = [
             {"role": "user", "content": "hello"},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("blue")]
 
@@ -165,7 +165,7 @@ class TestKeepLastKImages:
         # First image replaced
         assert result_msgs[1]["content"][0]["type"] == "text"
         # Last image kept
-        assert result_msgs[2]["content"][0]["type"] == "image_url"
+        assert result_msgs[2]["content"][0]["type"] == "image"
 
 
 # ===========================================================================
@@ -415,17 +415,17 @@ class TestKeepLastKImagesStrategy:
 
         strategy = KeepLastKImagesStrategy(k=2)
         messages = [
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("green"), _make_image("blue")]
 
         result_msgs = strategy.prepare_context(messages)
 
         assert result_msgs[0]["content"][0] == {"type": "text", "text": "[screenshot omitted]"}
-        assert result_msgs[1]["content"][0]["type"] == "image_url"
-        assert result_msgs[2]["content"][0]["type"] == "image_url"
+        assert result_msgs[1]["content"][0]["type"] == "image"
+        assert result_msgs[2]["content"][0]["type"] == "image"
 
     def test_no_pruning_under_k(self):
         """Strategy should not prune when under k images."""
@@ -433,8 +433,8 @@ class TestKeepLastKImagesStrategy:
 
         strategy = KeepLastKImagesStrategy(k=5)
         messages = [
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("green")]
 
@@ -462,13 +462,13 @@ class TestSlidingWindowStrategy:
             {"role": "user", "content": "Do the task."},
             # Round 1
             {"role": "assistant", "content": "Clicking..."},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}, {"type": "text", "text": "clicked"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}, {"type": "text", "text": "clicked"}]},
             # Round 2
             {"role": "assistant", "content": "Scrolling..."},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}, {"type": "text", "text": "scrolled"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}, {"type": "text", "text": "scrolled"}]},
             # Round 3
             {"role": "assistant", "content": "Typing..."},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}, {"type": "text", "text": "typed"}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}, {"type": "text", "text": "typed"}]},
         ]
         images = [_make_image("red"), _make_image("green"), _make_image("blue")]
 
@@ -493,13 +493,13 @@ class TestSlidingWindowStrategy:
             {"role": "user", "content": "Do the task."},
             # Round 1
             {"role": "assistant", "content": "Action 1"},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
             # Round 2
             {"role": "assistant", "content": "Action 2"},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
             # Round 3
             {"role": "assistant", "content": "Action 3"},
-            {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,fake"}}]},
+            {"role": "tool", "content": [{"type": "image", "image": "data:image/png;base64,fake"}]},
         ]
         images = [_make_image("red"), _make_image("green"), _make_image("blue")]
 
@@ -512,7 +512,7 @@ class TestSlidingWindowStrategy:
         # Round 2 tool message
         assert result_msgs[4]["content"][0] == {"type": "text", "text": "[screenshot omitted]"}
         # Round 3 tool message: image preserved
-        assert result_msgs[6]["content"][0]["type"] == "image_url"
+        assert result_msgs[6]["content"][0]["type"] == "image"
 
     def test_no_messages(self):
         """Empty messages should work without errors."""

@@ -69,7 +69,7 @@ def keep_last_k_images(
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "image_url":
+                if isinstance(block, dict) and block.get("type") == "image" and "image" in block:
                     total_images += 1
 
     if total_images <= k:
@@ -83,7 +83,7 @@ def keep_last_k_images(
             continue
         for i in range(len(content) - 1, -1, -1):
             block = content[i]
-            if isinstance(block, dict) and block.get("type") == "image_url":
+            if isinstance(block, dict) and block.get("type") == "image" and "image" in block:
                 images_seen_from_end += 1
                 if images_seen_from_end > k:
                     # Replace with placeholder
@@ -223,7 +223,7 @@ class SlidingWindowStrategy(BaseContextStrategy):
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "image_url":
+                        if isinstance(block, dict) and block.get("type") == "image" and "image" in block:
                             has_image = True
                             break
                 if has_image:
@@ -239,7 +239,7 @@ class SlidingWindowStrategy(BaseContextStrategy):
                     if isinstance(content, list):
                         for i in range(len(content)):
                             block = content[i]
-                            if isinstance(block, dict) and block.get("type") == "image_url":
+                            if isinstance(block, dict) and block.get("type") == "image" and "image" in block:
                                 content[i] = {"type": "text", "text": "[screenshot omitted]"}
 
         # Reconstruct messages

@@ -91,14 +91,14 @@ class GUIAgentState(Enum):
 
 
 def _find_last_image_url(messages: list[dict]) -> str | None:
-    """Find the last image_url data URI in the message history."""
+    """Find the last image data URI in the message history."""
     for msg in reversed(messages):
         content = msg.get("content")
         if not isinstance(content, list):
             continue
         for block in reversed(content):
-            if isinstance(block, dict) and block.get("type") == "image_url":
-                return block["image_url"]["url"]
+            if isinstance(block, dict) and block.get("type") == "image":
+                return block["image"]
     return None
 
 
@@ -188,7 +188,7 @@ class GUIAgentLoop(AgentLoopBase):
                 img_content = []
                 for img_b64 in initial_response.image:
                     if img_b64 is not None:
-                        img_content.append({"type": "image_url", "image_url": {"url": img_b64}})
+                        img_content.append({"type": "image", "image": img_b64})
                 if img_content:
                     img_content.append({"type": "text", "text": f"{task_query}\nPlease continue"})
                     messages.append({"role": "user", "content": img_content})
@@ -337,7 +337,7 @@ class GUIAgentLoop(AgentLoopBase):
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type": "image_url", "image_url": {"url": last_img_url}},
+                                    {"type": "image", "image": last_img_url},
                                     {"type": "text", "text": error_text},
                                 ],
                             }
@@ -348,7 +348,7 @@ class GUIAgentLoop(AgentLoopBase):
                     img_content = []
                     for img_b64 in tool_response.image:
                         if img_b64 is not None:
-                            img_content.append({"type": "image_url", "image_url": {"url": img_b64}})
+                            img_content.append({"type": "image", "image": img_b64})
                     img_content.append({"type": "text", "text": f"{task_query}\nPlease continue"})
                     messages.append({"role": "user", "content": img_content})
                 else:
