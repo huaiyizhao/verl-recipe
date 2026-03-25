@@ -412,7 +412,7 @@ class MCPDesktopEnvTool(BaseTool):
             "task_id": task_id,
             "ground_truth": ground_truth,
         }
-        return instance_id, ToolResponse(image=[_base64_to_pil(screenshot_b64)])
+        return instance_id, ToolResponse(image=[screenshot_b64])
 
     @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
@@ -436,7 +436,7 @@ class MCPDesktopEnvTool(BaseTool):
         summary = f"Executed action: {action}"
         if "coordinate" in parameters:
             summary += f" at {parameters['coordinate']}"
-        return ToolResponse(image=[_base64_to_pil(screenshot_b64)], text=summary), self.step_reward, {"action": action}
+        return ToolResponse(image=[screenshot_b64], text=summary), self.step_reward, {"action": action}
 
     async def calc_reward(self, instance_id: str, **kwargs) -> float:
         """Calculate task reward via the ground-truth validation API.

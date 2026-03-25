@@ -57,8 +57,6 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from PIL import Image
-
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopGroupOutput,
@@ -71,7 +69,6 @@ from recipe.gui_agent.context_manager import (
     KeepLastKImagesStrategy,
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
-from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -91,6 +88,18 @@ class GUIAgentState(Enum):
     GENERATING = "generating"
     PROCESSING_ACTION = "processing_action"
     TERMINATED = "terminated"
+
+
+def _find_last_image_url(messages: list[dict]) -> str | None:
+    """Find the last image_url data URI in the message history."""
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                return block["image_url"]["url"]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -174,22 +183,15 @@ class GUIAgentLoop(AgentLoopBase):
         )
 
         try:
-            # Add initial screenshot to messages and image_data
-            image_data: list[Image.Image] = []
+            # Add initial screenshot to messages as inline base64
             if initial_response.image:
-                for img in initial_response.image:
-                    if img is not None:
-                        image_data.append(img)
-                # Append initial observation as a user message with screenshot
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": f"{task_query}\nPlease continue"},
-                        ],
-                    }
-                )
+                img_content = []
+                for img_b64 in initial_response.image:
+                    if img_b64 is not None:
+                        img_content.append({"type": "image_url", "image_url": {"url": img_b64}})
+                if img_content:
+                    img_content.append({"type": "text", "text": f"{task_query}\nPlease continue"})
+                    messages.append({"role": "user", "content": img_content})
 
             # --- Multi-turn loop ---
             turn = 0
@@ -200,9 +202,11 @@ class GUIAgentLoop(AgentLoopBase):
                 turn += 1
 
                 # 1. Prune old images using the pluggable context strategy
-                messages, image_data = context_strategy.prepare_context(messages, image_data)
+                messages = context_strategy.prepare_context(messages)
 
-                # 2. Tokenize prompt for THIS turn
+                # 2. Extract images from messages and tokenize prompt for THIS turn
+                multi_modal_data = await self.process_vision_info(messages)
+                image_data = multi_modal_data.get("images")
                 prompt_ids = await self.apply_chat_template(
                     messages,
                     tools=self.tool_schemas,
@@ -244,12 +248,8 @@ class GUIAgentLoop(AgentLoopBase):
                 extra_fields["tool_rewards"] = []
                 extra_fields["turn_number"] = turn
 
-                # Build multi_modal_data for this trajectory
-                multi_modal_data: dict[str, Any] = {}
-                if image_data:
-                    multi_modal_data["images"] = list(image_data)
-
                 # 4. Save this turn as a trajectory
+                # multi_modal_data was already extracted by process_vision_info above
                 agent_metrics = AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
                 traj = AgentLoopOutput(
                     prompt_ids=prompt_ids,
@@ -330,35 +330,27 @@ class GUIAgentLoop(AgentLoopBase):
                 if tool_error is not None:
                     # All retries exhausted — tell the model what went wrong
                     error_text = f"Action failed: {tool_error}\n{task_query}\nPlease continue"
-                    if image_data:
-                        # Re-use the last known screenshot so the model has visual context
+                    # Re-use the last known screenshot so the model has visual context
+                    last_img_url = _find_last_image_url(messages)
+                    if last_img_url:
                         messages.append(
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type": "image"},
+                                    {"type": "image_url", "image_url": {"url": last_img_url}},
                                     {"type": "text", "text": error_text},
                                 ],
                             }
                         )
-                        image_data.append(image_data[-1])
                     else:
                         messages.append({"role": "user", "content": error_text})
                 elif tool_response.image:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image"},
-                                {"type": "text", "text": f"{task_query}\nPlease continue"},
-                            ],
-                        }
-                    )
-
-                    # Add new screenshot to image_data
-                    for img in tool_response.image:
-                        if img is not None:
-                            image_data.append(img)
+                    img_content = []
+                    for img_b64 in tool_response.image:
+                        if img_b64 is not None:
+                            img_content.append({"type": "image_url", "image_url": {"url": img_b64}})
+                    img_content.append({"type": "text", "text": f"{task_query}\nPlease continue"})
+                    messages.append({"role": "user", "content": img_content})
                 else:
                     messages.append(
                         {

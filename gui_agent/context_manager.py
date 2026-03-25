@@ -34,8 +34,6 @@ To add a new strategy, subclass :class:`BaseContextStrategy` and implement
 from abc import ABC, abstractmethod
 from typing import Any
 
-from PIL import Image
-
 
 # ---------------------------------------------------------------------------
 # Image-pruning helper (moved here to avoid circular imports)
@@ -44,25 +42,23 @@ from PIL import Image
 
 def keep_last_k_images(
     messages: list[dict[str, Any]],
-    image_data: list[Image.Image],
     k: int,
-) -> tuple[list[dict[str, Any]], list[Image.Image]]:
-    """Replace old screenshots in *messages* with text placeholders.
+) -> list[dict[str, Any]]:
+    """Replace old image_url blocks in *messages* with text placeholders.
 
-    Walks the message list in reverse order, counting ``{"type": "image"}``
+    Walks the message list in reverse order, counting ``{"type": "image_url"}``
     content blocks.  Beyond the *k*-th most recent image the content block is
     replaced with ``{"type": "text", "text": "[screenshot omitted]"}``.
 
-    The *image_data* list is trimmed to contain only the last *k* images so
-    that it stays in sync with the messages that still reference images.
+    Images are embedded inline as base64 data URLs so no separate image_data
+    list is needed.
 
     Args:
         messages: Chat messages (modified **in-place** and returned).
-        image_data: Ordered list of PIL images referenced by the messages.
         k: Number of recent screenshots to keep.
 
     Returns:
-        (messages, pruned_image_data)
+        messages (modified in-place)
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -73,11 +69,11 @@ def keep_last_k_images(
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "image":
+                if isinstance(block, dict) and block.get("type") == "image_url":
                     total_images += 1
 
     if total_images <= k:
-        return messages, image_data
+        return messages
 
     # Walk in reverse and keep only the last k
     images_seen_from_end = 0
@@ -87,56 +83,44 @@ def keep_last_k_images(
             continue
         for i in range(len(content) - 1, -1, -1):
             block = content[i]
-            if isinstance(block, dict) and block.get("type") == "image":
+            if isinstance(block, dict) and block.get("type") == "image_url":
                 images_seen_from_end += 1
                 if images_seen_from_end > k:
                     # Replace with placeholder
                     content[i] = {"type": "text", "text": "[screenshot omitted]"}
 
-    # Keep only the last k images in image_data
-    if len(image_data) > k:
-        pruned_image_data = image_data[-k:]
-    else:
-        pruned_image_data = image_data
-
-    return messages, pruned_image_data
+    return messages
 
 
 class BaseContextStrategy(ABC):
     """Abstract base class for context management strategies.
 
-    A context strategy receives the full message history and associated image
-    data, and returns a (possibly pruned) copy suitable for the next LLM
-    generation turn.
+    A context strategy receives the full message history (with images embedded
+    inline as base64 data URLs) and returns a pruned copy suitable for the
+    next LLM generation turn.
     """
 
     @abstractmethod
     def prepare_context(
         self,
         messages: list[dict[str, Any]],
-        image_data: list[Image.Image],
-    ) -> tuple[list[dict[str, Any]], list[Image.Image]]:
-        """Prepare messages and images for the next generation turn.
+    ) -> list[dict[str, Any]]:
+        """Prepare messages for the next generation turn.
 
         Implementations may modify *messages* in-place (the caller is expected
-        to pass a mutable list) and should return the (messages, image_data)
-        tuple.
+        to pass a mutable list) and should return the messages.
 
         Args:
             messages: Chat message history (may be modified in-place).
-            image_data: Ordered list of PIL images referenced by messages.
 
         Returns:
-            (processed_messages, processed_image_data)
+            processed_messages
         """
         ...
 
 
 class KeepLastKImagesStrategy(BaseContextStrategy):
     """Keep only the last *K* images, replacing older ones with text placeholders.
-
-    This strategy wraps the existing :func:`keep_last_k_images` helper so that
-    current behaviour is preserved when using the pluggable interface.
 
     Args:
         k: Number of recent screenshots to keep (default 3).
@@ -150,9 +134,8 @@ class KeepLastKImagesStrategy(BaseContextStrategy):
     def prepare_context(
         self,
         messages: list[dict[str, Any]],
-        image_data: list[Image.Image],
-    ) -> tuple[list[dict[str, Any]], list[Image.Image]]:
-        return keep_last_k_images(messages, image_data, self.k)
+    ) -> list[dict[str, Any]]:
+        return keep_last_k_images(messages, self.k)
 
 
 class SlidingWindowStrategy(BaseContextStrategy):
@@ -190,8 +173,7 @@ class SlidingWindowStrategy(BaseContextStrategy):
     def prepare_context(
         self,
         messages: list[dict[str, Any]],
-        image_data: list[Image.Image],
-    ) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+    ) -> list[dict[str, Any]]:
         # --- Step 1: identify prefix (system + first user) vs rounds ---
         prefix: list[dict[str, Any]] = []
         rounds_start = 0
@@ -230,23 +212,7 @@ class SlidingWindowStrategy(BaseContextStrategy):
 
         # --- Step 3: truncate to max_conversation_rounds ---
         if len(rounds) > self.max_conversation_rounds:
-            # Count images in dropped rounds so we can trim image_data
-            dropped_rounds = rounds[: len(rounds) - self.max_conversation_rounds]
-            dropped_image_count = 0
-            for rnd in dropped_rounds:
-                for msg in rnd:
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "image":
-                                dropped_image_count += 1
-
             rounds = rounds[-self.max_conversation_rounds:]
-            # Also trim image_data for fully dropped rounds
-            if dropped_image_count > 0 and len(image_data) > dropped_image_count:
-                image_data = image_data[dropped_image_count:]
-            elif dropped_image_count > 0:
-                image_data = []
 
         # --- Step 4: replace images in rounds beyond max_image_rounds ---
         # Count image-bearing rounds from the end
@@ -257,7 +223,7 @@ class SlidingWindowStrategy(BaseContextStrategy):
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "image":
+                        if isinstance(block, dict) and block.get("type") == "image_url":
                             has_image = True
                             break
                 if has_image:
@@ -267,36 +233,18 @@ class SlidingWindowStrategy(BaseContextStrategy):
 
         if len(image_round_indices) > self.max_image_rounds:
             rounds_to_strip = image_round_indices[: len(image_round_indices) - self.max_image_rounds]
-            images_stripped = 0
             for idx in rounds_to_strip:
                 for msg in rounds[idx]:
                     content = msg.get("content")
                     if isinstance(content, list):
                         for i in range(len(content)):
                             block = content[i]
-                            if isinstance(block, dict) and block.get("type") == "image":
+                            if isinstance(block, dict) and block.get("type") == "image_url":
                                 content[i] = {"type": "text", "text": "[screenshot omitted]"}
-                                images_stripped += 1
-
-            # Trim image_data to remove stripped images
-            if images_stripped > 0 and len(image_data) > images_stripped:
-                image_data = image_data[images_stripped:]
-            elif images_stripped > 0:
-                image_data = []
-
-        # --- Step 5: also handle images in prefix ---
-        # Count images in prefix
-        prefix_images = 0
-        for msg in prefix:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "image":
-                        prefix_images += 1
 
         # Reconstruct messages
         result_messages = prefix[:]
         for rnd in rounds:
             result_messages.extend(rnd)
 
-        return result_messages, image_data
+        return result_messages
