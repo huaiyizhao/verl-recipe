@@ -176,7 +176,9 @@ def _build_dataset_sample(
         # --- verl core fields ---
         "data_source": "meeting",
         "agent_name": "gui_agent",  # matches @register("gui_agent") in gui_agent_loop.py
-        "prompt": [],  # GUI agent loop constructs all messages; task query is in extra_info["question"]
+        "prompt": [
+            {"role": "system", "content": "You are a helpful assistant."}
+        ],  # GUI agent loop constructs all messages; task query is in extra_info["question"]
         "ability": "cu",
         "reward_model": {
             "style": "rule",
@@ -214,7 +216,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--base_url", default=DEFAULT_BASE_URL)
     parser.add_argument("--address_base_url", default=DEFAULT_ADDRESS_BASE_URL)
-    parser.add_argument("--address_env", default="a4861800")
+    parser.add_argument("--address_env", default="huaiyizhao")
     parser.add_argument("--address_namespace", default="Development")
     parser.add_argument("--address_expire_min", type=int, default=60)
     parser.add_argument("--address_retry_interval", type=float, default=1.0)
