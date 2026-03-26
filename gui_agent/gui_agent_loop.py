@@ -250,6 +250,16 @@ class GUIAgentLoop(AgentLoopBase):
 
                 # 4. Save this turn as a trajectory
                 # multi_modal_data was already extracted by process_vision_info above
+                n_images = len(multi_modal_data.get("images", []))
+                image_token_id = getattr(self.processor, "image_token_id", None) if hasattr(self, "processor") and self.processor else None
+                if image_token_id is not None:
+                    n_image_tokens = sum(1 for t in prompt_ids if t == image_token_id)
+                else:
+                    n_image_tokens = -1
+                logger.info(
+                    "[GUI-%s] Turn %d: n_images_in_mm_data=%d, n_image_tokens_in_prompt=%d, prompt_len=%d",
+                    task_id, turn, n_images, n_image_tokens, len(prompt_ids),
+                )
                 agent_metrics = AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
                 traj = AgentLoopOutput(
                     prompt_ids=prompt_ids,
