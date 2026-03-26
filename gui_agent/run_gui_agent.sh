@@ -32,7 +32,7 @@ export NNODES
 export RAY_NUM_NODES=$NNODES
 export WANDB_API_KEY=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
 export VERL_LOGGING_LEVEL=INFO
-# export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
+export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
 
 TOTAL_GPUS=$((GPUS_PER_NODE * NNODES))
 if [ "$TOTAL_GPUS" -lt 2 ]; then
@@ -78,13 +78,13 @@ print(f\"Released {r['unlocked']}/{r['total']}, failed {r['failed']}\")
 adv_estimator=grpo
 
 max_turns=20
-max_prompt_length=16384
-max_response_length=2048
+max_prompt_length=32768
+max_response_length=8192
 actor_lr=1e-6
 
-train_batch_size=1
-ppo_mini_batch_size=1
-n_resp_per_prompt=2
+train_batch_size=16
+ppo_mini_batch_size=16
+n_resp_per_prompt=16
 n_resp_per_prompt_val=1
 
 # ================= performance =================
@@ -133,8 +133,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger='["console","wandb"]' \
-    actor_rollout_ref.rollout.trace.backend=weave \
+    trainer.logger='["console","mlflow"]' \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
