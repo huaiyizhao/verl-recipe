@@ -65,6 +65,13 @@ default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 # ================= cleanup stale MCP addresses =================
 MCP_ALLOCATOR_URL=${MCP_ALLOCATOR_URL:-http://ns008-cu-manager-svc}
 MCP_ENV=${MCP_ENV:-huaiyizhao}
+MCP_TOTAL=${MCP_TOTAL:-40}
+
+# Request desktop env instances for training
+echo "Requesting $MCP_TOTAL env instances for env=$MCP_ENV ..."
+curl -s "$MCP_ALLOCATOR_URL/env-assign" -d "{\"env\":\"$MCP_ENV\",\"total\":$MCP_TOTAL}" || true
+
+# Release stale addresses from previous runs
 echo "Releasing stale MCP addresses for env=$MCP_ENV ..."
 python3 -c "
 import asyncio
@@ -73,6 +80,9 @@ c = _AddressClient(base_url='$MCP_ALLOCATOR_URL', env='$MCP_ENV')
 r = asyncio.run(c.unlock_all())
 print(f\"Released {r['unlocked']}/{r['total']}, failed {r['failed']}\")
 " || true
+
+# Release env instances on exit (normal or error)
+trap 'echo "Releasing env instances..."; curl -s "$MCP_ALLOCATOR_URL/env-assign" -d "{\"env\":\"$MCP_ENV\",\"total\":0}" || true' EXIT
 
 # ================= algorithm =================
 adv_estimator=grpo
