@@ -65,7 +65,7 @@ default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 # ================= cleanup stale MCP addresses =================
 MCP_ALLOCATOR_URL=${MCP_ALLOCATOR_URL:-http://ns008-cu-manager-svc}
 MCP_ENV=${MCP_ENV:-huaiyizhao}
-MCP_TOTAL=${MCP_TOTAL:-40}
+MCP_TOTAL=${MCP_TOTAL:-80}
 
 # Request desktop env instances for training
 echo "Requesting $MCP_TOTAL env instances for env=$MCP_ENV ..."
@@ -92,8 +92,8 @@ max_prompt_length=32768
 max_response_length=8192
 actor_lr=1e-6
 
-train_batch_size=16
-ppo_mini_batch_size=16
+train_batch_size=4
+ppo_mini_batch_size=8
 n_resp_per_prompt=16
 n_resp_per_prompt_val=1
 
@@ -138,7 +138,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
-    actor_rollout_ref.rollout.agent.num_workers=2 \
+    actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
