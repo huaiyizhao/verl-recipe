@@ -80,7 +80,7 @@ async def _fetch_one(
 async def poll_cu_api(
     base_url: str = DEFAULT_BASE_URL,
     max_count: int = 128,
-    max_attempts: int = 10000,
+    max_attempts: int = 1000000,
     concurrency: int = 32,
 ) -> list[dict]:
     """Poll the CU API concurrently to collect meeting room booking tasks."""
