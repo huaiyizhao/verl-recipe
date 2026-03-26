@@ -237,7 +237,7 @@ class GUIAgentLoop(AgentLoopBase):
                 response_logprobs = output.log_probs[: len(response_ids)] if output.log_probs else None
 
                 response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
-                logger.info("[GUI-%s] Turn %d/%d: %d prompt tokens, %d response tokens\n%s", task_id, turn, self.max_turns, len(prompt_ids), len(response_ids), response_text)
+                # logger.info("[GUI-%s] Turn %d/%d: %d prompt tokens, %d response tokens\n%s", task_id, turn, self.max_turns, len(prompt_ids), len(response_ids), response_text)
 
                 # Build extra_fields from async training metadata
                 extra_fields: dict[str, Any] = {}
@@ -249,17 +249,6 @@ class GUIAgentLoop(AgentLoopBase):
                 extra_fields["turn_number"] = turn
 
                 # 4. Save this turn as a trajectory
-                # multi_modal_data was already extracted by process_vision_info above
-                n_images = len(multi_modal_data.get("images", []))
-                image_token_id = getattr(self.processor, "image_token_id", None) if hasattr(self, "processor") and self.processor else None
-                if image_token_id is not None:
-                    n_image_tokens = sum(1 for t in prompt_ids if t == image_token_id)
-                else:
-                    n_image_tokens = -1
-                logger.info(
-                    "[GUI-%s] Turn %d: n_images_in_mm_data=%d, n_image_tokens_in_prompt=%d, prompt_len=%d",
-                    task_id, turn, n_images, n_image_tokens, len(prompt_ids),
-                )
                 agent_metrics = AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
                 traj = AgentLoopOutput(
                     prompt_ids=prompt_ids,
