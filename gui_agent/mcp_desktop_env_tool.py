@@ -245,16 +245,16 @@ class _MCPClient:
         self.timeout = timeout
         self.label = label  # e.g. "session=xxx, seed=yyy" for log context
         if auth_token:
-            self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}), timeout=timeout)
+            self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}))
         else:
-            self._client = Client({"mcpServers": {"default": {"url": mcp_url}}}, timeout=timeout)
+            self._client = Client({"mcpServers": {"default": {"url": mcp_url}}})
 
     async def call_tool(self, tool_name: str, parameters: dict[str, Any]) -> Any:
         """Call an MCP tool with automatic retry on transient failures."""
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with self._client:
-                    return await self._client.call_tool_mcp(tool_name, parameters)
+                    return await self._client.call_tool_mcp(tool_name, parameters, timeout=self.timeout)
             except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
