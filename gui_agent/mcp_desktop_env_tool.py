@@ -257,15 +257,15 @@ class _MCPClient:
             except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
-                        "MCP call %s failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
-                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "MCP call %s(%s) failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
+                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc, self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
                 else:
                     logger.error(
-                        "MCP call %s failed (url=%s, %sattempt %d/%d, error=%s: %s)",
-                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "MCP call %s(%s) failed (url=%s, %sattempt %d/%d, error=%s: %s)",
+                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc,
                     )
                     raise
