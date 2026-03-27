@@ -276,8 +276,8 @@ class GUIAgentLoop(AgentLoopBase):
                 tool_call = tool_calls[0]
                 try:
                     tool_args = json.loads(tool_call.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(f"Failed to parse tool arguments: {tool_call.arguments}")
+                except Exception as e:
+                    logger.warning("Failed to parse tool arguments: %s (error: %s, type: %s)", tool_call, e, type(e).__name__)
                     terminated = True
                     continue
 

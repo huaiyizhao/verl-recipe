@@ -43,6 +43,12 @@ from verl.utils.rollout_trace import rollout_trace_op
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+# fastmcp.Client spawns background tasks (SSE reader, post writer) that log
+# errors directly when MCP connections fail. These bypass our try/except in
+# call_tool and produce massive spam on ConnectTimeout. Our call_tool retry
+# already logs the actual failure, so suppress the background task noise.
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.CRITICAL)
+
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
@@ -229,13 +235,14 @@ class _AddressClient:
 class _MCPClient:
     """Thin wrapper around :class:`fastmcp.Client` (imported lazily)."""
 
-    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0):
+    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0, label: str = ""):
         from fastmcp import Client
         from fastmcp.client.transports import SSETransport
 
         self.mcp_url = mcp_url
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.label = label  # e.g. "session=xxx, seed=yyy" for log context
         if auth_token:
             self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}))
         else:
@@ -247,15 +254,20 @@ class _MCPClient:
             try:
                 async with self._client:
                     return await self._client.call_tool_mcp(tool_name, parameters)
-            except Exception:
+            except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
-                        "MCP call %s failed (url=%s, attempt %d/%d), retrying...",
-                        tool_name, self.mcp_url, attempt, self.max_retries,
+                        "MCP call %s failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
+                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        attempt, self.max_retries, type(exc).__name__, exc, self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
                 else:
-                    logger.error("MCP call %s failed (url=%s, attempt %d/%d)", tool_name, self.mcp_url, attempt, self.max_retries)
+                    logger.error(
+                        "MCP call %s failed (url=%s, %sattempt %d/%d, error=%s: %s)",
+                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        attempt, self.max_retries, type(exc).__name__, exc,
+                    )
                     raise
 
     def _extract_image(self, result) -> Optional[str]:
@@ -395,7 +407,8 @@ class MCPDesktopEnvTool(BaseTool):
 
         try:
             await addr_client.reboot(address, self.reboot_max_retries, self.reboot_retry_interval, self.timeout)
-            mcp = _MCPClient(_AddressClient.to_mcp_url(address), auth_token=self.auth_token)
+            mcp_label = f"session={ground_truth.get('session')}, seed={ground_truth.get('seed')}, qseed={ground_truth.get('qseed')}"
+            mcp = _MCPClient(_AddressClient.to_mcp_url(address), auth_token=self.auth_token, label=mcp_label)
 
             # Navigate browser to initial URL if url_rewrite is configured
             initial_url = _build_initial_url(ground_truth, create_kwargs.get("url_rewrite"))
