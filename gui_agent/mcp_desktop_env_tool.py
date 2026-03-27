@@ -229,33 +229,37 @@ class _AddressClient:
 class _MCPClient:
     """Thin wrapper around :class:`fastmcp.Client` (imported lazily)."""
 
-    def __init__(self, mcp_url: str, auth_token: Optional[str] = None):
+    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0):
         from fastmcp import Client
         from fastmcp.client.transports import SSETransport
 
         self.mcp_url = mcp_url
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         if auth_token:
             self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}))
         else:
             self._client = Client({"mcpServers": {"default": {"url": mcp_url}}})
 
     async def call_tool(self, tool_name: str, parameters: dict[str, Any]) -> Any:
-        """Call an MCP tool and return the raw result."""
-        try:
-            async with self._client:
-                return await self._client.call_tool_mcp(tool_name, parameters)
-        except Exception:
-            logger.error("MCP call %s failed (url=%s)", tool_name, self.mcp_url)
-            raise
+        """Call an MCP tool with automatic retry on transient failures."""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                async with self._client:
+                    return await self._client.call_tool_mcp(tool_name, parameters)
+            except Exception:
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "MCP call %s failed (url=%s, attempt %d/%d), retrying...",
+                        tool_name, self.mcp_url, attempt, self.max_retries,
+                    )
+                    await asyncio.sleep(self.retry_delay)
+                else:
+                    logger.error("MCP call %s failed (url=%s, attempt %d/%d)", tool_name, self.mcp_url, attempt, self.max_retries)
+                    raise
 
-    async def take_screenshot(self) -> Optional[str]:
-        """Call ``browser_take_screenshot`` and return a ``data:image/…;base64,…`` URI, or *None*."""
-        try:
-            result = await self.call_tool("browser_take_screenshot", {})
-        except Exception as exc:
-            logger.warning("Screenshot failed: %s", exc)
-            return None
-
+    def _extract_image(self, result) -> Optional[str]:
+        """Extract a ``data:image/…;base64,…`` URI from an MCP tool result, or *None*."""
         for item in getattr(result, "content", None) or []:
             if hasattr(item, "type") and item.type == "image" and isinstance(getattr(item, "data", None), str):
                 raw = item.data
@@ -264,6 +268,15 @@ class _MCPClient:
                 mime = getattr(item, "mimeType", None) or getattr(item, "mime_type", None) or "image/png"
                 return f"data:{mime};base64,{raw}"
         return None
+
+    async def take_screenshot(self) -> Optional[str]:
+        """Call ``browser_take_screenshot`` and return a ``data:image/…;base64,…`` URI, or *None*."""
+        try:
+            result = await self.call_tool("browser_take_screenshot", {})
+        except Exception as exc:
+            logger.warning("Screenshot failed: %s", exc)
+            return None
+        return self._extract_image(result)
 
     async def close(self) -> None:
         """Best-effort cleanup of underlying client resources."""
@@ -399,7 +412,12 @@ class MCPDesktopEnvTool(BaseTool):
                 await asyncio.sleep(3)
             if screenshot_b64 is None:
                 raise RuntimeError(f"Failed to take initial screenshot from {address} after 3 attempts")
-        except Exception:
+        except Exception as exc:
+            gt = ground_truth
+            logger.error(
+                "create(%s) failed: address=%s, session=%s, seed=%s, qseed=%s, error=%s",
+                task_id, address, gt.get("session"), gt.get("seed"), gt.get("qseed"), exc,
+            )
             try:
                 await addr_client.release(instance_id)
             except Exception:
@@ -425,12 +443,26 @@ class MCPDesktopEnvTool(BaseTool):
         if action == "terminate":
             return ToolResponse(text=f"Task terminated with status: {parameters.get('status', 'unknown')}"), 0.0, {}
 
+        gt = info.get("ground_truth", {})
         mcp: _MCPClient = info["mcp_client"]
-        await mcp.call_tool("computer_use", parameters)
+        try:
+            result = await mcp.call_tool("computer_use", parameters)
+        except Exception as exc:
+            logger.error(
+                "execute(%s) computer_use failed: address=%s, session=%s, seed=%s, qseed=%s, action=%s, error=%s",
+                instance_id, info.get("address"), gt.get("session"), gt.get("seed"), gt.get("qseed"), action, exc,
+            )
+            raise
 
-        screenshot_b64 = await mcp.take_screenshot()
+        # Use image from tool result; fall back to separate screenshot if none
+        screenshot_b64 = mcp._extract_image(result)
         if screenshot_b64 is None:
-            logger.warning("Screenshot failed after '%s' for %s", action, instance_id)
+            screenshot_b64 = await mcp.take_screenshot()
+        if screenshot_b64 is None:
+            logger.warning(
+                "Screenshot failed after '%s' for %s: address=%s, session=%s",
+                action, instance_id, info.get("address"), gt.get("session"),
+            )
             return ToolResponse(text=f"Executed action: {action} (screenshot unavailable)"), self.step_reward, {"action": action}
 
         summary = f"Executed action: {action}"
