@@ -82,7 +82,7 @@ print(f\"Released {r['unlocked']}/{r['total']}, failed {r['failed']}\")
 " || true
 
 # Release env instances on exit (normal or error)
-trap 'echo "Releasing env instances..."; curl -s "$MCP_ALLOCATOR_URL/env-assign" -d "{\"env\":\"$MCP_ENV\",\"total\":0}" || true' EXIT
+trap 'echo "Releasing env instances..."; curl -s "$MCP_ALLOCATOR_URL/env-assign" -d "{\"env\":\"$MCP_ENV\",\"total\":1}" || true' EXIT
 
 # ================= algorithm =================
 adv_estimator=grpo
