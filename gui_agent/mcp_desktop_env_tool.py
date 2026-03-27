@@ -235,18 +235,19 @@ class _AddressClient:
 class _MCPClient:
     """Thin wrapper around :class:`fastmcp.Client` (imported lazily)."""
 
-    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0, label: str = ""):
+    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0, timeout: float = 10.0, label: str = ""):
         from fastmcp import Client
         from fastmcp.client.transports import SSETransport
 
         self.mcp_url = mcp_url
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.timeout = timeout
         self.label = label  # e.g. "session=xxx, seed=yyy" for log context
         if auth_token:
-            self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}))
+            self._client = Client(SSETransport(url=mcp_url, headers={"Authorization": f"Bearer {auth_token}"}), timeout=timeout)
         else:
-            self._client = Client({"mcpServers": {"default": {"url": mcp_url}}})
+            self._client = Client({"mcpServers": {"default": {"url": mcp_url}}}, timeout=timeout)
 
     async def call_tool(self, tool_name: str, parameters: dict[str, Any]) -> Any:
         """Call an MCP tool with automatic retry on transient failures."""
@@ -408,7 +409,7 @@ class MCPDesktopEnvTool(BaseTool):
         try:
             await addr_client.reboot(address, self.reboot_max_retries, self.reboot_retry_interval, self.timeout)
             mcp_label = f"session={ground_truth.get('session')}, seed={ground_truth.get('seed')}, qseed={ground_truth.get('qseed')}"
-            mcp = _MCPClient(_AddressClient.to_mcp_url(address), auth_token=self.auth_token, label=mcp_label)
+            mcp = _MCPClient(_AddressClient.to_mcp_url(address), auth_token=self.auth_token, timeout=self.timeout, label=mcp_label)
 
             # Navigate browser to initial URL if url_rewrite is configured
             initial_url = _build_initial_url(ground_truth, create_kwargs.get("url_rewrite"))
