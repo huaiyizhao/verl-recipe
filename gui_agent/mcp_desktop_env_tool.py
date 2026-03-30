@@ -25,7 +25,6 @@ External dependencies: ``aiohttp``, ``requests``, ``fastmcp`` (lazy),
 
 import asyncio
 import base64
-from datetime import timedelta
 import io
 import logging
 import os
@@ -255,7 +254,7 @@ class _MCPClient:
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with self._client:
-                    return await self._client.call_tool_mcp(tool_name, parameters, read_timeout_seconds=timedelta(seconds=self.timeout),)
+                    return await self._client.call_tool(tool_name, parameters, timeout=self.timeout)
             except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
