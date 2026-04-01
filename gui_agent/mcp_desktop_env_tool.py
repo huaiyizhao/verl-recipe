@@ -42,6 +42,11 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
 
 # fastmcp.Client spawns background tasks (SSE reader, post writer) that log
 # errors directly when MCP connections fail. These bypass our try/except in
@@ -257,15 +262,15 @@ class _MCPClient:
             except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
-                        "[_MCPClient] call %s failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
-                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "[_MCPClient] call %s(%s) failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
+                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc, self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
                 else:
                     logger.error(
-                        "[_MCPClient] call %s failed after all retries (url=%s, %sattempt %d/%d, error=%s: %s)",
-                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "[_MCPClient] call %s(%s) failed after all retries (url=%s, %sattempt %d/%d, error=%s: %s)",
+                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc,
                     )
                     raise
