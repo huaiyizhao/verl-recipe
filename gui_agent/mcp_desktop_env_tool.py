@@ -371,7 +371,7 @@ class MCPDesktopEnvTool(BaseTool):
 
         self.screen_width = screen_width
         self.screen_height = screen_height
-        self.timeout = config.get("timeout", 30)
+        self.timeout = config.get("timeout", 60)
         self.step_reward = config.get("step_reward", 0.0)
         self.auth_token = config.get("auth_token")
         self.reboot_max_retries = config.get("reboot_max_retries", 12)
