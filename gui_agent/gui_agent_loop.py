@@ -123,7 +123,6 @@ class GUIAgentLoop(AgentLoopBase):
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
         self.keep_last_k = 3  # default, can be overridden per-task from data
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
-        self.tool_execute_retries = 2  # retry transient env errors before telling the model
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -144,7 +143,7 @@ class GUIAgentLoop(AgentLoopBase):
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
 
     @rollout_trace_op
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopGroupOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopGroupOutput | None:
         """Run the GUI agent loop.
 
         Args:
@@ -178,9 +177,21 @@ class GUIAgentLoop(AgentLoopBase):
         # --- Create env and get initial screenshot ---
         create_kwargs.setdefault("task_id", task_id)
 
-        instance_id, initial_response = await self.desktop_tool.create(
-            create_kwargs=create_kwargs,
-        )
+        try:
+            instance_id, initial_response = await self.desktop_tool.create(
+                create_kwargs=create_kwargs,
+            )
+        except Exception as exc:
+            logger.error("[GUIAgentLoop] Failed to create environment for %s, discarding rollout: %s", task_id, exc)
+            return None
+
+        # If create succeeded but MCP is dead (e.g. browser_navigate or screenshot failed),
+        # release the env and discard this rollout.
+        instance_info = getattr(self.desktop_tool, "_instances", {}).get(instance_id, {})
+        if instance_info.get("mcp_dead"):
+            logger.warning("[GUIAgentLoop] MCP is dead after create for %s, discarding rollout", task_id)
+            await self.desktop_tool.release(instance_id)
+            return None
 
         try:
             # Add initial screenshot to messages as inline base64
@@ -293,29 +304,20 @@ class GUIAgentLoop(AgentLoopBase):
                     messages.append({"role": "assistant", "content": assistant_text})
                     continue
 
-                # Execute action on desktop with retry for transient env errors
-                tool_response = None
-                tool_error = None
-                for attempt in range(1, self.tool_execute_retries + 1):
-                    try:
-                        tool_response, tool_reward, tool_metrics = await self.desktop_tool.execute(
-                            instance_id, tool_args
-                        )
-                        extra_fields["tool_rewards"].append(tool_reward)
-                        tool_error = None
-                        break
-                    except TimeoutError:
-                        # Fatal: env is broken (MCP timeout, env crash, etc.)
-                        logger.error(f"Fatal: timeout executing tool for {task_id}, aborting rollout")
+                # Execute action on desktop (retry is handled inside _MCPClient.call_tool)
+                try:
+                    tool_response, tool_reward, tool_metrics = await self.desktop_tool.execute(
+                        instance_id, tool_args
+                    )
+                    # Check if MCP marked as dead via metrics
+                    if tool_metrics.get("mcp_failed"):
+                        logger.error("[GUIAgentLoop] MCP call failed for %s, aborting rollout", task_id)
                         fatal_error = True
-                        break
-                    except Exception as e:
-                        tool_error = e
-                        if attempt < self.tool_execute_retries:
-                            logger.warning(f"Tool execution failed (attempt {attempt}), retrying: {e}")
-                        else:
-                            logger.warning(f"Tool execution failed after {self.tool_execute_retries} attempts: {e}")
-                            extra_fields["tool_rewards"].append(0.0)
+                    else:
+                        extra_fields["tool_rewards"].append(tool_reward)
+                except Exception as e:
+                    logger.error("[GUIAgentLoop] Tool execution failed for %s, aborting rollout: %s", task_id, e)
+                    fatal_error = True
 
                 if fatal_error:
                     break
@@ -326,24 +328,7 @@ class GUIAgentLoop(AgentLoopBase):
                 )
                 messages.append({"role": "assistant", "content": assistant_text})
 
-                if tool_error is not None:
-                    # All retries exhausted — tell the model what went wrong
-                    error_text = f"Action failed: {tool_error}\n{task_query}\nPlease continue"
-                    # Re-use the last known screenshot so the model has visual context
-                    last_img_url = _find_last_image_url(messages)
-                    if last_img_url:
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image", "image": last_img_url},
-                                    {"type": "text", "text": error_text},
-                                ],
-                            }
-                        )
-                    else:
-                        messages.append({"role": "user", "content": error_text})
-                elif tool_response.image:
+                if tool_response and tool_response.image:
                     img_content = []
                     for img_b64 in tool_response.image:
                         if img_b64 is not None:
@@ -360,7 +345,8 @@ class GUIAgentLoop(AgentLoopBase):
 
             # --- Compute final reward ---
             if fatal_error:
-                reward = 0.0
+                logger.warning("[GUIAgentLoop] Fatal error for %s, discarding rollout", task_id)
+                return None
             else:
                 reward = await self.desktop_tool.calc_reward(instance_id)
                 logger.info("[GUI-%s] Final reward = %.4f", task_id, reward)

@@ -47,7 +47,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # errors directly when MCP connections fail. These bypass our try/except in
 # call_tool and produce massive spam on ConnectTimeout. Our call_tool retry
 # already logs the actual failure, so suppress the background task noise.
-logging.getLogger("mcp.client.streamable_http").setLevel(logging.CRITICAL)
 
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
@@ -258,15 +257,15 @@ class _MCPClient:
             except Exception as exc:
                 if attempt < self.max_retries:
                     logger.warning(
-                        "MCP call %s(%s) failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
-                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "[_MCPClient] call %s failed (url=%s, %sattempt %d/%d, error=%s: %s), retrying in %.1fs...",
+                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc, self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
                 else:
                     logger.error(
-                        "MCP call %s(%s) failed (url=%s, %sattempt %d/%d, error=%s: %s)",
-                        tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
+                        "[_MCPClient] call %s failed after all retries (url=%s, %sattempt %d/%d, error=%s: %s)",
+                        tool_name, self.mcp_url, f"{self.label}, " if self.label else "",
                         attempt, self.max_retries, type(exc).__name__, exc,
                     )
                     raise
@@ -287,7 +286,7 @@ class _MCPClient:
         try:
             result = await self.call_tool("browser_take_screenshot", {})
         except Exception as exc:
-            logger.warning("Screenshot failed: %s", exc)
+            logger.warning("[_MCPClient] Screenshot failed: %s", exc)
             return None
         return self._extract_image(result)
 
@@ -305,7 +304,7 @@ class _MCPClient:
                     except asyncio.CancelledError:
                         pass
         except Exception as exc:
-            logger.warning("Client cleanup error: %s", exc)
+            logger.warning("[_MCPClient] Client cleanup error: %s", exc)
 
 
 # ============================================================================
@@ -397,7 +396,7 @@ class MCPDesktopEnvTool(BaseTool):
         ground_truth["session"] = str(uuid4())
 
         logger.info(
-            "create(%s): session=%s, seed=%s, qseed=%s",
+            "[MCPDesktopEnvTool] create(%s): session=%s, seed=%s, qseed=%s",
             task_id, ground_truth["session"],
             ground_truth.get("seed", "N/A"),
             ground_truth.get("qseed", "N/A"),
@@ -416,27 +415,25 @@ class MCPDesktopEnvTool(BaseTool):
             if initial_url:
                 await mcp.call_tool("browser_navigate", {"url": initial_url})
 
-            # Take initial screenshot with retries (browser may need time to stabilize)
-            screenshot_b64 = None
-            for attempt in range(1, 4):
-                screenshot_b64 = await mcp.take_screenshot()
-                if screenshot_b64 is not None:
-                    break
-                logger.warning("Screenshot attempt %d/3 failed for %s, retrying...", attempt, address)
-                await asyncio.sleep(3)
+            # Take initial screenshot (call_tool inside already retries 3 times)
+            screenshot_b64 = await mcp.take_screenshot()
             if screenshot_b64 is None:
-                raise RuntimeError(f"Failed to take initial screenshot from {address} after 3 attempts")
+                raise RuntimeError(f"Failed to take initial screenshot from {address}")
         except Exception as exc:
             gt = ground_truth
             logger.error(
-                "create(%s) failed: address=%s, session=%s, seed=%s, qseed=%s, error=%s",
+                "[MCPDesktopEnvTool] create(%s) failed: address=%s, session=%s, seed=%s, qseed=%s, error=%s",
                 task_id, address, gt.get("session"), gt.get("seed"), gt.get("qseed"), exc,
             )
-            try:
-                await addr_client.release(instance_id)
-            except Exception:
-                logger.warning("Failed to release address for %s after create error", instance_id)
-            raise
+            # Store instance with mcp_dead flag so execute() short-circuits
+            self._instances[instance_id] = {
+                "address": address,
+                "mcp_client": None,
+                "task_id": task_id,
+                "ground_truth": ground_truth,
+                "mcp_dead": True,
+            }
+            return instance_id, ToolResponse(text=f"[MCPDesktopEnvTool] Environment initialization failed: {exc}")
 
         self._instances[instance_id] = {
             "address": address,
@@ -457,16 +454,30 @@ class MCPDesktopEnvTool(BaseTool):
         if action == "terminate":
             return ToolResponse(text=f"Task terminated with status: {parameters.get('status', 'unknown')}"), 0.0, {}
 
+        # Early exit if MCP connection is already dead
+        if info.get("mcp_dead"):
+            logger.warning("[MCPDesktopEnvTool] execute(%s) skipped: MCP connection is dead", instance_id)
+            return (
+                ToolResponse(text="MCP connection is dead. Task terminated."),
+                0.0,
+                {"mcp_failed": True},
+            )
+
         gt = info.get("ground_truth", {})
         mcp: _MCPClient = info["mcp_client"]
         try:
             result = await mcp.call_tool("computer_use", parameters)
         except Exception as exc:
             logger.error(
-                "execute(%s) computer_use failed: address=%s, session=%s, seed=%s, qseed=%s, action=%s, error=%s",
+                "[MCPDesktopEnvTool] execute(%s) computer_use failed: address=%s, session=%s, seed=%s, qseed=%s, action=%s, error=%s",
                 instance_id, info.get("address"), gt.get("session"), gt.get("seed"), gt.get("qseed"), action, exc,
             )
-            raise
+            info["mcp_dead"] = True
+            return (
+                ToolResponse(text=f"MCP call failed: {exc}. Task terminated."),
+                0.0,
+                {"mcp_failed": True},
+            )
 
         # Use image from tool result; fall back to separate screenshot if none
         screenshot_b64 = mcp._extract_image(result)
@@ -474,7 +485,7 @@ class MCPDesktopEnvTool(BaseTool):
             screenshot_b64 = await mcp.take_screenshot()
         if screenshot_b64 is None:
             logger.warning(
-                "Screenshot failed after '%s' for %s: address=%s, session=%s",
+                "[MCPDesktopEnvTool] Screenshot failed after '%s' for %s: address=%s, session=%s",
                 action, instance_id, info.get("address"), gt.get("session"),
             )
             return ToolResponse(text=f"Executed action: {action} (screenshot unavailable)"), self.step_reward, {"action": action}
@@ -493,16 +504,16 @@ class MCPDesktopEnvTool(BaseTool):
         """
         info = self._instances.get(instance_id)
         if info is None:
-            logger.warning("calc_reward: unknown instance_id %s", instance_id)
+            logger.warning("[MCPDesktopEnvTool] calc_reward: unknown instance_id %s", instance_id)
             return 0.0
 
         gt = info.get("ground_truth", {})
         base_url, seed, qseed, session = gt.get("base_url", ""), gt.get("seed"), gt.get("qseed"), gt.get("session")
         if not (seed and qseed and session):
-            logger.warning("calc_reward(%s): missing required keys", instance_id)
+            logger.warning("[MCPDesktopEnvTool] calc_reward(%s): missing required keys", instance_id)
             return 0.0
         if not base_url:
-            logger.warning("calc_reward(%s): base_url is empty", instance_id)
+            logger.warning("[MCPDesktopEnvTool] calc_reward(%s): base_url is empty", instance_id)
             return 0.0
 
         mock_date = gt.get("mock_date", "")
@@ -520,10 +531,10 @@ class MCPDesktopEnvTool(BaseTool):
             if mcp is not None:
                 await mcp.close()
         except Exception:
-            logger.warning("Failed to close MCP client for %s", instance_id, exc_info=True)
+            logger.warning("[MCPDesktopEnvTool] Failed to close MCP client for %s", instance_id, exc_info=True)
         finally:
             if self._address_client is not None:
                 try:
                     await self._address_client.release(instance_id)
                 except Exception:
-                    logger.warning("Failed to release address for %s", instance_id, exc_info=True)
+                    logger.warning("[MCPDesktopEnvTool] Failed to release address for %s", instance_id, exc_info=True)
