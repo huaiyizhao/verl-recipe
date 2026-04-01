@@ -257,6 +257,11 @@ class _MCPClient:
         """Call an MCP tool with automatic retry on transient failures."""
         for attempt in range(1, self.max_retries + 1):
             try:
+                logger.debug(
+                    "[_MCPClient] -> %s(%s) (url=%s, %sattempt %d/%d, timeout=%.1fs)",
+                    tool_name, parameters, self.mcp_url, f"{self.label}, " if self.label else "",
+                    attempt, self.max_retries, self.timeout,
+                )
                 async with self._client:
                     return await self._client.call_tool(tool_name, parameters, timeout=self.timeout)
             except Exception as exc:
