@@ -88,13 +88,13 @@ trap 'echo "Releasing env instances..."; curl -s "$MCP_ALLOCATOR_URL/env-assign"
 adv_estimator=grpo
 
 max_turns=20
-max_prompt_length=32768
-max_response_length=8192
+max_prompt_length=16000
+max_response_length=4096
 actor_lr=1e-6
 
 train_batch_size=2
 ppo_mini_batch_size=2
-n_resp_per_prompt=16
+n_resp_per_prompt=8
 n_resp_per_prompt_val=1
 
 # ================= performance =================
