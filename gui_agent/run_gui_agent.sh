@@ -30,9 +30,12 @@ export GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${GPUS_PER_NODE:-8}}
 NNODES=${SLURM_JOB_NUM_NODES:-${NNODES:-1}}
 export NNODES
 export RAY_NUM_NODES=$NNODES
-export WANDB_API_KEY=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
+# export WANDB_API_KEY=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
 export VERL_LOGGING_LEVEL=DEBUG
 export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
+export WANDB_BASE_URL="http://10.3.53.138:8080"
+export WANDB_API_KEY=local-16e25bbe5e89b34e6418adc9287b845ac07eb8fa
+
 
 TOTAL_GPUS=$((GPUS_PER_NODE * NNODES))
 if [ "$TOTAL_GPUS" -lt 2 ]; then
@@ -143,7 +146,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    trainer.logger='["console","mlflow"]' \
+    trainer.logger='["console","wandb"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name=$project_name \
