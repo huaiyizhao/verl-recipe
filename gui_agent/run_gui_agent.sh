@@ -31,12 +31,12 @@ NNODES=${SLURM_JOB_NUM_NODES:-${NNODES:-1}}
 export NNODES
 export RAY_NUM_NODES=$NNODES
 export HYDRA_FULL_ERROR=1
-export RAY_LOG_TO_STDERR=1
-# export WANDB_API_KEY=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
+# export RAY_LOG_TO_STDERR=1
+export WANDB_API_KEY=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
 export VERL_LOGGING_LEVEL=DEBUG
-export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
-export WANDB_BASE_URL="http://10.3.53.138:8080"
-export WANDB_API_KEY=local-16e25bbe5e89b34e6418adc9287b845ac07eb8fa
+# export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
+# export WANDB_BASE_URL="http://10.3.53.138:8080"
+# export WANDB_API_KEY=local-16e25bbe5e89b34e6418adc9287b845ac07eb8fa
 
 
 TOTAL_GPUS=$((GPUS_PER_NODE * NNODES))
@@ -149,8 +149,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger='["console","wandb"]' \
-    actor_rollout_ref.rollout.trace.backend=mlflow \
-    actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \
@@ -160,3 +158,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="$default_local_dir" \
     trainer.test_freq=10 \
     trainer.total_epochs=1 "$@"
+
+
+    # actor_rollout_ref.rollout.trace.backend=mlflow \
+    # actor_rollout_ref.rollout.trace.token2text=True \

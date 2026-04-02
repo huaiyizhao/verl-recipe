@@ -53,7 +53,7 @@ if not logger.handlers:
 # call_tool and produce massive spam on ConnectTimeout. Our call_tool retry
 # already logs the actual failure, so suppress the background task noise.
 
-_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60)
 
 
 def _to_base_url(address: str) -> str:
@@ -181,7 +181,7 @@ class _AddressClient:
         self._mapping.clear()
         return {"total": len(addresses), "unlocked": unlocked, "failed": failed}
 
-    async def reboot(self, address: str, max_retries: int = 30, retry_interval: float = 2.0, timeout: int = 10) -> None:
+    async def reboot(self, address: str, max_retries: int = 3, retry_interval: float = 2.0, timeout: int = 60) -> None:
         """POST ``/instruction/reboot`` then poll ``/instruction/status`` until 200."""
         base = _to_base_url(address)
         to = aiohttp.ClientTimeout(total=timeout)
@@ -239,7 +239,7 @@ class _AddressClient:
 class _MCPClient:
     """Thin wrapper around :class:`fastmcp.Client` (imported lazily)."""
 
-    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 3.0, timeout: float = 10.0, label: str = ""):
+    def __init__(self, mcp_url: str, auth_token: Optional[str] = None, max_retries: int = 3, retry_delay: float = 5.0, timeout: float = 60.0, label: str = ""):
         from fastmcp import Client
         from fastmcp.client.transports import SSETransport
 
@@ -322,7 +322,7 @@ class _MCPClient:
 # ============================================================================
 
 
-def _check_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 15) -> dict[str, Any]:
+def _check_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 60) -> dict[str, Any]:
     """``GET <base_url>/api/__task__?…&check=true`` → ``{"score": int, "reward": float}``."""
     url = f"{base_url}/api/__task__?seed={seed}&qseed={qseed}&_session_={session}&_mockdate_={mock_date}&check=true"
     try:
@@ -341,7 +341,7 @@ def _check_task(base_url: str, seed: str, qseed: str, session: str, mock_date: s
         return {"score": 0, "reward": 0.0}
 
 
-def _reset_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 10) -> None:
+def _reset_task(base_url: str, seed: str, qseed: str, session: str, mock_date: str = "", timeout: int = 60) -> None:
     """Best-effort reset after reward evaluation."""
     try:
         url = f"{base_url}/__reset__?seed={seed}&qseed={qseed}&_session_={session}&_mockdate_={mock_date}"
@@ -379,7 +379,7 @@ class MCPDesktopEnvTool(BaseTool):
         self.timeout = config.get("timeout", 60)
         self.step_reward = config.get("step_reward", 0.0)
         self.auth_token = config.get("auth_token")
-        self.reboot_max_retries = config.get("reboot_max_retries", 12)
+        self.reboot_max_retries = config.get("reboot_max_retries", 3)
         self.reboot_retry_interval = config.get("reboot_retry_interval", 2.0)
         self._instances: dict[str, dict[str, Any]] = {}
 
