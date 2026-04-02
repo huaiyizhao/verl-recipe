@@ -30,6 +30,8 @@ export GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${GPUS_PER_NODE:-8}}
 NNODES=${SLURM_JOB_NUM_NODES:-${NNODES:-1}}
 export NNODES
 export RAY_NUM_NODES=$NNODES
+export HYDRA_FULL_ERROR=1
+export RAY_LOG_TO_STDERR=1
 # export WANDB_API_KEY=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
 export VERL_LOGGING_LEVEL=DEBUG
 export MLFLOW_TRACKING_URI="http://mlflow-tracking:23001"
@@ -96,7 +98,7 @@ max_response_length=4096
 actor_lr=1e-6
 
 train_batch_size=2
-ppo_mini_batch_size=2
+ppo_mini_batch_size=1
 n_resp_per_prompt=8
 n_resp_per_prompt_val=1
 
@@ -143,7 +145,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     trainer.logger='["console","wandb"]' \
@@ -156,5 +158,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes="$NNODES" \
     trainer.save_freq=-1 \
     trainer.default_local_dir="$default_local_dir" \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.total_epochs=1 "$@"
