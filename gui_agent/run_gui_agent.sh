@@ -50,7 +50,7 @@ echo "Using $NNODES nodes and $GPUS_PER_NODE GPUs per node..."
 # ================= data / model / tool =================
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-model_path=${model_path:-Qwen/Qwen3-VL-8B-Instruct}
+model_path=${model_path:-/efs/data/cua/runs/0318n-lora-all-data/v0-20260327-044237/checkpoint-914-merged}
 
 train_files=${train_files:-/efs/data/cua/rl/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/test.parquet}
@@ -64,7 +64,7 @@ tool_config_path=recipe/gui_agent/config/tool_config.yaml
 
 # =================== wandb ===================
 project_name=gui_agent_training
-experiment_name=qwen3-vl-8b-gui-agent
+experiment_name=0318n-lora-all-data
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= cleanup stale MCP addresses =================
