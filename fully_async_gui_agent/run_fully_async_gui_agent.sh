@@ -39,12 +39,12 @@ export HYDRA_FULL_ERROR=1
 export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen2.5-VL-7B-Instruct"}
-train_files=${train_files:-/efs/data/cua/rl/train.parquet}
-test_files=${test_files:-/efs/data/cua/rl/test.parquet}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
+test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
 # ================= desktop env service =================
-export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://localhost:2354}
+export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://10.192.64.33:2354}
 
 # ================= rollout / agent loop =================
 rollout_mode="async"

@@ -53,13 +53,15 @@ import urllib.request
 from typing import Any
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a GUI agent controlling a Linux desktop. You will be shown a "
-    "screenshot of the current screen at each step and must call the "
-    "`computer_use` tool to interact with the desktop (click, type, scroll, "
-    "keyboard shortcuts, etc.). When the task is complete, call `computer_use` "
-    "with ``action=terminate`` and ``status=success`` or ``status=failure``."
-)
+# DEFAULT_SYSTEM_PROMPT = (
+#     "You are a GUI agent controlling a Linux desktop. You will be shown a "
+#     "screenshot of the current screen at each step and must call the "
+#     "`computer_use` tool to interact with the desktop (click, type, scroll, "
+#     "keyboard shortcuts, etc.). When the task is complete, call `computer_use` "
+#     "with ``action=terminate`` and ``status=success`` or ``status=failure``."
+# )
+
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # ---------------------------------------------------------------------------
