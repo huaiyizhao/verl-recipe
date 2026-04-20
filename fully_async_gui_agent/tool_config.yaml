@@ -1,0 +1,15 @@
+tools:
+  # Session-based HTTP desktop environment tool for GUI Agent training.
+  # Communicates with an externally-managed desktop service via:
+  #   POST /session/create, /session/{id}/step, /session/{id}/evaluate, /session/{id}/close
+  # Env var DESKTOP_API_BASE_URL (default http://localhost:2354) selects the service.
+  - class_name: "recipe.fully_async_gui_agent.desktop_env_tool.DesktopEnvTool"
+    config:
+      type: native
+      api_base_url: ${oc.env:DESKTOP_API_BASE_URL,http://localhost:2354}
+      screen_width: 1000
+      screen_height: 1000
+      timeout: 30
+      pause: 2.0
+      evaluate_settle_seconds: 20
+      step_reward: 0.0

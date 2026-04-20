@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Fully-Async GUI Agent (Computer-Use Agent) PPO training.
+#
+# Prerequisites:
+#   1. A running desktop environment service accessible via HTTP (endpoints:
+#      /session/create, /session/{id}/step, /session/{id}/evaluate,
+#      /session/{id}/close). Set DESKTOP_API_BASE_URL to its endpoint.
+#   2. A VLM checkpoint (e.g. Qwen2.5-VL-7B-Instruct).
+#   3. A parquet dataset with columns:
+#        - prompt (list of chat messages)
+#        - extra_info.task_id (desktop task identifier)
+#        - extra_info.question (user query for the task)
+
+set -xeuo pipefail
+
+# ================= cluster topology =================
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+
+# Fully-async resource split: rollout vs training GPUs.
+n_gpus_rollout=${n_gpus_rollout:-4}
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+
+export HYDRA_FULL_ERROR=1
+export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
+
+# ================= data / model =================
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen2.5-VL-7B-Instruct"}
+train_files=${train_files:-/efs/data/cua/rl/train.parquet}
+test_files=${test_files:-/efs/data/cua/rl/test.parquet}
+
+# ================= desktop env service =================
+export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://localhost:2354}
+
+# ================= rollout / agent loop =================
+rollout_mode="async"
+rollout_name=${rollout_name:-vllm}
+if [ "$rollout_mode" = "async" ]; then
+    export VLLM_USE_V1=1
+fi
+
+tool_config_path=${tool_config_path:-recipe/fully_async_gui_agent/tool_config.yaml}
+agent_loop_config_path=${agent_loop_config_path:-recipe/fully_async_gui_agent/agent.yaml}
+
+# ================= algorithm =================
+adv_estimator=grpo
+
+max_turns=${max_turns:-20}
+max_prompt_length=${max_prompt_length:-16000}
+max_response_length=${max_response_length:-4096}
+actor_lr=${actor_lr:-1e-6}
+
+# Fully-async uses gen_batch_size=1 (streaming single-sample generation).
+train_prompt_bsz=0
+gen_prompt_bsz=1
+n_resp_per_prompt=${n_resp_per_prompt:-4}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-1}
+require_batches=${require_batches:-1}
+total_rollout_steps=${total_rollout_steps:-1000}
+
+# Async stream pipeline with partial rollout (see fully_async README).
+staleness_threshold=${staleness_threshold:-0.1}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
+partial_rollout=${partial_rollout:-True}
+
+# ================= performance =================
+infer_tp=${infer_tp:-2}
+actor_offload=${actor_offload:-True}
+ref_offload=${ref_offload:-True}
+fsdp_size=-1
+
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+
+project_name=${project_name:-fully_async_gui_agent}
+experiment_name=${experiment_name:-qwen25vl_7b_fsdp_async}
+
+# ================= launch =================
+python3 -m verl.experimental.fully_async_policy.fully_async_main \
+    algorithm.adv_estimator=${adv_estimator} \
+    data.train_files="${train_files}" \
+    data.val_files="${test_files}" \
+    data.train_batch_size=${train_prompt_bsz} \
+    data.gen_batch_size=${gen_prompt_bsz} \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.return_raw_chat=True \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.hybrid_engine=False \
+    actor_rollout_ref.actor.optim.lr=${actor_lr} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
+    actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.use_rollout_log_probs=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
+    actor_rollout_ref.rollout.name=${rollout_name} \
+    actor_rollout_ref.rollout.mode=${rollout_mode} \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.max_model_len=32768 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
+    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.multi_turn.enable=True \
+    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
+    actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
+    actor_rollout_ref.rollout.agent.num_workers=4 \
+    algorithm.use_kl_in_reward=False \
+    async_training.staleness_threshold="${staleness_threshold}" \
+    async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
+    async_training.require_batches="${require_batches}" \
+    async_training.partial_rollout="${partial_rollout}" \
+    trainer.logger='["console"]' \
+    trainer.project_name="${project_name}" \
+    trainer.experiment_name="${experiment_name}" \
+    trainer.total_epochs=1 \
+    trainer.val_before_train=False \
+    trainer.test_freq=-1 \
+    trainer.save_freq=-1 \
+    trainer.resume_mode=disable \
+    trainer.nnodes="${NNODES}" \
+    trainer.n_gpus_per_node="${n_gpus_training}" \
+    rollout.nnodes="${NNODES}" \
+    rollout.n_gpus_per_node="${n_gpus_rollout}" \
+    rollout.total_rollout_steps="${total_rollout_steps}" \
+    "$@"

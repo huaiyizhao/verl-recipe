@@ -1,0 +1,4 @@
+# Agent loop registration for the fully-async GUI Agent recipe.
+# Registers ``gui_agent`` → GUIAgentLoop at hydra instantiation time.
+- name: gui_agent
+  _target_: recipe.fully_async_gui_agent.gui_agent_loop.GUIAgentLoop
