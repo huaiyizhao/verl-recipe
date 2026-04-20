@@ -27,6 +27,14 @@
 
 set -xeuo pipefail
 
+# ================= paths =================
+# RECIPE_DIR is the directory containing this script (portable, no matter where
+# the script is invoked from). VERL_ROOT must point at the verl source tree so
+# that Hydra's ``hydra.searchpath: file://verl/trainer/config`` (relative to
+# CWD) can resolve. Override VERL_ROOT if you use a different verl checkout.
+RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERL_ROOT=${VERL_ROOT:-/root/verl}
+
 # ================= cluster topology =================
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -53,8 +61,8 @@ if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
 fi
 
-tool_config_path=${tool_config_path:-recipe/fully_async_gui_agent/tool_config.yaml}
-agent_loop_config_path=${agent_loop_config_path:-recipe/fully_async_gui_agent/agent.yaml}
+tool_config_path=${tool_config_path:-${RECIPE_DIR}/tool_config.yaml}
+agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -90,6 +98,10 @@ project_name=${project_name:-fully_async_gui_agent}
 experiment_name=${experiment_name:-qwen25vl_7b_fsdp_async}
 
 # ================= launch =================
+# Hydra's config uses ``hydra.searchpath: file://verl/trainer/config`` which is
+# resolved relative to CWD, so chdir to the verl source root before launching.
+cd "${VERL_ROOT}"
+
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
     data.train_files="${train_files}" \
