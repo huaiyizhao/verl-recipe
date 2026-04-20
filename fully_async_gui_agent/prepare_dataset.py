@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="/efs/data/cua/rl",
+        default="/efs/data/cua/rl/osworld",
         help="Directory to write train.parquet / test.parquet.",
     )
     parser.add_argument(

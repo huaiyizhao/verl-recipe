@@ -27,7 +27,7 @@
 
 set -xeuo pipefail
 
-export HF_TOKEN=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
+export HF_TOKEN=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
 export WANDB_API_KEY=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
 
 
