@@ -27,6 +27,10 @@
 
 set -xeuo pipefail
 
+export HF_TOKEN=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
+export WANDB_API_KEY=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
+
+
 # ================= paths =================
 # RECIPE_DIR is the directory containing this script (portable, no matter where
 # the script is invoked from). VERL_ROOT must point at the verl source tree so
@@ -67,35 +71,35 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 # ================= algorithm =================
 adv_estimator=grpo
 
-max_turns=${max_turns:-20}
-max_prompt_length=${max_prompt_length:-16000}
-max_response_length=${max_response_length:-4096}
+max_turns=${max_turns:-50}
+max_prompt_length=${max_prompt_length:-10000}
+max_response_length=${max_response_length:-8192}
 actor_lr=${actor_lr:-1e-6}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-4}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-1}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-0.1}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
-partial_rollout=${partial_rollout:-True}
+partial_rollout=${partial_rollout:-False}
 
 # ================= performance =================
-infer_tp=${infer_tp:-2}
+infer_tp=${infer_tp:-4}
 actor_offload=${actor_offload:-True}
 ref_offload=${ref_offload:-True}
-fsdp_size=-1
+fsdp_size=4
 
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 
 project_name=${project_name:-fully_async_gui_agent}
-experiment_name=${experiment_name:-qwen25vl_7b_fsdp_async}
+experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
 
 # ================= launch =================
 # Hydra's config uses ``hydra.searchpath: file://verl/trainer/config`` which is
@@ -158,7 +162,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    trainer.logger='["console"]' \
+    trainer.logger='["console", "wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.total_epochs=1 \

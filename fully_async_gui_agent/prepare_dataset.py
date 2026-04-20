@@ -91,6 +91,14 @@ def fetch_tasks(api_base_url: str, domain: str | None, timeout: int) -> list[dic
 # ---------------------------------------------------------------------------
 
 
+#: ``data_source`` identifier written into every row. It flows through verl's
+#: RLHFDataset into ``non_tensor_batch["data_source"]`` and is consulted by
+#: ``reward_score.default_compute_score``. For GUI agent tasks the true reward
+#: is produced inside the agent loop (via the desktop ``/evaluate`` API), so
+#: the reward-manager path only needs to return a no-op fallback score.
+DATA_SOURCE = "osworld"
+
+
 def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str, Any]:
     """Build one parquet row for a single task."""
     task_id = task["task_id"]
@@ -112,7 +120,24 @@ def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str,
         "index": index,
     }
 
-    return {"prompt": prompt, "extra_info": extra_info}
+    # ``data_source`` and ``reward_model`` are framework-required columns
+    # (see ``NaiveRewardManager.run_single`` and ``RLHFDataset``).
+    # The agent loop already sets ``AgentLoopOutput.reward_score`` from the
+    # desktop env ``/evaluate`` endpoint, so the reward-manager path should
+    # only be invoked as a fallback when ``reward_score is None`` (e.g. a
+    # discarded rollout). In that case we return 0.0 — see ``reward_score``
+    # registry for the ``osworld`` no-op compute_score.
+    reward_model = {
+        "style": "rule",
+        "ground_truth": task_id,  # referenced by desktop env; no string match
+    }
+
+    return {
+        "prompt": prompt,
+        "extra_info": extra_info,
+        "data_source": DATA_SOURCE,
+        "reward_model": reward_model,
+    }
 
 
 def split_train_test(
