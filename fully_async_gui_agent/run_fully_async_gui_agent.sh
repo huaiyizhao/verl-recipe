@@ -27,6 +27,10 @@
 
 set -xeuo pipefail
 
+export HF_TOKEN=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
+export WANDB_API_KEY=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
+
+
 # ================= paths =================
 # RECIPE_DIR is the directory containing this script (portable, no matter where
 # the script is invoked from). VERL_ROOT must point at the verl source tree so
