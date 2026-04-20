@@ -44,7 +44,7 @@ n_gpus_rollout=${n_gpus_rollout:-4}
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 export HYDRA_FULL_ERROR=1
-export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
+export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-DEBUG}
 
 # ================= data / model =================
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
