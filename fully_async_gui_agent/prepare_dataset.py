@@ -98,45 +98,82 @@ def fetch_tasks(api_base_url: str, domain: str | None, timeout: int) -> list[dic
 #: the reward-manager path only needs to return a no-op fallback score.
 DATA_SOURCE = "osworld"
 
+#: ``agent_name`` selects which agent loop handles the rollout. Must match
+#: ``@register("gui_agent")`` in ``recipe.fully_async_gui_agent.gui_agent_loop``.
+#: Without this field (or a matching CLI override of ``default_agent_loop``),
+#: verl falls back to ``single_turn_agent`` and ``GUIAgentLoop.run()`` never
+#: executes — which silently returns ``reward_score=None`` and triggers the
+#: reward manager path that we do not want for GUI agent training.
+AGENT_NAME = "gui_agent"
+
 
 def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str, Any]:
-    """Build one parquet row for a single task."""
+    """Build one parquet row for a single OSWorld task.
+
+    Field consumers (keep this in sync with the source):
+
+    * ``RLHFDataset`` (verl/utils/dataset/rl_dataset.py):
+      ``data_source`` / ``prompt`` / ``extra_info`` / ``reward_model``.
+    * ``AgentLoopWorker`` (verl/experimental/agent_loop/agent_loop.py): routes
+      on ``agent_name`` → falls back to ``default_agent_loop`` when absent.
+    * ``GUIAgentLoop.run()`` (recipe/fully_async_gui_agent/gui_agent_loop.py):
+      reads ``extra_info.task_id`` / ``extra_info.question`` /
+      ``extra_info.tools_kwargs.computer_use.create_kwargs``.
+    * ``DesktopEnvTool.create()`` (recipe/fully_async_gui_agent/desktop_env_tool.py):
+      reads ``create_kwargs.task_id`` to start the remote session.
+    * ``NaiveRewardManager.run_single``: reads ``data_source`` and
+      ``reward_model.ground_truth`` as a fallback — never takes effect for
+      GUI agent because ``AgentLoopOutput.reward_score`` is set from the
+      desktop ``/evaluate`` API.
+    """
     task_id = task["task_id"]
     instruction = task.get("instruction") or ""
     domain = task.get("domain") or "unknown"
 
-    # Initial chat: system + first user turn. The agent loop will append the
-    # initial screenshot (as a user message) after it creates the desktop
-    # session, so the dataset only needs the textual kickoff.
+    # Initial chat: system prompt only. The GUI agent loop constructs all
+    # subsequent messages itself (first user turn from ``extra_info.question``
+    # + initial screenshot from the desktop env).
     prompt: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": instruction},
     ]
 
+    # ``create_kwargs`` forwarded to ``DesktopEnvTool.create()``. ``task_id``
+    # is the only field consumed by the current HTTP desktop service; extra
+    # knobs (``keep_last_k_images``) are read by the agent loop / context
+    # strategy.
+    create_kwargs = {
+        "task_id": task_id,
+        "keep_last_k_images": 3,
+    }
+
     extra_info: dict[str, Any] = {
+        "split": "unknown",  # overwritten by caller after train/test split
+        "index": index,
         "task_id": task_id,
         "question": instruction,
         "domain": domain,
-        "index": index,
+        "need_tools_kwargs": True,
+        "tools_kwargs": {
+            "computer_use": {
+                "create_kwargs": create_kwargs,
+            },
+        },
     }
 
-    # ``data_source`` and ``reward_model`` are framework-required columns
-    # (see ``NaiveRewardManager.run_single`` and ``RLHFDataset``).
-    # The agent loop already sets ``AgentLoopOutput.reward_score`` from the
-    # desktop env ``/evaluate`` endpoint, so the reward-manager path should
-    # only be invoked as a fallback when ``reward_score is None`` (e.g. a
-    # discarded rollout). In that case we return 0.0 — see ``reward_score``
-    # registry for the ``osworld`` no-op compute_score.
+    # ``reward_model`` is framework-required. Its ``ground_truth`` is only
+    # consulted if the reward-manager fallback is hit; the real terminal
+    # reward is emitted by the agent loop from the desktop ``/evaluate`` API.
     reward_model = {
         "style": "rule",
-        "ground_truth": task_id,  # referenced by desktop env; no string match
+        "ground_truth": task_id,
     }
 
     return {
-        "prompt": prompt,
-        "extra_info": extra_info,
         "data_source": DATA_SOURCE,
+        "agent_name": AGENT_NAME,
+        "prompt": prompt,
         "reward_model": reward_model,
+        "extra_info": extra_info,
     }
 
 
@@ -233,6 +270,11 @@ def main() -> int:
     ]
 
     train_rows, test_rows = split_train_test(rows, args.train_ratio, args.seed)
+    # Stamp each row's split label now that we know train vs test.
+    for row in train_rows:
+        row["extra_info"]["split"] = "train"
+    for row in test_rows:
+        row["extra_info"]["split"] = "test"
     print(
         f"[prepare_dataset] Split: train={len(train_rows)} "
         f"test={len(test_rows)} (ratio={args.train_ratio})"
@@ -248,10 +290,15 @@ def main() -> int:
     if train_rows:
         sample = train_rows[0]
         print("[prepare_dataset] Sample train row:")
-        print(f"  prompt[0].role     = {sample['prompt'][0]['role']}")
-        print(f"  prompt[1].content  = {sample['prompt'][1]['content'][:80]!r}...")
-        print(f"  extra_info.task_id = {sample['extra_info']['task_id']}")
-        print(f"  extra_info.domain  = {sample['extra_info']['domain']}")
+        print(f"  data_source            = {sample['data_source']}")
+        print(f"  agent_name             = {sample['agent_name']}")
+        print(f"  prompt (roles)         = {[m['role'] for m in sample['prompt']]}")
+        print(f"  extra_info.task_id     = {sample['extra_info']['task_id']}")
+        print(f"  extra_info.domain      = {sample['extra_info']['domain']}")
+        question = sample['extra_info']['question']
+        print(f"  extra_info.question    = {question[:80]!r}{'...' if len(question) > 80 else ''}")
+        ck = sample['extra_info']['tools_kwargs']['computer_use']['create_kwargs']
+        print(f"  create_kwargs keys     = {sorted(ck.keys())}")
 
     return 0
 
