@@ -199,15 +199,14 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     messages.append({"role": "user", "content": img_content})
 
             turn = 0
-            terminated = False
             fatal_error = False
+            stop_reason = ""  # why the loop exited (for logging / debugging)
 
-            # Last turn's snapshot, retained so we can either register it as
-            # the *final* AgentLoopOutput (loop ends here) or promote it to an
-            # intermediate trajectory (another turn follows).
+            # Last turn's snapshot; always retained as the *final*
+            # AgentLoopOutput once the loop exits.
             last_turn_ctx: dict[str, Any] | None = None
 
-            while turn < self.max_turns and not terminated and not fatal_error:
+            while True:
                 turn += 1
                 _log(
                     f"[GUI-{task_id}][turn={turn}] --- Begin turn (messages={len(messages)}) ---"
@@ -289,68 +288,87 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     response_ids, tool_schemas_all
                 )
 
-                if not tool_calls:
-                    # No tool call → model stopped; this turn is the final one.
-                    _log(
-                        f"[GUI-{task_id}][turn={turn}] No tool call parsed -> treat as final turn"
-                    )
-                    terminated = True
-                    continue
+                tool_args: dict[str, Any] | None = None
+                action: str = ""
+                if tool_calls:
+                    try:
+                        tool_args = json.loads(tool_calls[0].arguments)
+                        action = tool_args.get("action", "")
+                    except Exception as parse_exc:
+                        _log(
+                            f"[GUI-{task_id}][turn={turn}] Failed to parse tool arguments: "
+                            f"{tool_calls[0]} (error: {parse_exc!r})"
+                        )
+                        tool_args = None
+                        action = ""
 
-                # 5. Execute the first tool call.
-                tool_call = tool_calls[0]
-                try:
-                    tool_args = json.loads(tool_call.arguments)
-                except Exception as parse_exc:
+                if tool_args is not None:
                     _log(
-                        f"[GUI-{task_id}][turn={turn}] Failed to parse tool arguments: "
-                        f"{tool_call} (error: {parse_exc!r})"
+                        f"[GUI-{task_id}][turn={turn}] Tool call: action={action}, "
+                        f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
                     )
-                    terminated = True
-                    continue
 
-                action = tool_args.get("action", "")
-                _log(
-                    f"[GUI-{task_id}][turn={turn}] Tool call: action={action}, "
-                    f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
+                # 5. Decide whether this turn ends the rollout.
+                #    The rollout ends when any of:
+                #      (a) model emitted no parseable tool call;
+                #      (b) model issued action=terminate;
+                #      (c) we reached max_turns (this turn is the last one).
+                #    In all three cases the current turn becomes the *final*
+                #    trajectory (kept in ``last_turn_ctx``), not an
+                #    intermediate one.
+                is_final_turn = (
+                    tool_args is None
+                    or action == "terminate"
+                    or turn >= self.max_turns
                 )
 
-                if action == "terminate":
+                # 6. Execute the tool when we have a real action to run.
+                #    ``terminate`` is a purely virtual action (model announces
+                #    completion) so we skip the env step for it. For every
+                #    other action we execute, even on the final turn, so the
+                #    desktop reflects the full action sequence when reward
+                #    is computed via ``/evaluate``.
+                if tool_args is not None and action != "terminate":
+                    try:
+                        tool_response, _, _ = await self.desktop_tool.execute(
+                            instance_id, tool_args
+                        )
+                    except Exception as exec_exc:
+                        _log(
+                            f"[GUIAgentLoop] Tool execution failed for {task_id}, "
+                            f"aborting rollout: {exec_exc!r}\n{traceback.format_exc()}"
+                        )
+                        _log(
+                            f"[GUIAgentLoop][FATAL_ERROR][tool_execute] task_id={task_id} "
+                            f"turn={turn} action={action} err={exec_exc!r}"
+                        )
+                        fatal_error = True
+                        break
                     _log(
-                        f"[GUI-{task_id}][turn={turn}] Model issued terminate "
-                        f"(status={tool_args.get('status')})"
+                        f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
+                        f"got_image={bool(tool_response and tool_response.image)}",
+                        debug=True,
                     )
-                    terminated = True
-                    assistant_text = await self.loop.run_in_executor(
-                        None,
-                        lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True),
-                    )
-                    messages.append({"role": "assistant", "content": assistant_text})
-                    continue
+                else:
+                    tool_response = None
 
-                try:
-                    tool_response, _, _ = await self.desktop_tool.execute(
-                        instance_id, tool_args
-                    )
-                except Exception as exec_exc:
+                # 7. If this turn is the final one, exit loop now without
+                #    appending an intermediate or extending ``messages``
+                #    (the next user turn will never be consumed).
+                if is_final_turn:
+                    if tool_args is None:
+                        stop_reason = "no_tool_call"
+                    elif action == "terminate":
+                        stop_reason = "model_terminate"
+                    else:
+                        stop_reason = "max_turns"
                     _log(
-                        f"[GUIAgentLoop] Tool execution failed for {task_id}, "
-                        f"aborting rollout: {exec_exc!r}\n{traceback.format_exc()}"
+                        f"[GUI-{task_id}][turn={turn}] Rollout ends: reason={stop_reason}"
                     )
-                    _log(
-                        f"[GUIAgentLoop][FATAL_ERROR][tool_execute] task_id={task_id} "
-                        f"turn={turn} action={action} err={exec_exc!r}"
-                    )
-                    fatal_error = True
                     break
-                _log(
-                    f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
-                    f"got_image={bool(tool_response and tool_response.image)}",
-                    debug=True,
-                )
 
-                # 6. The current turn is not the final turn; register it as
-                #    an intermediate trajectory.
+                # 8. Not final: register this turn as an intermediate
+                #    trajectory and update messages for the next turn.
                 self.append_intermediate_trajectory(
                     prompt_ids=last_turn_ctx["prompt_ids"],
                     response_ids=last_turn_ctx["response_ids"],
@@ -360,9 +378,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     num_turns=last_turn_ctx["num_turns"],
                     **last_turn_ctx["extra_fields"],
                 )
-                last_turn_ctx = None  # consumed
+                last_turn_ctx = None  # consumed as intermediate
 
-                # 7. Update message history.
                 assistant_text = await self.loop.run_in_executor(
                     None,
                     lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True),
@@ -385,7 +402,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
             _log(
                 f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} turn={turn} "
-                f"terminated={terminated} fatal_error={fatal_error} "
+                f"stop_reason={stop_reason or ('fatal_error' if fatal_error else 'unknown')} "
+                f"fatal_error={fatal_error} "
                 f"last_turn_ctx_is_none={last_turn_ctx is None}"
             )
 
@@ -407,14 +425,17 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 )
                 return None
 
-            if turn >= self.max_turns and not terminated:
+            if turn >= self.max_turns and stop_reason == "max_turns":
                 _log(
                     f"[GUI-{task_id}] Reached max_turns={self.max_turns} without model terminate"
                 )
 
             # Compute terminal reward.
             shared_reward = await self.desktop_tool.calc_reward(instance_id)
-            _log(f"[GUI-{task_id}] Final reward = {shared_reward:.4f} (turns={turn})")
+            _log(
+                f"[GUI-{task_id}] Final reward = {shared_reward:.4f} "
+                f"(turns={turn}, stop_reason={stop_reason})"
+            )
 
             # Build the final AgentLoopOutput from the last turn's snapshot.
             final_extra_fields = dict(last_turn_ctx["extra_fields"])

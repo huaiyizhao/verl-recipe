@@ -53,15 +53,29 @@ import urllib.request
 from typing import Any
 
 
-# DEFAULT_SYSTEM_PROMPT = (
-#     "You are a GUI agent controlling a Linux desktop. You will be shown a "
-#     "screenshot of the current screen at each step and must call the "
-#     "`computer_use` tool to interact with the desktop (click, type, scroll, "
-#     "keyboard shortcuts, etc.). When the task is complete, call `computer_use` "
-#     "with ``action=terminate`` and ``status=success`` or ``status=failure``."
-# )
-
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Default system prompt used when no ``--system-prompt`` is passed.
+#
+# Key points conveyed to the model:
+#   * It is a GUI agent driving a Linux desktop via the ``computer_use`` tool.
+#   * Every assistant turn should call ``computer_use`` exactly once.
+#   * When the task is finished (or determined to be impossible), the model
+#     should call ``computer_use`` with ``action=terminate`` and an appropriate
+#     ``status`` to mark the rollout as complete. The agent loop then scores
+#     the current desktop state via the env's ``/evaluate`` endpoint, so the
+#     model's ``terminate`` call is the signal that it is done making changes.
+#   * If no ``terminate`` is issued within ``max_turns``, the rollout is
+#     force-stopped and scored on the then-current desktop state.
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a GUI agent controlling a Linux desktop. "
+    "At each step you will be shown a screenshot of the current screen and "
+    "must respond by calling the `computer_use` tool exactly once to interact "
+    "with the desktop (e.g. click, type, scroll, keyboard shortcut). "
+    "Think step by step about what to do next based on the screenshot and the "
+    "user's task, then emit a single tool call. "
+    "When you believe the task is complete (or impossible), call `computer_use` "
+    "with `action=\"terminate\"` and set `status=\"success\"` or `status=\"failure\"` "
+    "to end the episode. Do not keep acting after you decide the task is done."
+)
 
 
 # ---------------------------------------------------------------------------
