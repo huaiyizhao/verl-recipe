@@ -41,6 +41,7 @@ import copy
 import io
 import logging
 import os
+import sys
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -51,15 +52,27 @@ from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.utils.rollout_trace import rollout_trace_op
 
-# Force the ROOT logger level so our INFO/DEBUG logs are not filtered out by
-# verl's global ``logging.basicConfig(level=WARNING)`` call. Honors the
-# ``VERL_LOGGING_LEVEL`` env var so users can still override it.
-_level_name = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper()
-_level = getattr(logging, _level_name, logging.INFO)
-logging.getLogger().setLevel(_level)
-
+# We bypass the ``logging`` framework for INFO/DEBUG lines because verl's
+# global ``basicConfig(WARNING)`` plus Ray's early-attached handlers silently
+# drop them regardless of per-logger levels. ``print`` goes straight to stdout
+# (picked up by Ray's log forwarder) and is unaffected by any of that.
+# ``logger`` is still kept for ERROR / exc_info warnings where the stack trace
+# is valuable.
 logger = logging.getLogger(__name__)
-logger.setLevel(_level)
+
+_DEBUG_ENABLED = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper() == "DEBUG"
+
+
+def _log(msg: str, *, debug: bool = False) -> None:
+    """Print-based logger that bypasses the ``logging`` framework entirely.
+
+    ``flush=True`` + ``stderr`` ensures lines survive worker crashes.
+    Honors ``VERL_LOGGING_LEVEL=DEBUG`` for debug-gated messages.
+    """
+    if debug and not _DEBUG_ENABLED:
+        return
+    print(msg, file=sys.stderr, flush=True)
+
 
 # Truncate very long payload/response strings in logs to keep output readable.
 _MAX_LOG_BODY = int(os.getenv("DESKTOP_ENV_LOG_MAX_BODY", "4096"))
@@ -329,11 +342,7 @@ class DesktopEnvTool(BaseTool):
         effective_timeout = timeout if timeout is not None else self.timeout
         request_body = payload or {}
 
-        logger.info(
-            "[DesktopEnvTool] -> POST %s payload=%s",
-            url,
-            _short_repr(request_body),
-        )
+        _log(f"[DesktopEnvTool] -> POST {url} payload={_short_repr(request_body)}")
 
         for attempt in range(1, attempts + 1):
             try:
@@ -357,22 +366,22 @@ class DesktopEnvTool(BaseTool):
                             try:
                                 data = _json.loads(text_body)
                             except _json.JSONDecodeError as je:
-                                logger.error(
-                                    "[DesktopEnvTool] <- POST %s status=%d non-JSON body (content_type=%s): %s",
-                                    url, status, content_type, _short_repr(text_body),
+                                _log(
+                                    f"[DesktopEnvTool] <- POST {url} status={status} "
+                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
                                 )
                                 raise RuntimeError(
                                     f"POST {path} returned non-JSON body: {text_body!r}"
                                 ) from je
-                            logger.info(
-                                "[DesktopEnvTool] <- POST %s status=%d response=%s",
-                                url, status, _short_repr(data),
+                            _log(
+                                f"[DesktopEnvTool] <- POST {url} status={status} "
+                                f"response={_short_repr(data)}"
                             )
                             return data
                         # Empty body is allowed for endpoints like /close.
-                        logger.info(
-                            "[DesktopEnvTool] <- POST %s status=%d empty body (content_type=%s)",
-                            url, status, content_type,
+                        _log(
+                            f"[DesktopEnvTool] <- POST {url} status={status} "
+                            f"empty body (content_type={content_type})"
                         )
                         return {}
             except Exception as exc:
@@ -385,15 +394,21 @@ class DesktopEnvTool(BaseTool):
                         f"url={exc.request_info.url if exc.request_info else url}"
                     )
                 if attempt >= attempts:
+                    _log(
+                        f"[DesktopEnvTool] POST {path} failed after {attempts} attempts: "
+                        f"{detail} | payload={_short_repr(request_body)}"
+                    )
+                    # Preserve stack trace via the logging framework (ERROR
+                    # is not filtered out by the default WARNING config).
                     logger.error(
-                        "[DesktopEnvTool] POST %s failed after %d attempts: %s | payload=%s",
-                        path, attempts, detail, _short_repr(request_body),
+                        "[DesktopEnvTool] POST %s failed after %d attempts",
+                        path, attempts,
                         exc_info=True,
                     )
                     break
-                logger.warning(
-                    "[DesktopEnvTool] POST %s failed (attempt %d/%d): %s. Retrying in %.1fs",
-                    path, attempt, attempts, detail, self.retry_interval,
+                _log(
+                    f"[DesktopEnvTool] POST {path} failed (attempt {attempt}/{attempts}): "
+                    f"{detail}. Retrying in {self.retry_interval:.1f}s"
                 )
                 await asyncio.sleep(self.retry_interval)
 
@@ -431,10 +446,8 @@ class DesktopEnvTool(BaseTool):
         if not task_id:
             raise ValueError("create_kwargs must contain 'task_id'")
 
-        logger.info(
-            "[DesktopEnvTool] create session task_id=%s instance_id=%s",
-            task_id,
-            instance_id,
+        _log(
+            f"[DesktopEnvTool] create session task_id={task_id} instance_id={instance_id}"
         )
         resp = await self._post(
             "/session/create",
@@ -452,10 +465,9 @@ class DesktopEnvTool(BaseTool):
         observation = resp.get("observation") or {}
         screenshot = _decode_screenshot(observation.get("screenshot"))
         images = [screenshot] if screenshot is not None else []
-        logger.info(
-            "[DesktopEnvTool] created session_id=%s has_screenshot=%s",
-            session_id,
-            bool(screenshot),
+        _log(
+            f"[DesktopEnvTool] created session_id={session_id} "
+            f"has_screenshot={bool(screenshot)}"
         )
         return instance_id, ToolResponse(image=images)
 
@@ -478,10 +490,9 @@ class DesktopEnvTool(BaseTool):
 
         # Virtual actions that the agent loop handles directly.
         if action == "terminate":
-            logger.info(
-                "[DesktopEnvTool] virtual action=terminate session_id=%s status=%s",
-                session_id,
-                parameters.get("status", "unknown"),
+            _log(
+                f"[DesktopEnvTool] virtual action=terminate session_id={session_id} "
+                f"status={parameters.get('status', 'unknown')}"
             )
             return (
                 ToolResponse(
@@ -491,9 +502,7 @@ class DesktopEnvTool(BaseTool):
                 {"action": action},
             )
         if action == "answer":
-            logger.info(
-                "[DesktopEnvTool] virtual action=answer session_id=%s", session_id
-            )
+            _log(f"[DesktopEnvTool] virtual action=answer session_id={session_id}")
             return (
                 ToolResponse(text=f"Answer: {parameters.get('text', '')}"),
                 0.0,
@@ -501,11 +510,9 @@ class DesktopEnvTool(BaseTool):
             )
 
         code = _translate_action_to_pyautogui(parameters)
-        logger.debug(
-            "[DesktopEnvTool] step session_id=%s action=%s code=%s",
-            session_id,
-            action,
-            code,
+        _log(
+            f"[DesktopEnvTool] step session_id={session_id} action={action} code={code}",
+            debug=True,
         )
         resp = await self._post(
             f"/session/{session_id}/step",
@@ -522,13 +529,10 @@ class DesktopEnvTool(BaseTool):
 
         # Forward non-observation metadata (reward / done / info / step_count).
         meta = {k: v for k, v in resp.items() if k != "observation"}
-        logger.info(
-            "[DesktopEnvTool] step done session_id=%s action=%s has_screenshot=%s done=%s step_count=%s",
-            session_id,
-            action,
-            bool(screenshot),
-            meta.get("done"),
-            meta.get("step_count"),
+        _log(
+            f"[DesktopEnvTool] step done session_id={session_id} action={action} "
+            f"has_screenshot={bool(screenshot)} done={meta.get('done')} "
+            f"step_count={meta.get('step_count')}"
         )
         return (
             ToolResponse(image=images, text=action_summary),
@@ -540,17 +544,16 @@ class DesktopEnvTool(BaseTool):
         """Compute the terminal reward via ``/evaluate``."""
         info = self._instances.get(instance_id)
         if info is None:
-            logger.warning(
-                "[DesktopEnvTool] calc_reward: unknown instance_id=%s (already released?)",
-                instance_id,
+            _log(
+                f"[DesktopEnvTool] calc_reward: unknown instance_id={instance_id} "
+                f"(already released?)"
             )
             return 0.0
         session_id = info["session_id"]
 
-        logger.info(
-            "[DesktopEnvTool] evaluate session_id=%s settle=%ds",
-            session_id,
-            self.evaluate_settle_seconds,
+        _log(
+            f"[DesktopEnvTool] evaluate session_id={session_id} "
+            f"settle={self.evaluate_settle_seconds}s"
         )
         try:
             resp = await self._post(
@@ -558,6 +561,7 @@ class DesktopEnvTool(BaseTool):
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
         except Exception:
+            _log(f"[DesktopEnvTool] Failed to evaluate session {session_id}")
             logger.warning(
                 "Failed to evaluate session %s", session_id, exc_info=True
             )
@@ -566,34 +570,32 @@ class DesktopEnvTool(BaseTool):
         try:
             reward = float(resp.get("reward", 0.0))
         except (TypeError, ValueError):
-            logger.warning(
-                "[DesktopEnvTool] evaluate session_id=%s returned non-numeric reward: %r",
-                session_id,
-                resp.get("reward"),
+            _log(
+                f"[DesktopEnvTool] evaluate session_id={session_id} "
+                f"returned non-numeric reward: {resp.get('reward')!r}"
             )
             return 0.0
-        logger.info(
-            "[DesktopEnvTool] evaluate session_id=%s reward=%.4f", session_id, reward
-        )
+        _log(f"[DesktopEnvTool] evaluate session_id={session_id} reward={reward:.4f}")
         return reward
 
     async def release(self, instance_id: str, **kwargs) -> None:
         """Close the session. MUST be called in a ``finally`` block."""
         info = self._instances.pop(instance_id, None)
         if info is None:
-            logger.debug(
-                "[DesktopEnvTool] release: no-op for unknown instance_id=%s", instance_id
+            _log(
+                f"[DesktopEnvTool] release: no-op for unknown instance_id={instance_id}",
+                debug=True,
             )
             return
         session_id = info["session_id"]
-        logger.info(
-            "[DesktopEnvTool] release session_id=%s task_id=%s",
-            session_id,
-            info.get("task_id"),
+        _log(
+            f"[DesktopEnvTool] release session_id={session_id} "
+            f"task_id={info.get('task_id')}"
         )
         try:
             await self._post(f"/session/{session_id}/close")
         except Exception:
+            _log(f"[DesktopEnvTool] Failed to close session {session_id}")
             logger.warning(
                 "Failed to close session %s", session_id, exc_info=True
             )
