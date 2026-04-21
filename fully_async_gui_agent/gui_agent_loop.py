@@ -30,8 +30,9 @@ The loop packs intermediate trajectories using
 """
 
 import json
-import logging
 import os
+import sys
+import traceback
 from typing import Any
 from uuid import uuid4
 
@@ -54,8 +55,19 @@ from recipe.fully_async_gui_agent.context_manager import (
     KeepLastKImagesStrategy,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+# We bypass the ``logging`` framework entirely here because verl's global
+# ``basicConfig(WARNING)`` plus Ray's early-attached handlers silently drop
+# INFO/DEBUG records regardless of per-logger levels. ``print`` goes straight
+# to stdout (picked up by Ray's log forwarder) and is unaffected by any of
+# that. ``VERL_LOGGING_LEVEL=DEBUG`` still gates debug-only messages.
+_DEBUG_ENABLED = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper() == "DEBUG"
+
+
+def _log(msg: str, *, debug: bool = False) -> None:
+    """Print-based logger. ``flush=True`` + ``stderr`` survives worker crashes."""
+    if debug and not _DEBUG_ENABLED:
+        return
+    print(msg, file=sys.stderr, flush=True)
 
 
 @register("gui_agent")
@@ -134,13 +146,13 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         request_id = uuid4().hex
         metrics: dict[str, Any] = {}
 
-        logger.info(
-            "[GUI-%s] Starting agent loop (request_id=%s, max_turns=%d, initial_messages=%d, query=%r)",
-            task_id,
-            request_id,
-            self.max_turns,
-            len(messages),
-            (task_query[:80] + "...") if len(task_query) > 80 else task_query,
+        _log(
+            f"[GUIAgentLoop][RUN_START] task_id={task_id} request_id={request_id} max_turns={self.max_turns}"
+        )
+        _log(
+            f"[GUI-{task_id}] Starting agent loop (request_id={request_id}, "
+            f"max_turns={self.max_turns}, initial_messages={len(messages)}, "
+            f"query={(task_query[:80] + '...') if len(task_query) > 80 else task_query!r})"
         )
 
         # Context management strategy (per-task, overridable via create_kwargs).
@@ -150,11 +162,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         context_strategy: BaseContextStrategy = KeepLastKImagesStrategy(k=keep_last_k)
 
         create_kwargs.setdefault("task_id", task_id)
-        logger.debug(
-            "[GUI-%s] Context strategy=KeepLastKImagesStrategy(k=%d), create_kwargs=%s",
-            task_id,
-            keep_last_k,
-            create_kwargs,
+        _log(
+            f"[GUI-{task_id}] Context strategy=KeepLastKImagesStrategy(k={keep_last_k}), "
+            f"create_kwargs={create_kwargs}",
+            debug=True,
         )
 
         # Acquire a desktop session.
@@ -163,17 +174,15 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 create_kwargs=create_kwargs,
             )
         except Exception as exc:
-            logger.error(
-                "[GUIAgentLoop] Failed to create env for %s, discarding rollout: %s",
-                task_id,
-                exc,
+            _log(
+                f"[GUIAgentLoop] Failed to create env for {task_id}, "
+                f"discarding rollout: {exc!r}\n{traceback.format_exc()}"
             )
+            _log(f"[GUIAgentLoop][RETURN_NONE][create_failed] task_id={task_id} err={exc!r}")
             return None
-        logger.info(
-            "[GUI-%s] Env session created: instance_id=%s, initial_images=%d",
-            task_id,
-            instance_id,
-            len(initial_response.image or []),
+        _log(
+            f"[GUI-{task_id}] Env session created: instance_id={instance_id}, "
+            f"initial_images={len(initial_response.image or [])}"
         )
 
         try:
@@ -200,11 +209,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
             while turn < self.max_turns and not terminated and not fatal_error:
                 turn += 1
-                logger.info(
-                    "[GUI-%s][turn=%d] --- Begin turn (messages=%d) ---",
-                    task_id,
-                    turn,
-                    len(messages),
+                _log(
+                    f"[GUI-{task_id}][turn={turn}] --- Begin turn (messages={len(messages)}) ---"
                 )
 
                 # 1. Prune old images.
@@ -223,14 +229,11 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 if len(prompt_ids) > self.prompt_length:
                     prompt_ids = prompt_ids[-self.prompt_length :]
                     truncated = True
-                logger.debug(
-                    "[GUI-%s][turn=%d] prompt_ids=%d (orig=%d, truncated=%s), images=%d",
-                    task_id,
-                    turn,
-                    len(prompt_ids),
-                    original_prompt_len,
-                    truncated,
-                    len(image_data) if image_data else 0,
+                _log(
+                    f"[GUI-{task_id}][turn={turn}] prompt_ids={len(prompt_ids)} "
+                    f"(orig={original_prompt_len}, truncated={truncated}), "
+                    f"images={len(image_data) if image_data else 0}",
+                    debug=True,
                 )
 
                 # 3. LLM generation (partial-rollout-resume enabled upstream).
@@ -241,12 +244,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         sampling_params=sampling_params,
                         image_data=image_data if image_data else None,
                     )
-                logger.debug(
-                    "[GUI-%s][turn=%d] LLM generated response_ids=%d, num_preempted=%s",
-                    task_id,
-                    turn,
-                    len(output.token_ids),
-                    output.num_preempted,
+                _log(
+                    f"[GUI-{task_id}][turn={turn}] LLM generated response_ids={len(output.token_ids)}, "
+                    f"num_preempted={output.num_preempted}",
+                    debug=True,
                 )
 
                 if metrics.get("num_preempted") is None:
@@ -290,10 +291,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
                 if not tool_calls:
                     # No tool call → model stopped; this turn is the final one.
-                    logger.info(
-                        "[GUI-%s][turn=%d] No tool call parsed -> treat as final turn",
-                        task_id,
-                        turn,
+                    _log(
+                        f"[GUI-{task_id}][turn={turn}] No tool call parsed -> treat as final turn"
                     )
                     terminated = True
                     continue
@@ -303,31 +302,23 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 try:
                     tool_args = json.loads(tool_call.arguments)
                 except Exception as parse_exc:
-                    logger.warning(
-                        "[GUI-%s][turn=%d] Failed to parse tool arguments: %s (error: %s)",
-                        task_id,
-                        turn,
-                        tool_call,
-                        parse_exc,
+                    _log(
+                        f"[GUI-{task_id}][turn={turn}] Failed to parse tool arguments: "
+                        f"{tool_call} (error: {parse_exc!r})"
                     )
                     terminated = True
                     continue
 
                 action = tool_args.get("action", "")
-                logger.info(
-                    "[GUI-%s][turn=%d] Tool call: action=%s, args=%s",
-                    task_id,
-                    turn,
-                    action,
-                    {k: v for k, v in tool_args.items() if k != "action"},
+                _log(
+                    f"[GUI-{task_id}][turn={turn}] Tool call: action={action}, "
+                    f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
                 )
 
                 if action == "terminate":
-                    logger.info(
-                        "[GUI-%s][turn=%d] Model issued terminate (status=%s)",
-                        task_id,
-                        turn,
-                        tool_args.get("status"),
+                    _log(
+                        f"[GUI-{task_id}][turn={turn}] Model issued terminate "
+                        f"(status={tool_args.get('status')})"
                     )
                     terminated = True
                     assistant_text = await self.loop.run_in_executor(
@@ -342,18 +333,20 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         instance_id, tool_args
                     )
                 except Exception as exec_exc:
-                    logger.error(
-                        "[GUIAgentLoop] Tool execution failed for %s, aborting rollout: %s",
-                        task_id,
-                        exec_exc,
+                    _log(
+                        f"[GUIAgentLoop] Tool execution failed for {task_id}, "
+                        f"aborting rollout: {exec_exc!r}\n{traceback.format_exc()}"
+                    )
+                    _log(
+                        f"[GUIAgentLoop][FATAL_ERROR][tool_execute] task_id={task_id} "
+                        f"turn={turn} action={action} err={exec_exc!r}"
                     )
                     fatal_error = True
                     break
-                logger.debug(
-                    "[GUI-%s][turn=%d] Tool executed OK: got_image=%s",
-                    task_id,
-                    turn,
-                    bool(tool_response and tool_response.image),
+                _log(
+                    f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
+                    f"got_image={bool(tool_response and tool_response.image)}",
+                    debug=True,
                 )
 
                 # 6. The current turn is not the final turn; register it as
@@ -390,24 +383,38 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         {"role": "user", "content": f"{task_query}\nPlease continue"}
                     )
 
+            _log(
+                f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} turn={turn} "
+                f"terminated={terminated} fatal_error={fatal_error} "
+                f"last_turn_ctx_is_none={last_turn_ctx is None}"
+            )
+
             if fatal_error:
-                logger.warning("[GUIAgentLoop] Fatal error for %s at turn=%d, discarding rollout", task_id, turn)
+                _log(
+                    f"[GUIAgentLoop] Fatal error for {task_id} at turn={turn}, discarding rollout"
+                )
+                _log(
+                    f"[GUIAgentLoop][RETURN_NONE][fatal_error] task_id={task_id} turn={turn}"
+                )
                 return None
 
             if last_turn_ctx is None:
-                logger.warning("[GUIAgentLoop] No turns produced for %s, discarding rollout", task_id)
+                _log(
+                    f"[GUIAgentLoop] No turns produced for {task_id}, discarding rollout"
+                )
+                _log(
+                    f"[GUIAgentLoop][RETURN_NONE][no_turns_produced] task_id={task_id} turn={turn}"
+                )
                 return None
 
             if turn >= self.max_turns and not terminated:
-                logger.info(
-                    "[GUI-%s] Reached max_turns=%d without model terminate",
-                    task_id,
-                    self.max_turns,
+                _log(
+                    f"[GUI-{task_id}] Reached max_turns={self.max_turns} without model terminate"
                 )
 
             # Compute terminal reward.
             shared_reward = await self.desktop_tool.calc_reward(instance_id)
-            logger.info("[GUI-%s] Final reward = %.4f (turns=%d)", task_id, shared_reward, turn)
+            _log(f"[GUI-{task_id}] Final reward = {shared_reward:.4f} (turns={turn})")
 
             # Build the final AgentLoopOutput from the last turn's snapshot.
             final_extra_fields = dict(last_turn_ctx["extra_fields"])
@@ -430,12 +437,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             num_intermediate = len(
                 final_output.extra_fields.get("intermediate_trajectories", [])
             )
-            logger.info(
-                "[GUI-%s] Done: %d trajectories (1 final + %d intermediate), reward=%.4f",
-                task_id,
-                num_intermediate + 1,
-                num_intermediate,
-                shared_reward,
+            _log(
+                f"[GUI-{task_id}] Done: {num_intermediate + 1} trajectories "
+                f"(1 final + {num_intermediate} intermediate), reward={shared_reward:.4f}"
             )
             return final_output
 
@@ -443,6 +447,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             try:
                 await self.desktop_tool.release(instance_id)
             except Exception:
-                logger.warning(
-                    "[GUIAgentLoop] Failed to release env for %s", task_id, exc_info=True
+                _log(
+                    f"[GUIAgentLoop] Failed to release env for {task_id}\n{traceback.format_exc()}"
                 )
+            _log(
+                f"[GUIAgentLoop][RUN_END] task_id={task_id} request_id={request_id}"
+            )
