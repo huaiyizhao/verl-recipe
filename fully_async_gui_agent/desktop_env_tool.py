@@ -35,6 +35,7 @@ agent can feed the observation back to the LLM. The tool tolerates missing
 screenshots gracefully.
 """
 
+import asyncio
 import base64
 import copy
 import io
@@ -258,6 +259,12 @@ class DesktopEnvTool(BaseTool):
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
         self.step_reward = float(config.get("step_reward", 0.0))
 
+        # HTTP retry config: retry ``max_retries`` times with a fixed
+        # ``retry_interval`` seconds between attempts. After that, _post
+        # raises and the caller (agent loop) will abort the rollout.
+        self.max_retries = int(config.get("max_retries", 3))
+        self.retry_interval = float(config.get("retry_interval", 30.0))
+
         # instance_id → {"session_id": str, "task_id": str}
         self._instances: dict[str, dict[str, str]] = {}
 
@@ -265,30 +272,49 @@ class DesktopEnvTool(BaseTool):
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    async def _post(self, path: str, payload: dict | None = None) -> dict:
-        """POST JSON to the desktop env service and return the JSON response."""
+    async def _post(
+        self,
+        path: str,
+        payload: dict | None = None,
+        timeout: Optional[aiohttp.ClientTimeout] = None,
+    ) -> dict:
+        """POST JSON to the desktop env service and return the JSON response.
+
+        On any failure, retry up to ``self.max_retries`` times, sleeping
+        ``self.retry_interval`` seconds between attempts. If all retries
+        fail, raise so the caller (agent loop) can abort the rollout.
+        """
         url = f"{self.api_base_url}{path}"
-        logger.debug("[DesktopEnvTool] POST %s payload_keys=%s", path, list((payload or {}).keys()))
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            async with session.post(url, json=payload or {}) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
+        attempts = self.max_retries + 1  # initial attempt + retries
+        last_exc: Optional[BaseException] = None
+        effective_timeout = timeout if timeout is not None else self.timeout
+
+        for attempt in range(1, attempts + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=effective_timeout) as session:
+                    async with session.post(url, json=payload or {}) as resp:
+                        resp.raise_for_status()
+                        if resp.content_type == "application/json":
+                            return await resp.json()
+                        # Empty body is allowed for endpoints like /close.
+                        return {}
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
                     logger.error(
-                        "[DesktopEnvTool] POST %s -> HTTP %d body=%s",
-                        path,
-                        resp.status,
-                        body[:500],
+                        "[DesktopEnvTool] POST %s failed after %d attempts: %s",
+                        path, attempts, exc,
                     )
-                resp.raise_for_status()
-                if resp.content_type == "application/json":
-                    data = await resp.json()
-                    logger.debug(
-                        "[DesktopEnvTool] POST %s -> keys=%s", path, list(data.keys())
-                    )
-                    return data
-                # Empty body is allowed for endpoints like /close.
-                logger.debug("[DesktopEnvTool] POST %s -> empty body", path)
-                return {}
+                    break
+                logger.warning(
+                    "[DesktopEnvTool] POST %s failed (attempt %d/%d): %s. Retrying in %.1fs",
+                    path, attempt, attempts, exc, self.retry_interval,
+                )
+                await asyncio.sleep(self.retry_interval)
+
+        raise RuntimeError(
+            f"POST {path} failed after {attempts} attempts: {last_exc}"
+        ) from last_exc
 
     # ------------------------------------------------------------------
     # BaseTool interface
@@ -325,7 +351,11 @@ class DesktopEnvTool(BaseTool):
             task_id,
             instance_id,
         )
-        resp = await self._post("/session/create", {"task_id": task_id})
+        resp = await self._post(
+            "/session/create",
+            {"task_id": task_id, "require_a11y_tree": False},
+            timeout=aiohttp.ClientTimeout(total=120),
+        )
         session_id = resp.get("session_id")
         if not session_id:
             raise RuntimeError(

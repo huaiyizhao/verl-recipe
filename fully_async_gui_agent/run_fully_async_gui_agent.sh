@@ -79,14 +79,22 @@ n_resp_per_prompt=${n_resp_per_prompt:-4}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
+total_epochs=200
+test_freq=5
+
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-0.1}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
 partial_rollout=${partial_rollout:-False}
 
+# Hard cap on in-flight rollouts. The desktop-env service only allows a
+# limited number of concurrent sessions (e.g. 32), so we must throttle the
+# rollouter here to avoid flooding the backend.
+max_concurrent_rollouts=${max_concurrent_rollouts:-4}
+
 # ================= performance =================
-infer_tp=${infer_tp:-4}
+infer_tp=${infer_tp:-1}
 actor_offload=${actor_offload:-True}
 ref_offload=${ref_offload:-True}
 fsdp_size=4
@@ -158,12 +166,13 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
+    +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.total_epochs=1 \
+    trainer.total_epochs="${total_epochs}" \
     trainer.val_before_train=False \
-    trainer.test_freq=-1 \
+    trainer.test_freq="${test_freq}" \
     trainer.save_freq=-1 \
     trainer.resume_mode=disable \
     trainer.nnodes="${NNODES}" \
