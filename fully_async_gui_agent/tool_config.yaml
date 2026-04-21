@@ -11,5 +11,5 @@ tools:
       screen_height: 1000
       timeout: 30
       pause: 2.0
-      evaluate_settle_seconds: 20
+      evaluate_settle_seconds: 30
       step_reward: 0.0

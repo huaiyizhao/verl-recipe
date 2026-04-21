@@ -76,7 +76,7 @@ actor_lr=${actor_lr:-1e-6}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-2}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-1}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 total_epochs=200
@@ -84,8 +84,8 @@ test_freq=5
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-0.1}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
+staleness_threshold=${staleness_threshold:-0}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-1}
 partial_rollout=${partial_rollout:-False}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
