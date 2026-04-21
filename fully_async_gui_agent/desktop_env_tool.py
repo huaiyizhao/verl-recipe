@@ -51,8 +51,46 @@ from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.utils.rollout_trace import rollout_trace_op
 
+# Force the ROOT logger level so our INFO/DEBUG logs are not filtered out by
+# verl's global ``logging.basicConfig(level=WARNING)`` call. Honors the
+# ``VERL_LOGGING_LEVEL`` env var so users can still override it.
+_level_name = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper()
+_level = getattr(logging, _level_name, logging.INFO)
+logging.getLogger().setLevel(_level)
+
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+logger.setLevel(_level)
+
+# Truncate very long payload/response strings in logs to keep output readable.
+_MAX_LOG_BODY = int(os.getenv("DESKTOP_ENV_LOG_MAX_BODY", "4096"))
+
+
+def _short_repr(obj: Any, limit: int = _MAX_LOG_BODY) -> str:
+    """Return a truncated ``repr`` suitable for logs.
+
+    Screenshot base64 blobs can be huge; we elide them so logs stay useful.
+    """
+    try:
+        if isinstance(obj, dict):
+            redacted = {}
+            for k, v in obj.items():
+                if isinstance(v, str) and len(v) > 200 and k in ("screenshot", "image", "a11y_tree"):
+                    redacted[k] = f"<{k}: {len(v)} chars elided>"
+                elif isinstance(v, dict):
+                    redacted[k] = {
+                        sk: (f"<{sk}: {len(sv)} chars elided>" if isinstance(sv, str) and len(sv) > 200 and sk in ("screenshot", "image", "a11y_tree") else sv)
+                        for sk, sv in v.items()
+                    }
+                else:
+                    redacted[k] = v
+            s = repr(redacted)
+        else:
+            s = repr(obj)
+    except Exception:
+        s = f"<unreprable {type(obj).__name__}>"
+    if len(s) > limit:
+        return s[:limit] + f"... <{len(s) - limit} more chars>"
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +318,8 @@ class DesktopEnvTool(BaseTool):
     ) -> dict:
         """POST JSON to the desktop env service and return the JSON response.
 
-        On any failure, retry up to ``self.max_retries`` times, sleeping
+        Logs the request payload and response body at INFO level. On any
+        failure, retry up to ``self.max_retries`` times, sleeping
         ``self.retry_interval`` seconds between attempts. If all retries
         fail, raise so the caller (agent loop) can abort the rollout.
         """
@@ -288,27 +327,73 @@ class DesktopEnvTool(BaseTool):
         attempts = self.max_retries + 1  # initial attempt + retries
         last_exc: Optional[BaseException] = None
         effective_timeout = timeout if timeout is not None else self.timeout
+        request_body = payload or {}
+
+        logger.info(
+            "[DesktopEnvTool] -> POST %s payload=%s",
+            url,
+            _short_repr(request_body),
+        )
 
         for attempt in range(1, attempts + 1):
             try:
                 async with aiohttp.ClientSession(timeout=effective_timeout) as session:
-                    async with session.post(url, json=payload or {}) as resp:
-                        resp.raise_for_status()
-                        if resp.content_type == "application/json":
-                            return await resp.json()
+                    async with session.post(url, json=request_body) as resp:
+                        status = resp.status
+                        content_type = resp.content_type
+                        # Always read the full body so we can log it (and show
+                        # it in error messages).
+                        text_body = await resp.text()
+                        if status >= 400:
+                            raise aiohttp.ClientResponseError(
+                                request_info=resp.request_info,
+                                history=resp.history,
+                                status=status,
+                                message=text_body or resp.reason or "",
+                                headers=resp.headers,
+                            )
+                        if content_type == "application/json" and text_body:
+                            import json as _json
+                            try:
+                                data = _json.loads(text_body)
+                            except _json.JSONDecodeError as je:
+                                logger.error(
+                                    "[DesktopEnvTool] <- POST %s status=%d non-JSON body (content_type=%s): %s",
+                                    url, status, content_type, _short_repr(text_body),
+                                )
+                                raise RuntimeError(
+                                    f"POST {path} returned non-JSON body: {text_body!r}"
+                                ) from je
+                            logger.info(
+                                "[DesktopEnvTool] <- POST %s status=%d response=%s",
+                                url, status, _short_repr(data),
+                            )
+                            return data
                         # Empty body is allowed for endpoints like /close.
+                        logger.info(
+                            "[DesktopEnvTool] <- POST %s status=%d empty body (content_type=%s)",
+                            url, status, content_type,
+                        )
                         return {}
             except Exception as exc:
                 last_exc = exc
+                # Extract as much detail as possible from the exception.
+                detail = str(exc) or repr(exc)
+                if isinstance(exc, aiohttp.ClientResponseError):
+                    detail = (
+                        f"status={exc.status} message={exc.message!r} "
+                        f"url={exc.request_info.url if exc.request_info else url}"
+                    )
                 if attempt >= attempts:
                     logger.error(
-                        "[DesktopEnvTool] POST %s failed after %d attempts: %s",
-                        path, attempts, exc,
+                        "[DesktopEnvTool] POST %s failed after %d attempts: %s | payload=%s",
+                        path, attempts, detail, _short_repr(request_body),
+                        exc_info=True,
                     )
                     break
                 logger.warning(
                     "[DesktopEnvTool] POST %s failed (attempt %d/%d): %s. Retrying in %.1fs",
-                    path, attempt, attempts, exc, self.retry_interval,
+                    path, attempt, attempts, detail, self.retry_interval,
                 )
                 await asyncio.sleep(self.retry_interval)
 
