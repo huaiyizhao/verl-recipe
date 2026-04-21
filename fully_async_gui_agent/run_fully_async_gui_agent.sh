@@ -67,7 +67,7 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 # ================= algorithm =================
 adv_estimator=grpo
 
-max_turns=${max_turns:-50}
+max_turns=${max_turns:-20}
 max_prompt_length=${max_prompt_length:-24000}
 max_response_length=${max_response_length:-8192}
 actor_lr=${actor_lr:-1e-6}
@@ -75,7 +75,7 @@ actor_lr=${actor_lr:-1e-6}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-4}
+n_resp_per_prompt=${n_resp_per_prompt:-2}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
@@ -85,7 +85,7 @@ test_freq=5
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-0.1}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-False}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a

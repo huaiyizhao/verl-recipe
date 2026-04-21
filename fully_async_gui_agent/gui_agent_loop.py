@@ -54,6 +54,7 @@ from recipe.fully_async_gui_agent.context_manager import (
     BaseContextStrategy,
     KeepLastKImagesStrategy,
 )
+from recipe.fully_async_gui_agent.data_flow_logger import log_dataproto, log_message
 
 # We bypass the ``logging`` framework entirely here because verl's global
 # ``basicConfig(WARNING)`` plus Ray's early-attached handlers silently drop
@@ -330,9 +331,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 #    is computed via ``/evaluate``.
                 if tool_args is not None and action != "terminate":
                     try:
-                        tool_response, _, _ = await self.desktop_tool.execute(
-                            instance_id, tool_args
-                        )
+                        with simple_timer("tool_calls", metrics):
+                            tool_response, _, _ = await self.desktop_tool.execute(
+                                instance_id, tool_args
+                            )
                     except Exception as exec_exc:
                         _log(
                             f"[GUIAgentLoop] Tool execution failed for {task_id}, "
@@ -462,6 +464,18 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"[GUI-{task_id}] Done: {num_intermediate + 1} trajectories "
                 f"(1 final + {num_intermediate} intermediate), reward={shared_reward:.4f}"
             )
+
+            # --- Data flow log: agent loop output ---
+            log_message(
+                "gui_agent_loop.build_final_output",
+                f"task_id={task_id} turns={turn} stop_reason={stop_reason} "
+                f"reward={shared_reward:.4f} "
+                f"num_intermediate={num_intermediate} "
+                f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
+                f"final_response_len={len(last_turn_ctx['response_ids'])} "
+                f"extra_fields_keys={list(final_output.extra_fields.keys())}",
+            )
+
             return final_output
 
         finally:
