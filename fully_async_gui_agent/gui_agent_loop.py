@@ -376,6 +376,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     response_ids=last_turn_ctx["response_ids"],
                     response_mask=last_turn_ctx["response_mask"],
                     response_logprobs=last_turn_ctx["response_logprobs"],
+                    routed_experts=last_turn_ctx["routed_experts"],
                     multi_modal_data=last_turn_ctx["multi_modal_data"],
                     num_turns=last_turn_ctx["num_turns"],
                     **last_turn_ctx["extra_fields"],
