@@ -44,6 +44,7 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 export HYDRA_FULL_ERROR=1
 export VERL_LOGGING_LEVEL=DEBUG
+export MLFLOW_TRACKING_URI=http://172.20.70.149:29004
 
 # ================= data / model =================
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
@@ -166,7 +167,8 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
-    trainer.logger='["console", "wandb"]' \
+    trainer.logger='["console", "mlflow"]' \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.total_epochs="${total_epochs}" \
