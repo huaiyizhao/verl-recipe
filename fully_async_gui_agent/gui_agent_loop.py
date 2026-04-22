@@ -45,6 +45,7 @@ from verl.experimental.agent_loop.multi_trajectory_agent_loop import (
     MultiTrajectoryAgentLoop,
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
+from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -207,6 +208,18 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # AgentLoopOutput once the loop exits.
             last_turn_ctx: dict[str, Any] | None = None
 
+            # Consecutive-failure counter for tool execution. A single tool
+            # failure is surfaced to the model as a user message (so it can
+            # retry with a different action); only when we see repeated
+            # failures in a row do we treat the env as truly broken and
+            # abort. This keeps single-action mistakes cheap: the rollout
+            # still produces a usable final trajectory with whatever reward
+            # the env eventually grades.
+            consecutive_tool_failures = 0
+            max_consecutive_tool_failures = int(
+                getattr(self, "max_consecutive_tool_failures", 3)
+            )
+
             while True:
                 turn += 1
                 _log(
@@ -335,22 +348,57 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             tool_response, _, _ = await self.desktop_tool.execute(
                                 instance_id, tool_args
                             )
+                        # Successful tool execution resets the failure streak.
+                        consecutive_tool_failures = 0
                     except Exception as exec_exc:
+                        consecutive_tool_failures += 1
                         _log(
-                            f"[GUIAgentLoop] Tool execution failed for {task_id}, "
-                            f"aborting rollout: {exec_exc!r}\n{traceback.format_exc()}"
+                            f"[GUIAgentLoop] Tool execution failed for {task_id} "
+                            f"(streak={consecutive_tool_failures}/"
+                            f"{max_consecutive_tool_failures}): "
+                            f"{exec_exc!r}\n{traceback.format_exc()}"
                         )
                         _log(
-                            f"[GUIAgentLoop][FATAL_ERROR][tool_execute] task_id={task_id} "
-                            f"turn={turn} action={action} err={exec_exc!r}"
+                            f"[GUIAgentLoop][SOFT_ERROR][tool_execute] "
+                            f"task_id={task_id} turn={turn} action={action} "
+                            f"err={exec_exc!r} "
+                            f"streak={consecutive_tool_failures}/"
+                            f"{max_consecutive_tool_failures}"
                         )
-                        fatal_error = True
-                        break
-                    _log(
-                        f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
-                        f"got_image={bool(tool_response and tool_response.image)}",
-                        debug=True,
-                    )
+
+                        if consecutive_tool_failures >= max_consecutive_tool_failures:
+                            # Repeated failures almost always mean the env
+                            # session itself is dead (crashed VM, closed
+                            # socket, auth lost). Further turns cannot make
+                            # progress; exit the loop and let the post-loop
+                            # logic keep whatever ``last_turn_ctx`` we have.
+                            _log(
+                                f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
+                                f"task_id={task_id} turn={turn} action={action} "
+                                f"err={exec_exc!r}"
+                            )
+                            fatal_error = True
+                            break
+
+                        # Otherwise feed the error text back to the model as
+                        # a user turn so it can retry with a different action.
+                        # Build a synthetic tool_response so the downstream
+                        # "append intermediate + extend messages" code path
+                        # is reused verbatim.
+                        tool_response = ToolResponse(
+                            text=(
+                                f"Error executing action {action!r}: "
+                                f"{type(exec_exc).__name__}: {exec_exc}. "
+                                f"The screen was not changed. "
+                                f"Please try a different action."
+                            )
+                        )
+                    else:
+                        _log(
+                            f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
+                            f"got_image={bool(tool_response and tool_response.image)}",
+                            debug=True,
+                        )
                 else:
                     tool_response = None
 
@@ -410,9 +458,14 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"last_turn_ctx_is_none={last_turn_ctx is None}"
             )
 
+            # Environment-level failures (repeated tool exec errors, no
+            # turns produced) are NOT the model's fault. Turning them into
+            # reward=0 training samples would incorrectly punish the model
+            # for env instability. Discard the rollout instead.
             if fatal_error:
                 _log(
-                    f"[GUIAgentLoop] Fatal error for {task_id} at turn={turn}, discarding rollout"
+                    f"[GUIAgentLoop] Fatal error for {task_id} at turn={turn}, "
+                    f"discarding rollout (env-level failure, not model's fault)"
                 )
                 _log(
                     f"[GUIAgentLoop][RETURN_NONE][fatal_error] task_id={task_id} turn={turn}"
@@ -433,8 +486,21 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"[GUI-{task_id}] Reached max_turns={self.max_turns} without model terminate"
                 )
 
-            # Compute terminal reward.
-            shared_reward = await self.desktop_tool.calc_reward(instance_id)
+            # Compute terminal reward. If the reward service itself fails,
+            # that's an env-level problem (we cannot grade this rollout
+            # honestly), so discard rather than defaulting to 0.
+            try:
+                shared_reward = await self.desktop_tool.calc_reward(instance_id)
+            except Exception as reward_exc:
+                _log(
+                    f"[GUIAgentLoop] calc_reward failed for {task_id}: {reward_exc!r}; "
+                    f"discarding rollout (env-level failure, not model's fault)"
+                )
+                _log(
+                    f"[GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
+                    f"task_id={task_id} turn={turn} err={reward_exc!r}"
+                )
+                return None
             _log(
                 f"[GUI-{task_id}] Final reward = {shared_reward:.4f} "
                 f"(turns={turn}, stop_reason={stop_reason})"

@@ -169,6 +169,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.total_epochs="${total_epochs}" \

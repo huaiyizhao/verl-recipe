@@ -259,6 +259,29 @@ def _translate_action_to_pyautogui(parameters: dict[str, Any]) -> Optional[str]:
     raise ValueError(f"Unknown computer_use action: {action!r}")
 
 
+# Whitelist of action names understood by ``_translate_action_to_pyautogui``
+# plus the virtual actions handled in ``DesktopEnvTool.execute``. Used to
+# give structured feedback on unknown actions without aborting the rollout.
+_VALID_COMPUTER_USE_ACTIONS: tuple[str, ...] = (
+    # physical actions
+    "mouse_move",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "left_click_drag",
+    "type",
+    "key",
+    "scroll",
+    "hscroll",
+    "wait",
+    # virtual actions (no backend step)
+    "terminate",
+    "answer",
+)
+
+
 def _decode_screenshot(b64_png: Optional[str]) -> Optional[Image.Image]:
     """Decode a base64-encoded PNG screenshot field if present."""
     if not b64_png:
@@ -487,6 +510,31 @@ class DesktopEnvTool(BaseTool):
         session_id = info["session_id"]
 
         action = parameters.get("action", "")
+
+        # Reject unknown actions with a structured tool response instead of
+        # raising. Aborting the rollout here was the root cause of many
+        # cold-start training failures where the untrained model kept
+        # emitting schema-invalid action names (``click``, ``press``, ...),
+        # causing the entire rollout to be discarded and the batch to be
+        # empty. Returning a descriptive error lets the agent learn the
+        # valid action vocabulary through tool feedback.
+        if action not in _VALID_COMPUTER_USE_ACTIONS:
+            valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
+            _log(
+                f"[DesktopEnvTool] invalid action={action!r} "
+                f"session_id={session_id} (returning soft error)"
+            )
+            return (
+                ToolResponse(
+                    text=(
+                        f"Error: unknown action {action!r}. "
+                        f"No screen state change. "
+                        f"Valid computer_use actions are: {valid_list}."
+                    )
+                ),
+                0.0,
+                {"action": action, "invalid_action": True},
+            )
 
         # Virtual actions that the agent loop handles directly.
         if action == "terminate":
