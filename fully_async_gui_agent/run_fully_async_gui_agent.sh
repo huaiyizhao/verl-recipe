@@ -26,7 +26,6 @@
 #        - extra_info.question (user query for the task)
 
 set -xeuo pipefail
-
 # ================= paths =================
 # RECIPE_DIR is the directory containing this script (portable, no matter where
 # the script is invoked from). VERL_ROOT must point at the verl source tree so
@@ -75,8 +74,8 @@ actor_lr=${actor_lr:-1e-6}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-2}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-1}
+n_resp_per_prompt=${n_resp_per_prompt:-4}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 total_epochs=200
@@ -91,7 +90,7 @@ partial_rollout=${partial_rollout:-False}
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-4}
+max_concurrent_rollouts=${max_concurrent_rollouts:-16}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
