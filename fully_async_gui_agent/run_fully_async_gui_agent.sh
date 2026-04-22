@@ -52,7 +52,7 @@ train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
 # ================= desktop env service =================
-export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://10.192.64.33:2354}
+export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://10.192.64.238:2354}
 
 # ================= rollout / agent loop =================
 rollout_mode="async"
