@@ -191,8 +191,28 @@ def _build_tool_schema(screen_width: int, screen_height: int) -> OpenAIFunctionT
 # ---------------------------------------------------------------------------
 
 
-def _translate_action_to_pyautogui(parameters: dict[str, Any]) -> Optional[str]:
+def _denorm_coord(coord, screen_width: int, screen_height: int) -> tuple[int, int]:
+    """Convert Qwen-VL normalized coordinates [0, 1000] to absolute pixel coordinates.
+
+    Qwen-VL outputs coordinates in the range [0, 1000] regardless of the actual
+    screen resolution. This function scales them to the real pixel space.
+    """
+    x, y = coord
+    abs_x = int(float(x) / 1000.0 * screen_width)
+    abs_y = int(float(y) / 1000.0 * screen_height)
+    return abs_x, abs_y
+
+
+def _translate_action_to_pyautogui(
+    parameters: dict[str, Any],
+    screen_width: int,
+    screen_height: int,
+) -> Optional[str]:
     """Translate a Qwen-VL computer_use structured action into a pyautogui code line.
+
+    Coordinates output by Qwen-VL are normalized to [0, 1000] and are
+    denormalized to absolute pixels using ``screen_width`` / ``screen_height``
+    before being embedded in the generated pyautogui snippet.
 
     Returns ``None`` for virtual actions that are handled by the agent loop
     directly (``terminate``, ``answer``) and do not map to a backend step.
@@ -204,33 +224,33 @@ def _translate_action_to_pyautogui(parameters: dict[str, Any]) -> Optional[str]:
         return None
 
     if action == "mouse_move":
-        x, y = coord
-        return f"pyautogui.moveTo({int(x)}, {int(y)})"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.moveTo({x}, {y})"
 
     if action == "left_click":
-        x, y = coord
-        return f"pyautogui.click(x={int(x)}, y={int(y)}, button='left')"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.click(x={x}, y={y}, button='left')"
 
     if action == "right_click":
-        x, y = coord
-        return f"pyautogui.click(x={int(x)}, y={int(y)}, button='right')"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.click(x={x}, y={y}, button='right')"
 
     if action == "middle_click":
-        x, y = coord
-        return f"pyautogui.click(x={int(x)}, y={int(y)}, button='middle')"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.click(x={x}, y={y}, button='middle')"
 
     if action == "double_click":
-        x, y = coord
-        return f"pyautogui.doubleClick(x={int(x)}, y={int(y)})"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.doubleClick(x={x}, y={y})"
 
     if action == "triple_click":
-        x, y = coord
-        return f"pyautogui.tripleClick(x={int(x)}, y={int(y)})"
+        x, y = _denorm_coord(coord, screen_width, screen_height)
+        return f"pyautogui.tripleClick(x={x}, y={y})"
 
     if action == "left_click_drag":
-        x, y = coord
+        x, y = _denorm_coord(coord, screen_width, screen_height)
         # Drag *to* the target from the current cursor position, mouse button held left.
-        return f"pyautogui.dragTo({int(x)}, {int(y)}, button='left')"
+        return f"pyautogui.dragTo({x}, {y}, button='left')"
 
     if action == "type":
         text = parameters.get("text", "")
@@ -305,8 +325,14 @@ class DesktopEnvTool(BaseTool):
     Config keys:
         api_base_url (str): Base URL of the desktop env service (e.g.
             ``http://localhost:2354``).
-        screen_width (int): Screen width in pixels (default 1000).
-        screen_height (int): Screen height in pixels (default 1000).
+        screen_width (int): Width shown to the model in the prompt (Qwen-VL
+            normalized space, default 1000).
+        screen_height (int): Height shown to the model in the prompt (Qwen-VL
+            normalized space, default 1000).
+        real_screen_width (int): Actual desktop resolution width used to
+            denormalize model coordinates (default: same as screen_width).
+        real_screen_height (int): Actual desktop resolution height used to
+            denormalize model coordinates (default: same as screen_height).
         timeout (int): HTTP request timeout in seconds (default 30).
         pause (float): ``pause`` value forwarded to ``/step`` after each
             action (default 2.0).
@@ -328,6 +354,10 @@ class DesktopEnvTool(BaseTool):
         self.api_base_url = config["api_base_url"].rstrip("/")
         self.screen_width = screen_width
         self.screen_height = screen_height
+        # Real desktop resolution for coordinate denormalization.
+        # Falls back to screen_width/screen_height if not configured.
+        self.real_screen_width = int(config.get("real_screen_width", screen_width))
+        self.real_screen_height = int(config.get("real_screen_height", screen_height))
         self.timeout = aiohttp.ClientTimeout(total=config.get("timeout", 30))
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
@@ -557,7 +587,7 @@ class DesktopEnvTool(BaseTool):
                 {"action": action},
             )
 
-        code = _translate_action_to_pyautogui(parameters)
+        code = _translate_action_to_pyautogui(parameters, self.real_screen_width, self.real_screen_height)
         _log(
             f"[DesktopEnvTool] step session_id={session_id} action={action} code={code}",
             debug=True,
