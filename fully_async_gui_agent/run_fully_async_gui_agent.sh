@@ -44,7 +44,11 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 export HYDRA_FULL_ERROR=1
 export VERL_LOGGING_LEVEL=DEBUG
-export MLFLOW_TRACKING_URI=http://172.20.70.149:29004
+# WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
+# for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
+export WANDB_API_KEY=${WANDB_API_KEY:-}
+# Reduce memory fragmentation (helps with the 27GB reserved-but-unallocated).
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 
 # ================= data / model =================
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
@@ -99,8 +103,13 @@ actor_offload=${actor_offload:-True}
 ref_offload=${ref_offload:-True}
 fsdp_size=4
 
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+# Max packed-sequence length per GPU per micro-batch (dynamic_bsz on).
+# With Qwen3-VL-8B + FSDP2, a 64k packed sequence OOMs on 140GB even with
+# param/optimizer offload, because the (seq_len^2) attention activations plus
+# FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
+# ~(max_prompt+max_response) is safer; scale up only if backward fits.
+actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3 / 2))
 
 project_name=${project_name:-fully_async_gui_agent}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
@@ -167,8 +176,8 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
-    trainer.logger='["console", "mlflow"]' \
-    actor_rollout_ref.rollout.trace.backend=mlflow \
+    trainer.logger='["console", "wandb"]' \
+    actor_rollout_ref.rollout.trace.backend=weave \
     actor_rollout_ref.rollout.trace.token2text=True \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
