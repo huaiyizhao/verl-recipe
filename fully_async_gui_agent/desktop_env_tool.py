@@ -548,6 +548,34 @@ class DesktopEnvTool(BaseTool):
         )
         return instance_id, ToolResponse(image=images)
 
+    async def screenshot(self, instance_id: str) -> list:
+        """Take a screenshot of the current desktop without executing any action.
+
+        Sends a no-op ``time.sleep(0)`` step to the backend and returns the
+        observation screenshot. This is used to attach a fresh screenshot to
+        error responses so the agent always receives visual context.
+
+        Returns:
+            list of PIL.Image (length 0 or 1).
+        """
+        info = self._instances.get(instance_id)
+        if info is None:
+            return []
+        session_id = info["session_id"]
+        try:
+            resp = await self._post(
+                f"/session/{session_id}/step",
+                {"action": "import time; time.sleep(0)", "pause": 0},
+            )
+            observation = resp.get("observation") or {}
+            screenshot = _decode_screenshot(observation.get("screenshot"))
+            return [screenshot] if screenshot is not None else []
+        except Exception:
+            _log_error(
+                f"[DesktopEnvTool] screenshot failed for session_id={session_id}"
+            )
+            return []
+
     @rollout_trace_op
     async def execute(
         self, instance_id: str, parameters: dict[str, Any], **kwargs
@@ -576,10 +604,14 @@ class DesktopEnvTool(BaseTool):
             valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
             _log_error(
                 f"[DesktopEnvTool] invalid action={action!r} "
-                f"session_id={session_id} (returning soft error)"
+                f"session_id={session_id} (returning soft error with screenshot)"
             )
+            # Attach a fresh screenshot so the agent always has visual context
+            # even when the action was invalid.
+            images = await self.screenshot(instance_id)
             return (
                 ToolResponse(
+                    image=images,
                     text=(
                         f"Error: unknown action {action!r}. "
                         f"No screen state change. "

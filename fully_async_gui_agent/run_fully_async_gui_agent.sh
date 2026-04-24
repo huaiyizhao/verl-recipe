@@ -84,7 +84,7 @@ train_prompt_mini_bsz=${train_prompt_mini_bsz:-2}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 total_epochs=200
-test_freq=5
+test_freq=-1  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).

@@ -383,12 +383,23 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             fatal_error = True
                             break
 
-                        # Otherwise feed the error text back to the model as
-                        # a user turn so it can retry with a different action.
+                        # Take a fresh screenshot so the next turn always has
+                        # visual context, even though the action itself failed.
+                        # Without this, the user message would be pure text,
+                        # and after context pruning all images could be lost,
+                        # causing multi_modal_data to be empty for subsequent
+                        # intermediate trajectories.
+                        error_images = await self.desktop_tool.screenshot(instance_id)
+                        _log(
+                            f"[GUI-{task_id}][turn={turn}] Error recovery screenshot: "
+                            f"got_image={bool(error_images)}"
+                        )
+
                         # Build a synthetic tool_response so the downstream
                         # "append intermediate + extend messages" code path
                         # is reused verbatim.
                         tool_response = ToolResponse(
+                            image=error_images,
                             text=(
                                 f"Error executing action {action!r}: "
                                 f"{type(exec_exc).__name__}: {exec_exc}. "
