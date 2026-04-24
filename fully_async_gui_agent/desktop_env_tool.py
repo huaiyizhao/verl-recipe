@@ -42,6 +42,7 @@ import io
 import logging
 import os
 import sys
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -63,15 +64,38 @@ logger = logging.getLogger(__name__)
 _DEBUG_ENABLED = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper() == "DEBUG"
 
 
+def _ts() -> str:
+    """Short timestamp prefix for error logs, e.g. ``2026-04-24 14:47:03.123``."""
+    t = time.time()
+    lt = time.localtime(t)
+    ms = int((t - int(t)) * 1000)
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', lt)}.{ms:03d}"
+
+
 def _log(msg: str, *, debug: bool = False) -> None:
     """Print-based logger that bypasses the ``logging`` framework entirely.
 
+    Normal info-level traces are only emitted when ``VERL_LOGGING_LEVEL=DEBUG``
+    (so the default run stays quiet). The ``debug`` kwarg is kept for backwards
+    compatibility with existing callsites; all info lines are now gated on the
+    same ``_DEBUG_ENABLED`` flag regardless of its value. Use
+    :func:`_log_error` for anything that should always surface.
+
     ``flush=True`` + ``stderr`` ensures lines survive worker crashes.
-    Honors ``VERL_LOGGING_LEVEL=DEBUG`` for debug-gated messages.
     """
-    if debug and not _DEBUG_ENABLED:
+    del debug  # unused; kept for backward compatibility
+    if not _DEBUG_ENABLED:
         return
     print(msg, file=sys.stderr, flush=True)
+
+
+def _log_error(msg: str) -> None:
+    """Always-on error log with a millisecond timestamp.
+
+    Use for failures that must be visible even in the default (non-DEBUG)
+    configuration.
+    """
+    print(f"[{_ts()}] {msg}", file=sys.stderr, flush=True)
 
 
 # Truncate very long payload/response strings in logs to keep output readable.
@@ -419,7 +443,7 @@ class DesktopEnvTool(BaseTool):
                             try:
                                 data = _json.loads(text_body)
                             except _json.JSONDecodeError as je:
-                                _log(
+                                _log_error(
                                     f"[DesktopEnvTool] <- POST {url} status={status} "
                                     f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
                                 )
@@ -447,7 +471,7 @@ class DesktopEnvTool(BaseTool):
                         f"url={exc.request_info.url if exc.request_info else url}"
                     )
                 if attempt >= attempts:
-                    _log(
+                    _log_error(
                         f"[DesktopEnvTool] POST {path} failed after {attempts} attempts: "
                         f"{detail} | payload={_short_repr(request_body)}"
                     )
@@ -459,7 +483,7 @@ class DesktopEnvTool(BaseTool):
                         exc_info=True,
                     )
                     break
-                _log(
+                _log_error(
                     f"[DesktopEnvTool] POST {path} failed (attempt {attempt}/{attempts}): "
                     f"{detail}. Retrying in {self.retry_interval:.1f}s"
                 )
@@ -550,7 +574,7 @@ class DesktopEnvTool(BaseTool):
         # valid action vocabulary through tool feedback.
         if action not in _VALID_COMPUTER_USE_ACTIONS:
             valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
-            _log(
+            _log_error(
                 f"[DesktopEnvTool] invalid action={action!r} "
                 f"session_id={session_id} (returning soft error)"
             )
@@ -622,7 +646,7 @@ class DesktopEnvTool(BaseTool):
         """Compute the terminal reward via ``/evaluate``."""
         info = self._instances.get(instance_id)
         if info is None:
-            _log(
+            _log_error(
                 f"[DesktopEnvTool] calc_reward: unknown instance_id={instance_id} "
                 f"(already released?)"
             )
@@ -639,7 +663,7 @@ class DesktopEnvTool(BaseTool):
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
         except Exception:
-            _log(f"[DesktopEnvTool] Failed to evaluate session {session_id}")
+            _log_error(f"[DesktopEnvTool] Failed to evaluate session {session_id}")
             logger.warning(
                 "Failed to evaluate session %s", session_id, exc_info=True
             )
@@ -648,7 +672,7 @@ class DesktopEnvTool(BaseTool):
         try:
             reward = float(resp.get("reward", 0.0))
         except (TypeError, ValueError):
-            _log(
+            _log_error(
                 f"[DesktopEnvTool] evaluate session_id={session_id} "
                 f"returned non-numeric reward: {resp.get('reward')!r}"
             )
@@ -673,7 +697,7 @@ class DesktopEnvTool(BaseTool):
         try:
             await self._post(f"/session/{session_id}/close")
         except Exception:
-            _log(f"[DesktopEnvTool] Failed to close session {session_id}")
+            _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
             logger.warning(
                 "Failed to close session %s", session_id, exc_info=True
             )

@@ -176,9 +176,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 create_kwargs=create_kwargs,
             )
         except Exception as exc:
+            # Traceback is already printed by desktop_env_tool._post via
+            # logger.error(..., exc_info=True); keep a single summary line
+            # here to avoid duplicating the full stack.
             _log(
                 f"[GUIAgentLoop] Failed to create env for {task_id}, "
-                f"discarding rollout: {exc!r}\n{traceback.format_exc()}"
+                f"discarding rollout: {exc!r}"
             )
             _log(f"[GUIAgentLoop][RETURN_NONE][create_failed] task_id={task_id} err={exc!r}")
             return None

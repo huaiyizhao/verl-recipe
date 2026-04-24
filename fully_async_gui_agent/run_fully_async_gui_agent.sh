@@ -43,7 +43,7 @@ n_gpus_rollout=${n_gpus_rollout:-4}
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 export HYDRA_FULL_ERROR=1
-export VERL_LOGGING_LEVEL=DEBUG
+# export VERL_LOGGING_LEVEL=DEBUG
 # WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
 # for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
 export WANDB_API_KEY=${WANDB_API_KEY:-}
