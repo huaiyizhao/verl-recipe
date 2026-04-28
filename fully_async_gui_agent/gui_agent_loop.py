@@ -183,7 +183,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"[GUIAgentLoop] Failed to create env for {task_id}, "
                 f"discarding rollout: {exc!r}"
             )
-            _log(f"[GUIAgentLoop][RETURN_NONE][create_failed] task_id={task_id} err={exc!r}")
+            _log(f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][create_failed] task_id={task_id} err={exc!r}")
             return None
         _log(
             f"[GUI-{task_id}] Env session created: instance_id={instance_id}, "
@@ -225,9 +225,6 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
             while True:
                 turn += 1
-                _log(
-                    f"[GUI-{task_id}][turn={turn}] --- Begin turn (messages={len(messages)}) ---"
-                )
 
                 # 1. Prune old images.
                 messages = context_strategy.prepare_context(messages)
@@ -362,7 +359,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             f"{exec_exc!r}\n{traceback.format_exc()}"
                         )
                         _log(
-                            f"[GUIAgentLoop][SOFT_ERROR][tool_execute] "
+                            f"[POTENTIAL ERROR][GUIAgentLoop][SOFT_ERROR][tool_execute] "
                             f"task_id={task_id} turn={turn} action={action} "
                             f"err={exec_exc!r} "
                             f"streak={consecutive_tool_failures}/"
@@ -376,7 +373,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             # progress; exit the loop and let the post-loop
                             # logic keep whatever ``last_turn_ctx`` we have.
                             _log(
-                                f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
+                                f"[POTENTIAL ERROR][GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
                                 f"task_id={task_id} turn={turn} action={action} "
                                 f"err={exec_exc!r}"
                             )
@@ -482,7 +479,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
                 _log(
-                    f"[GUIAgentLoop][RETURN_NONE][fatal_error] task_id={task_id} turn={turn}"
+                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][fatal_error] task_id={task_id} turn={turn}"
                 )
                 return None
 
@@ -491,7 +488,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"[GUIAgentLoop] No turns produced for {task_id}, discarding rollout"
                 )
                 _log(
-                    f"[GUIAgentLoop][RETURN_NONE][no_turns_produced] task_id={task_id} turn={turn}"
+                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][no_turns_produced] task_id={task_id} turn={turn}"
                 )
                 return None
 
@@ -511,7 +508,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
                 _log(
-                    f"[GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
+                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
                     f"task_id={task_id} turn={turn} err={reward_exc!r}"
                 )
                 return None
