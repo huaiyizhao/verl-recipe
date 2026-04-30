@@ -1,5 +1,5 @@
 working_dir: ./
-excludes: ["/.git/"]
+excludes: ["/.git/", "/val_outputs/", "/wandb/"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
