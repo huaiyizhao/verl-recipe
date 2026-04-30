@@ -8,13 +8,13 @@ env_vars:
   FI_PROVIDER: efa
   FI_EFA_USE_DEVICE_RDMA: "1"
   FI_EFA_SET_DEFAULT_GDR: "1"
-  # 启用 Hopper 架构专用的 NVLink Switch 优化
   NCCL_NVLS_ENABLE: "1"
-  # 增加通信通道以压榨 H200 3.2Tbps 的带宽
   NCCL_MIN_NCHANNELS: "32"
-  # 排除非 EFA 网卡
   NCCL_IB_HCA: ^mlx5_bond_0,lo
-  # 调试日志（正式训练稳定后可设为 WARN）
   NCCL_DEBUG: INFO
-  # 设置 Python 路径
   PYTHONPATH: .
+  # Needed by Ray workers on all nodes
+  DESKTOP_API_BASE_URL: "http://10.192.64.238:2354"
+  VLLM_USE_V1: "1"
+  PYTORCH_ALLOC_CONF: "expandable_segments:True"
+  WANDB_API_KEY: "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"
