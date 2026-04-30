@@ -35,12 +35,16 @@ RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERL_ROOT=${VERL_ROOT:-/root/verl}
 
 # ================= cluster topology =================
-NNODES=${NNODES:-1}
+NNODES=${NNODES:-2}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 # Fully-async resource split: rollout vs training GPUs.
+# With 2 nodes: each node contributes 4 GPUs for rollout + 4 GPUs for training.
+# This forces Ray to distribute workers across both nodes.
 n_gpus_rollout=${n_gpus_rollout:-4}
-n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+n_gpus_training=${n_gpus_training:-4}
+rollout_nnodes=${rollout_nnodes:-2}
+trainer_nnodes=${trainer_nnodes:-2}
 
 export HYDRA_FULL_ERROR=1
 # export VERL_LOGGING_LEVEL=DEBUG
@@ -72,7 +76,7 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-24000}
+max_prompt_length=${max_prompt_length:-20000}
 max_response_length=${max_response_length:-8192}
 actor_lr=${actor_lr:-1e-6}
 
@@ -99,9 +103,12 @@ max_concurrent_rollouts=${max_concurrent_rollouts:-32}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
-actor_offload=${actor_offload:-True}
-ref_offload=${ref_offload:-True}
-fsdp_size=4
+actor_offload=${actor_offload:-False}
+ref_offload=${ref_offload:-False}
+# H200 140GB: fsdp_size=4 (4-way sharding within each node).
+# Per-GPU: actor 4GB + optimizer 24GB + ref 4GB + activation ~25GB ≈ 57GB, fits 140GB.
+# Keeps all-gather within node (NVLink), no cross-node FSDP traffic.
+fsdp_size=${n_gpus_training}
 
 # Max packed-sequence length per GPU per micro-batch (dynamic_bsz on).
 # With Qwen3-VL-8B + FSDP2, a 64k packed sequence OOMs on 140GB even with
@@ -187,9 +194,9 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.test_freq="${test_freq}" \
     trainer.save_freq=-1 \
     trainer.resume_mode=disable \
-    trainer.nnodes="${NNODES}" \
+    trainer.nnodes="${trainer_nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
-    rollout.nnodes="${NNODES}" \
+    rollout.nnodes="${rollout_nnodes}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     "$@"
