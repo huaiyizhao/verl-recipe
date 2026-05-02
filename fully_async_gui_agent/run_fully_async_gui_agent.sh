@@ -47,6 +47,7 @@ rollout_nnodes=${rollout_nnodes:-2}
 trainer_nnodes=${trainer_nnodes:-2}
 
 export HYDRA_FULL_ERROR=1
+export HF_HOME="/efs/data/hf"
 # export VERL_LOGGING_LEVEL=DEBUG
 # WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
 # for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
