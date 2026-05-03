@@ -32,6 +32,7 @@ The loop packs intermediate trajectories using
 import json
 import os
 import sys
+import time
 import traceback
 from typing import Any
 from uuid import uuid4
@@ -65,11 +66,24 @@ from recipe.fully_async_gui_agent.data_flow_logger import log_dataproto, log_mes
 _DEBUG_ENABLED = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper() == "DEBUG"
 
 
+def _ts() -> str:
+    """Short millisecond timestamp, e.g. ``2026-05-02 16:49:00.136``.
+
+    Ray's log forwarder does not prepend timestamps to stderr lines, so we
+    prepend our own to make it easy to correlate rollout activity with
+    external events (e.g. desktop-env crashes, SIGABRT, trainer steps).
+    """
+    t = time.time()
+    lt = time.localtime(t)
+    ms = int((t - int(t)) * 1000)
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', lt)}.{ms:03d}"
+
+
 def _log(msg: str, *, debug: bool = False) -> None:
     """Print-based logger. ``flush=True`` + ``stderr`` survives worker crashes."""
     if debug and not _DEBUG_ENABLED:
         return
-    print(msg, file=sys.stderr, flush=True)
+    print(f"[{_ts()}] {msg}", file=sys.stderr, flush=True)
 
 
 @register("gui_agent")
