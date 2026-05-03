@@ -147,12 +147,24 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
         request_id = uuid4().hex
         metrics: dict[str, Any] = {}
+        trajectory_info = kwargs.get("trajectory_info", {}) or {}
+        sample_index = trajectory_info.get("sample_index", "?")
+        rollout_n = trajectory_info.get("rollout_n", "?")
+        global_step = trajectory_info.get("step", "?")
+        validate = trajectory_info.get("validate", False)
+        base_log_tag = (
+            f"[GUI-{task_id}][rid={request_id[:8]}][sample={sample_index}]"
+            f"[rollout={rollout_n}][step={global_step}][validate={validate}]"
+        )
+        log_tag = base_log_tag
 
         _log(
-            f"[GUIAgentLoop][RUN_START] task_id={task_id} request_id={request_id} max_turns={self.max_turns}"
+            f"[GUIAgentLoop][RUN_START] task_id={task_id} request_id={request_id} "
+            f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+            f"validate={validate} max_turns={self.max_turns}"
         )
         _log(
-            f"[GUI-{task_id}] Starting agent loop (request_id={request_id}, "
+            f"{log_tag} Starting agent loop (request_id={request_id}, "
             f"max_turns={self.max_turns}, initial_messages={len(messages)}, "
             f"query={(task_query[:80] + '...') if len(task_query) > 80 else task_query!r})"
         )
@@ -165,7 +177,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
         create_kwargs.setdefault("task_id", task_id)
         _log(
-            f"[GUI-{task_id}] Context strategy=KeepLastKImagesStrategy(k={keep_last_k}), "
+            f"{log_tag} Context strategy=KeepLastKImagesStrategy(k={keep_last_k}), "
             f"create_kwargs={create_kwargs}",
             debug=True,
         )
@@ -180,13 +192,18 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # logger.error(..., exc_info=True); keep a single summary line
             # here to avoid duplicating the full stack.
             _log(
-                f"[GUIAgentLoop] Failed to create env for {task_id}, "
+                f"[GUIAgentLoop] Failed to create env for {task_id} {base_log_tag}, "
                 f"discarding rollout: {exc!r}"
             )
-            _log(f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][create_failed] task_id={task_id} err={exc!r}")
+            _log(
+                f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][create_failed] "
+                f"task_id={task_id} request_id={request_id} sample_index={sample_index} "
+                f"rollout_n={rollout_n} step={global_step} err={exc!r}"
+            )
             return None
+        log_tag = f"{base_log_tag}[iid={instance_id[:8]}]"
         _log(
-            f"[GUI-{task_id}] Env session created: instance_id={instance_id}, "
+            f"{log_tag} Env session created: instance_id={instance_id}, "
             f"initial_images={len(initial_response.image or [])}"
         )
 
@@ -243,7 +260,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     prompt_ids = prompt_ids[-self.prompt_length :]
                     truncated = True
                 _log(
-                    f"[GUI-{task_id}][turn={turn}] prompt_ids={len(prompt_ids)} "
+                    f"{log_tag}[turn={turn}] prompt_ids={len(prompt_ids)} "
                     f"(orig={original_prompt_len}, truncated={truncated}), "
                     f"images={len(image_data) if image_data else 0}",
                     debug=True,
@@ -258,7 +275,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         image_data=image_data if image_data else None,
                     )
                 _log(
-                    f"[GUI-{task_id}][turn={turn}] LLM generated response_ids={len(output.token_ids)}, "
+                    f"{log_tag}[turn={turn}] LLM generated response_ids={len(output.token_ids)}, "
                     f"num_preempted={output.num_preempted}",
                     debug=True,
                 )
@@ -310,7 +327,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         action = tool_args.get("action", "")
                     except Exception as parse_exc:
                         _log(
-                            f"[GUI-{task_id}][turn={turn}] Failed to parse tool arguments: "
+                            f"{log_tag}[turn={turn}] Failed to parse tool arguments: "
                             f"{tool_calls[0]} (error: {parse_exc!r})"
                         )
                         tool_args = None
@@ -318,7 +335,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
                 if tool_args is not None:
                     _log(
-                        f"[GUI-{task_id}][turn={turn}] Tool call: action={action}, "
+                        f"{log_tag}[turn={turn}] Tool call: action={action}, "
                         f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
                     )
 
@@ -353,15 +370,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     except Exception as exec_exc:
                         consecutive_tool_failures += 1
                         _log(
-                            f"[GUIAgentLoop] Tool execution failed for {task_id} "
+                            f"[GUIAgentLoop] Tool execution failed for {task_id} {log_tag} "
                             f"(streak={consecutive_tool_failures}/"
                             f"{max_consecutive_tool_failures}): "
                             f"{exec_exc!r}\n{traceback.format_exc()}"
                         )
                         _log(
                             f"[POTENTIAL ERROR][GUIAgentLoop][SOFT_ERROR][tool_execute] "
-                            f"task_id={task_id} turn={turn} action={action} "
-                            f"err={exec_exc!r} "
+                            f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                            f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                            f"turn={turn} action={action} err={exec_exc!r} "
                             f"streak={consecutive_tool_failures}/"
                             f"{max_consecutive_tool_failures}"
                         )
@@ -374,8 +392,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             # logic keep whatever ``last_turn_ctx`` we have.
                             _log(
                                 f"[POTENTIAL ERROR][GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
-                                f"task_id={task_id} turn={turn} action={action} "
-                                f"err={exec_exc!r}"
+                                f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                                f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                                f"turn={turn} action={action} err={exec_exc!r}"
                             )
                             fatal_error = True
                             break
@@ -388,7 +407,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         # intermediate trajectories.
                         error_images = await self.desktop_tool.screenshot(instance_id)
                         _log(
-                            f"[GUI-{task_id}][turn={turn}] Error recovery screenshot: "
+                            f"{log_tag}[turn={turn}] Error recovery screenshot: "
                             f"got_image={bool(error_images)}"
                         )
 
@@ -406,7 +425,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         )
                     else:
                         _log(
-                            f"[GUI-{task_id}][turn={turn}] Tool executed OK: "
+                            f"{log_tag}[turn={turn}] Tool executed OK: "
                             f"got_image={bool(tool_response and tool_response.image)}",
                             debug=True,
                         )
@@ -424,7 +443,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     else:
                         stop_reason = "max_turns"
                     _log(
-                        f"[GUI-{task_id}][turn={turn}] Rollout ends: reason={stop_reason}"
+                        f"{log_tag}[turn={turn}] Rollout ends: reason={stop_reason}"
                     )
                     break
 
@@ -463,7 +482,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     )
 
             _log(
-                f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} turn={turn} "
+                f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} request_id={request_id} "
+                f"instance_id={instance_id} sample_index={sample_index} "
+                f"rollout_n={rollout_n} step={global_step} turn={turn} "
                 f"stop_reason={stop_reason or ('fatal_error' if fatal_error else 'unknown')} "
                 f"fatal_error={fatal_error} "
                 f"last_turn_ctx_is_none={last_turn_ctx is None}"
@@ -475,26 +496,32 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # for env instability. Discard the rollout instead.
             if fatal_error:
                 _log(
-                    f"[GUIAgentLoop] Fatal error for {task_id} at turn={turn}, "
+                    f"[GUIAgentLoop] Fatal error for {task_id} {log_tag} at turn={turn}, "
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
                 _log(
-                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][fatal_error] task_id={task_id} turn={turn}"
+                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][fatal_error] "
+                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                    f"turn={turn}"
                 )
                 return None
 
             if last_turn_ctx is None:
                 _log(
-                    f"[GUIAgentLoop] No turns produced for {task_id}, discarding rollout"
+                    f"[GUIAgentLoop] No turns produced for {task_id} {log_tag}, discarding rollout"
                 )
                 _log(
-                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][no_turns_produced] task_id={task_id} turn={turn}"
+                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][no_turns_produced] "
+                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                    f"turn={turn}"
                 )
                 return None
 
             if turn >= self.max_turns and stop_reason == "max_turns":
                 _log(
-                    f"[GUI-{task_id}] Reached max_turns={self.max_turns} without model terminate"
+                    f"{log_tag} Reached max_turns={self.max_turns} without model terminate"
                 )
 
             # Compute terminal reward. If the reward service itself fails,
@@ -504,16 +531,18 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 shared_reward = await self.desktop_tool.calc_reward(instance_id)
             except Exception as reward_exc:
                 _log(
-                    f"[GUIAgentLoop] calc_reward failed for {task_id}: {reward_exc!r}; "
+                    f"[GUIAgentLoop] calc_reward failed for {task_id} {log_tag}: {reward_exc!r}; "
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
                 _log(
                     f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
-                    f"task_id={task_id} turn={turn} err={reward_exc!r}"
+                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                    f"turn={turn} err={reward_exc!r}"
                 )
                 return None
             _log(
-                f"[GUI-{task_id}] Final reward = {shared_reward:.4f} "
+                f"{log_tag} Final reward = {shared_reward:.4f} "
                 f"(turns={turn}, stop_reason={stop_reason})"
             )
 
@@ -539,14 +568,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 final_output.extra_fields.get("intermediate_trajectories", [])
             )
             _log(
-                f"[GUI-{task_id}] Done: {num_intermediate + 1} trajectories "
+                f"{log_tag} Done: {num_intermediate + 1} trajectories "
                 f"(1 final + {num_intermediate} intermediate), reward={shared_reward:.4f}"
             )
 
             # --- Data flow log: agent loop output ---
             log_message(
                 "gui_agent_loop.build_final_output",
-                f"task_id={task_id} turns={turn} stop_reason={stop_reason} "
+                f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                f"turns={turn} stop_reason={stop_reason} "
                 f"reward={shared_reward:.4f} "
                 f"num_intermediate={num_intermediate} "
                 f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
@@ -561,8 +592,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 await self.desktop_tool.release(instance_id)
             except Exception:
                 _log(
-                    f"[GUIAgentLoop] Failed to release env for {task_id}\n{traceback.format_exc()}"
+                    f"[GUIAgentLoop] Failed to release env for {task_id} {log_tag}\n{traceback.format_exc()}"
                 )
             _log(
-                f"[GUIAgentLoop][RUN_END] task_id={task_id} request_id={request_id}"
+                f"[GUIAgentLoop][RUN_END] task_id={task_id} request_id={request_id} "
+                f"instance_id={instance_id} sample_index={sample_index} "
+                f"rollout_n={rollout_n} step={global_step}"
             )

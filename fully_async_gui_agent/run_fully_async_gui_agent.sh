@@ -26,6 +26,28 @@
 #        - extra_info.question (user query for the task)
 
 set -xeuo pipefail
+export HYDRA_FULL_ERROR=1
+export HF_HOME="/efs/data/hf"
+
+# ================= process resource limits =================
+# Raise nofile so busy actors (many aiohttp requests + gRPC connections)
+# cannot hit EMFILE, which has been observed to trigger SIGABRT inside
+# libuv's ``uv__epoll_ctl_flush`` on the Ray core-worker IO thread.
+# Enable unlimited core dumps so the next crash leaves a file we can
+# inspect with gdb.
+ulimit -n 1048576 || true
+ulimit -c unlimited || true
+
+# Make sure the env vars we set below are propagated to all Ray workers.
+# NOTE: runtime_env.yaml already includes gRPC/Ray tweaks that address
+# the same SIGABRT; this script-side ulimit covers the case where a
+# worker bypasses runtime_env (e.g. driver-local processes).
+# export VERL_LOGGING_LEVEL=DEBUG
+# WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
+# for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
+export WANDB_API_KEY=${WANDB_API_KEY:-}
+# Reduce memory fragmentation (helps with the 27GB reserved-but-unallocated).
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 # ================= paths =================
 # RECIPE_DIR is the directory containing this script (portable, no matter where
 # the script is invoked from). VERL_ROOT must point at the verl source tree so
@@ -45,15 +67,6 @@ n_gpus_rollout=${n_gpus_rollout:-4}
 n_gpus_training=${n_gpus_training:-4}
 rollout_nnodes=${rollout_nnodes:-2}
 trainer_nnodes=${trainer_nnodes:-2}
-
-export HYDRA_FULL_ERROR=1
-export HF_HOME="/efs/data/hf"
-# export VERL_LOGGING_LEVEL=DEBUG
-# WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
-# for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
-export WANDB_API_KEY=${WANDB_API_KEY:-}
-# Reduce memory fragmentation (helps with the 27GB reserved-but-unallocated).
-export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 
 # ================= data / model =================
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}

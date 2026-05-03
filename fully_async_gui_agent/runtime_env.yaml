@@ -20,3 +20,13 @@ env_vars:
   WANDB_API_KEY: "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"
   MLFLOW_TRACKING_URI: "http://172.20.70.149:29004"  # MLflow server 地址
   HF_HOME: "/efs/data/hf"
+
+  # --- Ray/gRPC SIGABRT mitigation ---------------------------------
+  # The core-worker's gRPC IO thread has been observed to abort inside
+  # ``uv__epoll_ctl_flush`` after ~1h of sustained task-event traffic.
+  # Switching gRPC off the epollex engine and lowering task-event
+  # reporting frequency both reduce the pressure on that code path.
+  GRPC_POLL_STRATEGY: "poll"
+  GRPC_VERBOSITY: "ERROR"
+  RAY_task_events_report_interval_ms: "10000"
+  RAY_task_events_max_num_status_events_buffer_on_worker: "1024"

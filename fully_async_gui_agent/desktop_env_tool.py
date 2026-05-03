@@ -43,6 +43,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -396,6 +397,46 @@ class DesktopEnvTool(BaseTool):
         # instance_id → {"session_id": str, "task_id": str}
         self._instances: dict[str, dict[str, str]] = {}
 
+        # Reused HTTP session. Creating/destroying ``aiohttp.ClientSession``
+        # per request causes heavy fd churn (each session owns a TCP
+        # connector and registers its sockets with the event loop's
+        # epoll/kqueue selector). Under this loop's high concurrency
+        # (n_resp_per_prompt=16 × many turns) that fd churn has been
+        # observed to crash the Ray core-worker with SIGABRT inside
+        # libuv's ``uv__epoll_ctl_flush``. A single long-lived session
+        # with a capped connector keeps socket count bounded and cuts
+        # per-request latency.
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+        # Per-host connector cap; leave plenty of headroom so the tool
+        # never becomes the throughput bottleneck.
+        self._connector_limit = int(config.get("http_connector_limit", 256))
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the shared ClientSession, creating it on first use."""
+        if self._session is None or self._session.closed:
+            async with self._session_lock:
+                if self._session is None or self._session.closed:
+                    connector = aiohttp.TCPConnector(
+                        limit=self._connector_limit,
+                        # Force fresh DNS on reconnect; keep sockets
+                        # alive between requests.
+                        ttl_dns_cache=60,
+                    )
+                    self._session = aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=self.timeout,
+                    )
+        return self._session
+
+    async def aclose(self) -> None:
+        """Close the shared HTTP session. Safe to call multiple times."""
+        if self._session is not None and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception:
+                _log_error(f"[DesktopEnvTool] aclose failed: {traceback.format_exc()}")
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -423,44 +464,46 @@ class DesktopEnvTool(BaseTool):
 
         for attempt in range(1, attempts + 1):
             try:
-                async with aiohttp.ClientSession(timeout=effective_timeout) as session:
-                    async with session.post(url, json=request_body) as resp:
-                        status = resp.status
-                        content_type = resp.content_type
-                        # Always read the full body so we can log it (and show
-                        # it in error messages).
-                        text_body = await resp.text()
-                        if status >= 400:
-                            raise aiohttp.ClientResponseError(
-                                request_info=resp.request_info,
-                                history=resp.history,
-                                status=status,
-                                message=text_body or resp.reason or "",
-                                headers=resp.headers,
-                            )
-                        if content_type == "application/json" and text_body:
-                            import json as _json
-                            try:
-                                data = _json.loads(text_body)
-                            except _json.JSONDecodeError as je:
-                                _log_error(
-                                    f"[DesktopEnvTool] <- POST {url} status={status} "
-                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
-                                )
-                                raise RuntimeError(
-                                    f"POST {path} returned non-JSON body: {text_body!r}"
-                                ) from je
-                            _log(
+                session = await self._get_session()
+                async with session.post(
+                    url, json=request_body, timeout=effective_timeout
+                ) as resp:
+                    status = resp.status
+                    content_type = resp.content_type
+                    # Always read the full body so we can log it (and show
+                    # it in error messages).
+                    text_body = await resp.text()
+                    if status >= 400:
+                        raise aiohttp.ClientResponseError(
+                            request_info=resp.request_info,
+                            history=resp.history,
+                            status=status,
+                            message=text_body or resp.reason or "",
+                            headers=resp.headers,
+                        )
+                    if content_type == "application/json" and text_body:
+                        import json as _json
+                        try:
+                            data = _json.loads(text_body)
+                        except _json.JSONDecodeError as je:
+                            _log_error(
                                 f"[DesktopEnvTool] <- POST {url} status={status} "
-                                f"response={_short_repr(data)}"
+                                f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
                             )
-                            return data
-                        # Empty body is allowed for endpoints like /close.
+                            raise RuntimeError(
+                                f"POST {path} returned non-JSON body: {text_body!r}"
+                            ) from je
                         _log(
                             f"[DesktopEnvTool] <- POST {url} status={status} "
-                            f"empty body (content_type={content_type})"
+                            f"response={_short_repr(data)}"
                         )
-                        return {}
+                        return data
+                    # Empty body is allowed for endpoints like /close.
+                    _log(
+                        f"[DesktopEnvTool] <- POST {url} status={status} "
+                        f"empty body (content_type={content_type})"
+                    )
+                    return {}
             except Exception as exc:
                 last_exc = exc
                 # Extract as much detail as possible from the exception.
