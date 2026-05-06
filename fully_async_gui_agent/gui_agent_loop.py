@@ -56,6 +56,8 @@ from verl.workers.rollout.replica import TokenOutput
 from recipe.fully_async_gui_agent.context_manager import (
     BaseContextStrategy,
     KeepLastKImagesStrategy,
+    Qwen3VLHistoryStrategy,
+    TurnRecord,
 )
 from recipe.fully_async_gui_agent.data_flow_logger import log_dataproto, log_message
 
@@ -115,6 +117,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         self.max_turns = self.rollout_config.multi_turn.max_assistant_turns or 20
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
         self.keep_last_k = 3  # default; can be overridden per-task via create_kwargs
+        self.history_n = 4  # default; can be overridden per-task via create_kwargs
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -146,6 +149,24 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         return AgentLoopMetrics(
             **{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields}
         )
+
+    @staticmethod
+    def _extract_low_level_instruction(response: str, fallback_action: str | None = None) -> str:
+        """Extract the Action: line from a model response (qwen3vl_agent style).
+
+        Scans lines for one starting with ``Action:`` and returns the text
+        after the prefix. Falls back to ``"Performing {action} action"`` when
+        no Action line is found.
+        """
+        for line in response.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("action:"):
+                result = stripped.split(":", 1)[1].strip()
+                if result:
+                    return result
+        if fallback_action:
+            return f"Performing {fallback_action} action"
+        return ""
 
     # ------------------------------------------------------------------
     # Main rollout
@@ -199,12 +220,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         # Context management strategy (per-task, overridable via create_kwargs).
         desktop_kwargs = tools_kwargs.get("computer_use", {})
         create_kwargs = dict(desktop_kwargs.get("create_kwargs", {}))
-        keep_last_k = create_kwargs.get("keep_last_k_images", self.keep_last_k)
-        context_strategy: BaseContextStrategy = KeepLastKImagesStrategy(k=keep_last_k)
+        history_n = create_kwargs.get("history_n", self.history_n)
+        context_strategy = Qwen3VLHistoryStrategy(history_n=history_n)
 
         create_kwargs.setdefault("task_id", task_id)
         _log(
-            f"{log_tag} Context strategy=KeepLastKImagesStrategy(k={keep_last_k}), "
+            f"{log_tag} Context strategy=Qwen3VLHistoryStrategy(history_n={history_n}), "
             f"create_kwargs={create_kwargs}",
             debug=True,
         )
@@ -235,33 +256,31 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         )
 
         try:
-            # Seed messages with the initial screenshot.
+            # Extract the system message and initial screenshot.
+            system_message = messages[0]  # {"role": "system", ...} from dataset
+            current_screenshot = None
             if initial_response.image:
-                img_content: list[dict[str, Any]] = []
                 for img in initial_response.image:
                     if img is not None:
-                        img_content.append({"type": "image", "image": img})
-                if img_content:
-                    img_content.append(
-                        {"type": "text", "text": f"{task_query}\nPlease continue"}
-                    )
-                    messages.append({"role": "user", "content": img_content})
+                        current_screenshot = img
+                        break
+
+            if current_screenshot is None:
+                _log_error(
+                    f"[GUIAgentLoop] No initial screenshot for {task_id} {log_tag}, "
+                    f"discarding rollout"
+                )
+                return None
 
             turn = 0
             fatal_error = False
-            stop_reason = ""  # why the loop exited (for logging / debugging)
+            stop_reason = ""
 
-            # Last turn's snapshot; always retained as the *final*
-            # AgentLoopOutput once the loop exits.
             last_turn_ctx: dict[str, Any] | None = None
 
-            # Consecutive-failure counter for tool execution. A single tool
-            # failure is surfaced to the model as a user message (so it can
-            # retry with a different action); only when we see repeated
-            # failures in a row do we treat the env as truly broken and
-            # abort. This keeps single-action mistakes cheap: the rollout
-            # still produces a usable final trajectory with whatever reward
-            # the env eventually grades.
+            # Persistent turn records for history strategy.
+            turn_records: list[TurnRecord] = []
+
             consecutive_tool_failures = 0
             max_consecutive_tool_failures = int(
                 getattr(self, "max_consecutive_tool_failures", 3)
@@ -270,8 +289,13 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             while True:
                 turn += 1
 
-                # 1. Prune old images.
-                messages = context_strategy.prepare_context(messages)
+                # 1. Build messages from turn_records + current_screenshot.
+                messages = context_strategy.build_messages(
+                    system_message=system_message,
+                    turn_records=turn_records,
+                    current_screenshot=current_screenshot,
+                    instruction=task_query,
+                )
 
                 # 2. Tokenize prompt for this turn.
                 multi_modal_data = await self.process_vision_info(messages)
@@ -293,7 +317,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     debug=True,
                 )
 
-                # 3. LLM generation (partial-rollout-resume enabled upstream).
+                # 3. LLM generation.
                 with simple_timer("generate_sequences", metrics):
                     output: TokenOutput = await self.server_manager.generate(
                         request_id=request_id,
@@ -322,7 +346,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     output.log_probs[: len(response_ids)] if output.log_probs else None
                 )
 
-                # Per-turn extra_fields (including async-training metadata).
+                # Per-turn extra_fields.
                 extra_fields: dict[str, Any] = {}
                 if output.extra_fields:
                     extra_fields.update(output.extra_fields)
@@ -336,7 +360,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     "response_logprobs": response_logprobs,
                     "multi_modal_data": multi_modal_data,
                     "routed_experts": output.routed_experts,
-                    "num_turns": turn * 2,  # user+assistant per turn
+                    "num_turns": turn * 2,
                     "extra_fields": extra_fields,
                 }
 
@@ -366,14 +390,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
                     )
 
+                # Decode assistant text and extract low_level_instruction.
+                assistant_text = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True),
+                )
+                low_level_instruction = self._extract_low_level_instruction(
+                    assistant_text, fallback_action=action or None
+                )
+
                 # 5. Decide whether this turn ends the rollout.
-                #    The rollout ends when any of:
-                #      (a) model emitted no parseable tool call;
-                #      (b) model issued action=terminate;
-                #      (c) we reached max_turns (this turn is the last one).
-                #    In all three cases the current turn becomes the *final*
-                #    trajectory (kept in ``last_turn_ctx``), not an
-                #    intermediate one.
                 is_final_turn = (
                     tool_args is None
                     or action == "terminate"
@@ -381,18 +407,13 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 )
 
                 # 6. Execute the tool when we have a real action to run.
-                #    ``terminate`` is a purely virtual action (model announces
-                #    completion) so we skip the env step for it. For every
-                #    other action we execute, even on the final turn, so the
-                #    desktop reflects the full action sequence when reward
-                #    is computed via ``/evaluate``.
+                error_text: str | None = None
                 if tool_args is not None and action != "terminate":
                     try:
                         with simple_timer("tool_calls", metrics):
                             tool_response, _, _ = await self.desktop_tool.execute(
                                 instance_id, tool_args
                             )
-                        # Successful tool execution resets the failure streak.
                         consecutive_tool_failures = 0
                     except Exception as exec_exc:
                         consecutive_tool_failures += 1
@@ -412,11 +433,6 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         )
 
                         if consecutive_tool_failures >= max_consecutive_tool_failures:
-                            # Repeated failures almost always mean the env
-                            # session itself is dead (crashed VM, closed
-                            # socket, auth lost). Further turns cannot make
-                            # progress; exit the loop and let the post-loop
-                            # logic keep whatever ``last_turn_ctx`` we have.
                             _log_error(
                                 f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
                                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
@@ -426,21 +442,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             fatal_error = True
                             break
 
-                        # Take a fresh screenshot so the next turn always has
-                        # visual context, even though the action itself failed.
-                        # Without this, the user message would be pure text,
-                        # and after context pruning all images could be lost,
-                        # causing multi_modal_data to be empty for subsequent
-                        # intermediate trajectories.
                         error_images = await self.desktop_tool.screenshot(instance_id)
                         _log(
                             f"{log_tag}[turn={turn}] Error recovery screenshot: "
                             f"got_image={bool(error_images)}"
                         )
 
-                        # Build a synthetic tool_response so the downstream
-                        # "append intermediate + extend messages" code path
-                        # is reused verbatim.
                         tool_response = ToolResponse(
                             image=error_images,
                             text=(
@@ -450,6 +457,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                                 f"Please try a different action."
                             )
                         )
+                        error_text = tool_response.text
                     else:
                         _log(
                             f"{log_tag}[turn={turn}] Tool executed OK: "
@@ -459,9 +467,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 else:
                     tool_response = None
 
-                # 7. If this turn is the final one, exit loop now without
-                #    appending an intermediate or extending ``messages``
-                #    (the next user turn will never be consumed).
+                # 7. If this turn is the final one, record it and exit.
                 if is_final_turn:
                     if tool_args is None:
                         stop_reason = "no_tool_call"
@@ -474,8 +480,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     )
                     break
 
-                # 8. Not final: register this turn as an intermediate
-                #    trajectory and update messages for the next turn.
+                # 8. Not final: register this turn as intermediate and
+                #    record it for history.
                 self.append_intermediate_trajectory(
                     prompt_ids=last_turn_ctx["prompt_ids"],
                     response_ids=last_turn_ctx["response_ids"],
@@ -488,25 +494,22 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 )
                 last_turn_ctx = None  # consumed as intermediate
 
-                assistant_text = await self.loop.run_in_executor(
-                    None,
-                    lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True),
-                )
-                messages.append({"role": "assistant", "content": assistant_text})
+                # Record this turn for the history strategy.
+                turn_records.append(TurnRecord(
+                    screenshot_image=current_screenshot,
+                    assistant_raw_text=assistant_text,
+                    low_level_instruction=low_level_instruction,
+                    error_text=error_text,
+                ))
 
+                # Update current_screenshot for the next turn.
+                next_screenshot = None
                 if tool_response and tool_response.image:
-                    img_content = []
                     for img in tool_response.image:
                         if img is not None:
-                            img_content.append({"type": "image", "image": img})
-                    img_content.append(
-                        {"type": "text", "text": f"{task_query}\nPlease continue"}
-                    )
-                    messages.append({"role": "user", "content": img_content})
-                else:
-                    messages.append(
-                        {"role": "user", "content": f"{task_query}\nPlease continue"}
-                    )
+                            next_screenshot = img
+                            break
+                current_screenshot = next_screenshot if next_screenshot else current_screenshot
 
             _log(
                 f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} request_id={request_id} "

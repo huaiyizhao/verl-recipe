@@ -249,3 +249,186 @@ class SlidingWindowStrategy(BaseContextStrategy):
         for rnd in rounds:
             result_messages.extend(rnd)
         return result_messages
+
+
+# ---------------------------------------------------------------------------
+# Qwen3VL-style history strategy (aligned with OSWorld/mm_agents/qwen3vl_agent)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from PIL import Image
+
+
+@dataclass
+class TurnRecord:
+    """Persistent record for one agent turn.
+
+    Stores the raw facts of each turn independently from the messages
+    sent to the model, enabling the strategy to rebuild messages from
+    scratch every turn (with sliding-window truncation and Previous
+    actions summarization).
+    """
+
+    # The screenshot observed *before* the model generated this turn's response.
+    screenshot_image: Optional[Image.Image] = None
+
+    # The model's raw decoded response text for this turn.
+    assistant_raw_text: str = ""
+
+    # A short imperative extracted from the response (the ``Action:`` line)
+    # or a fallback like ``"Performing left_click action"``.
+    low_level_instruction: str = ""
+
+    # If the tool execution failed this turn, the error description;
+    # otherwise ``None``.  When non-None the strategy inserts a pseudo
+    # user text message after this turn's assistant message.
+    error_text: Optional[str] = None
+
+
+class Qwen3VLHistoryStrategy(BaseContextStrategy):
+    """History strategy aligned with qwen3vl_agent's message assembly.
+
+    Core semantics:
+    * Only the most recent ``history_n`` turns are kept as (user image,
+      assistant text) pairs in the messages.
+    * Turns older than the window are summarized into a ``Previous actions:``
+      text block inside the first retained user message.
+    * The first retained user message always carries the instruction prompt
+      (screenshot + ``Instruction: ... / Previous actions: ...``).
+    * Subsequent user messages within the window carry **only** a screenshot.
+    * When a turn has ``error_text`` set and falls within the retained window,
+      a pseudo user text message is inserted after its assistant message.
+
+    This class does NOT modify the system message (that comes from the
+    dataset prompt[0] and is left untouched).
+
+    Parameters
+    ----------
+    history_n : int
+        Number of most-recent turns to keep as explicit (image, assistant)
+        pairs.  Default is 4 (matching qwen3vl_agent).
+    instruction_prompt_template : str
+        A format-string with ``{instruction}`` and ``{previous_actions_str}``
+        placeholders.  Default matches qwen3vl_agent.
+    """
+
+    _DEFAULT_INSTRUCTION_TEMPLATE = (
+        "Please generate the next move according to the UI screenshot, "
+        "instruction and previous actions.\n\n"
+        "Instruction: {instruction}\n\n"
+        "Previous actions:\n{previous_actions_str}"
+    )
+
+    def __init__(
+        self,
+        history_n: int = 4,
+        instruction_prompt_template: str | None = None,
+    ):
+        if history_n <= 0:
+            raise ValueError("history_n must be positive")
+        self.history_n = history_n
+        self.instruction_prompt_template = (
+            instruction_prompt_template or self._DEFAULT_INSTRUCTION_TEMPLATE
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def prepare_context(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Not used directly; prefer :meth:`build_messages`."""
+        return messages
+
+    def build_messages(
+        self,
+        system_message: dict[str, Any],
+        turn_records: list[TurnRecord],
+        current_screenshot: Image.Image,
+        instruction: str,
+    ) -> list[dict[str, Any]]:
+        """Build the full messages list for the current generation turn.
+
+        Parameters
+        ----------
+        system_message : dict
+            The ``{"role":"system", ...}`` message from the dataset prompt.
+        turn_records : list[TurnRecord]
+            All completed turns so far (newest last).  A "turn" means the
+            model has already responded and the tool has been executed.
+        current_screenshot : PIL.Image.Image
+            The screenshot for the *current* (not-yet-responded) turn.
+        instruction : str
+            The user's task instruction (``extra_info.question``).
+
+        Returns
+        -------
+        list[dict]
+            Ready-to-tokenize messages list (system + user/assistant pairs).
+        """
+        current_step = len(turn_records)
+        history_start_idx = max(0, current_step - self.history_n)
+
+        # --- Build Previous actions string (only summarizes early turns) ---
+        previous_actions_parts: list[str] = []
+        for i in range(history_start_idx):
+            desc = turn_records[i].low_level_instruction or "unknown action"
+            previous_actions_parts.append(f"Step {i + 1}: {desc}")
+        previous_actions_str = "\n".join(previous_actions_parts) if previous_actions_parts else "None"
+
+        instruction_prompt = self.instruction_prompt_template.format(
+            instruction=instruction,
+            previous_actions_str=previous_actions_str,
+        )
+
+        # --- Assemble messages ---
+        messages: list[dict[str, Any]] = [system_message]
+
+        history_len = min(self.history_n, current_step)
+        if history_len > 0:
+            # Windowed turns: turn_records[history_start_idx : current_step]
+            windowed = turn_records[history_start_idx:current_step]
+
+            for idx, record in enumerate(windowed):
+                # User message (screenshot ± instruction_prompt)
+                user_content: list[dict[str, Any]] = []
+                if record.screenshot_image is not None:
+                    user_content.append({"type": "image", "image": record.screenshot_image})
+                if idx == 0:
+                    # First retained user carries instruction prompt
+                    user_content.append({"type": "text", "text": instruction_prompt})
+                messages.append({"role": "user", "content": user_content})
+
+                # Assistant message (pure text)
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": record.assistant_raw_text}],
+                })
+
+                # Error feedback (pseudo user text, C-scheme)
+                if record.error_text:
+                    messages.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": record.error_text}],
+                    })
+
+            # Current turn: user message with only the current screenshot
+            messages.append({
+                "role": "user",
+                "content": [{"type": "image", "image": current_screenshot}],
+            })
+        else:
+            # First turn ever: current screenshot + instruction prompt
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": current_screenshot},
+                    {"type": "text", "text": instruction_prompt},
+                ],
+            })
+
+        return messages

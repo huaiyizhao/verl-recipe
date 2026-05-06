@@ -65,17 +65,18 @@ from typing import Any
 #     model's ``terminate`` call is the signal that it is done making changes.
 #   * If no ``terminate`` is issued within ``max_turns``, the rollout is
 #     force-stopped and scored on the then-current desktop state.
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a GUI agent controlling a Linux desktop. "
-    "At each step you will be shown a screenshot of the current screen and "
-    "must respond by calling the `computer_use` tool exactly once to interact "
-    "with the desktop (e.g. click, type, scroll, keyboard shortcut). "
-    "Think step by step about what to do next based on the screenshot and the "
-    "user's task, then emit a single tool call. "
-    "When you believe the task is complete (or impossible), call `computer_use` "
-    "with `action=\"terminate\"` and set `status=\"success\"` or `status=\"failure\"` "
-    "to end the episode. Do not keep acting after you decide the task is done."
-)
+DEFAULT_SYSTEM_PROMPT = """\
+# Response format
+
+Response format for every step:
+1) Action: a short imperative describing what to do in the UI.
+2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+
+Rules:
+- Output exactly in the order: Action, <tool_call>.
+- Be brief: one sentence for Action.
+- Do not output anything else outside those parts.
+- If finishing, use action=terminate in the tool call."""
 
 
 # ---------------------------------------------------------------------------

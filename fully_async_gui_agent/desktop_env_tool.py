@@ -394,48 +394,19 @@ class DesktopEnvTool(BaseTool):
         self.max_retries = int(config.get("max_retries", 3))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
-        # instance_id → {"session_id": str, "task_id": str}
-        self._instances: dict[str, dict[str, str]] = {}
-
-        # Reused HTTP session. Creating/destroying ``aiohttp.ClientSession``
-        # per request causes heavy fd churn (each session owns a TCP
-        # connector and registers its sockets with the event loop's
-        # epoll/kqueue selector). Under this loop's high concurrency
-        # (n_resp_per_prompt=16 × many turns) that fd churn has been
-        # observed to crash the Ray core-worker with SIGABRT inside
-        # libuv's ``uv__epoll_ctl_flush``. A single long-lived session
-        # with a capped connector keeps socket count bounded and cuts
-        # per-request latency.
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._session_lock = asyncio.Lock()
-        # Per-host connector cap; leave plenty of headroom so the tool
-        # never becomes the throughput bottleneck.
-        self._connector_limit = int(config.get("http_connector_limit", 256))
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Return the shared ClientSession, creating it on first use."""
-        if self._session is None or self._session.closed:
-            async with self._session_lock:
-                if self._session is None or self._session.closed:
-                    connector = aiohttp.TCPConnector(
-                        limit=self._connector_limit,
-                        # Force fresh DNS on reconnect; keep sockets
-                        # alive between requests.
-                        ttl_dns_cache=60,
-                    )
-                    self._session = aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=self.timeout,
-                    )
-        return self._session
-
-    async def aclose(self) -> None:
-        """Close the shared HTTP session. Safe to call multiple times."""
-        if self._session is not None and not self._session.closed:
-            try:
-                await self._session.close()
-            except Exception:
-                _log_error(f"[DesktopEnvTool] aclose failed: {traceback.format_exc()}")
+        # instance_id → {"session_id": str, "task_id": str,
+        #                  "client_session": aiohttp.ClientSession}
+        # One ClientSession per rollout: bound to the desktop env session's
+        # lifetime (created in ``create()``, closed in ``release()``).
+        # Rationale: a single per-tool shared session was prone to silent
+        # re-creation (when the connector got closed mid-run) which left
+        # orphan sessions for the GC to reap, surfacing as repeated
+        # ``Unclosed client session`` warnings; a per-_post session caused
+        # high-frequency fd churn that crashed the Ray core-worker inside
+        # libuv's ``uv__epoll_ctl_flush``. Per-rollout strikes the right
+        # balance: ~32 live sessions in steady state, created/destroyed
+        # only on rollout boundaries (a few times per minute).
+        self._instances: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -443,6 +414,7 @@ class DesktopEnvTool(BaseTool):
 
     async def _post(
         self,
+        session: aiohttp.ClientSession,
         path: str,
         payload: dict | None = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
@@ -464,7 +436,6 @@ class DesktopEnvTool(BaseTool):
 
         for attempt in range(1, attempts + 1):
             try:
-                session = await self._get_session()
                 async with session.post(
                     url, json=request_body, timeout=effective_timeout
                 ) as resp:
@@ -570,31 +541,56 @@ class DesktopEnvTool(BaseTool):
             f"[DesktopEnvTool] create session task_id={task_id} "
             f"instance_id={instance_id}"
         )
-        resp = await self._post(
-            "/session/create",
-            {"task_id": task_id, "require_a11y_tree": False},
-            timeout=aiohttp.ClientTimeout(total=120),
-        )
-        session_id = resp.get("session_id")
-        if not session_id:
-            raise RuntimeError(
-                f"/session/create did not return session_id; response={resp!r}"
-            )
 
-        # Even one missed assignment here would leak the server-side slot
-        # (server already moved it to IN_USE). If anything between this
-        # ``await`` and the dict assignment cancels the coroutine, the
-        # session_id is unreachable from release(). Emit a best-effort
-        # close on cancel/exception to keep server-side state consistent.
+        # Per-rollout ClientSession: bound to this desktop env session's
+        # lifetime. Created here, closed in ``release()``. We build it
+        # *before* the first HTTP call so that even a failed
+        # ``/session/create`` goes through a session we own and can close.
+        client_session = aiohttp.ClientSession(timeout=self.timeout)
         try:
-            self._instances[instance_id] = {"session_id": session_id, "task_id": task_id}
+            resp = await self._post(
+                client_session,
+                "/session/create",
+                {"task_id": task_id, "require_a11y_tree": False},
+                timeout=aiohttp.ClientTimeout(total=120),
+            )
+            session_id = resp.get("session_id")
+            if not session_id:
+                raise RuntimeError(
+                    f"/session/create did not return session_id; response={resp!r}"
+                )
+
+            # Once server returned a session_id, the slot is IN_USE on the
+            # server side. Anything failing between here and the dict
+            # assignment (incl. CancelledError) must close both the
+            # client-side ClientSession AND the server-side session, else
+            # we leak. Catch BaseException to cover CancelledError too.
+            self._instances[instance_id] = {
+                "session_id": session_id,
+                "task_id": task_id,
+                "client_session": client_session,
+            }
         except BaseException:
+            # Best-effort cleanup. If we already have a server session_id,
+            # try to close it on the server through our (still-open)
+            # ClientSession before closing the client session.
+            server_session_id = locals().get("session_id")
+            if server_session_id:
+                try:
+                    await self._post(
+                        client_session, f"/session/{server_session_id}/close"
+                    )
+                except Exception:
+                    _log_error(
+                        f"[DesktopEnvTool] create cleanup: failed to close orphan "
+                        f"server session_id={server_session_id}"
+                    )
             try:
-                await self._post(f"/session/{session_id}/close")
+                await client_session.close()
             except Exception:
                 _log_error(
-                    f"[DesktopEnvTool] create cleanup: failed to close orphan "
-                    f"session_id={session_id}"
+                    f"[DesktopEnvTool] create cleanup: failed to close "
+                    f"client_session for instance_id={instance_id}"
                 )
             raise
 
@@ -626,8 +622,10 @@ class DesktopEnvTool(BaseTool):
         if info is None:
             return []
         session_id = info["session_id"]
+        client_session = info["client_session"]
         try:
             resp = await self._post(
+                client_session,
                 f"/session/{session_id}/step",
                 {"action": "import time; time.sleep(0)", "pause": 0},
             )
@@ -654,6 +652,7 @@ class DesktopEnvTool(BaseTool):
         if info is None:
             raise ValueError(f"Unknown instance_id: {instance_id}")
         session_id = info["session_id"]
+        client_session = info["client_session"]
 
         action = parameters.get("action", "")
 
@@ -713,6 +712,7 @@ class DesktopEnvTool(BaseTool):
             debug=True,
         )
         resp = await self._post(
+            client_session,
             f"/session/{session_id}/step",
             {"action": code, "pause": self.pause},
         )
@@ -748,6 +748,7 @@ class DesktopEnvTool(BaseTool):
             )
             return 0.0
         session_id = info["session_id"]
+        client_session = info["client_session"]
 
         _log(
             f"[DesktopEnvTool] evaluate session_id={session_id} "
@@ -755,6 +756,7 @@ class DesktopEnvTool(BaseTool):
         )
         try:
             resp = await self._post(
+                client_session,
                 f"/session/{session_id}/evaluate",
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
@@ -786,18 +788,36 @@ class DesktopEnvTool(BaseTool):
             )
             return
         session_id = info["session_id"]
+        client_session = info["client_session"]
         _log_error(
             f"[DesktopEnvTool] release session_id={session_id} "
             f"task_id={info.get('task_id')} instance_id={instance_id}"
         )
         try:
-            await self._post(f"/session/{session_id}/close")
-            _log_error(
-                f"[DesktopEnvTool] release OK session_id={session_id} "
-                f"instance_id={instance_id}"
-            )
-        except Exception:
-            _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
-            logger.warning(
-                "Failed to close session %s", session_id, exc_info=True
-            )
+            try:
+                await self._post(client_session, f"/session/{session_id}/close")
+                _log_error(
+                    f"[DesktopEnvTool] release OK session_id={session_id} "
+                    f"instance_id={instance_id}"
+                )
+            except Exception:
+                _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
+                logger.warning(
+                    "Failed to close session %s", session_id, exc_info=True
+                )
+        finally:
+            # Always close the per-rollout ClientSession, even if /close
+            # failed or the coroutine was cancelled mid-_post. This is the
+            # only place that closes it, so missing this would directly
+            # cause "Unclosed client session" warnings at GC time.
+            try:
+                await client_session.close()
+                _log_error(
+                    f"[DesktopEnvTool] release closed client_session "
+                    f"instance_id={instance_id} session_id={session_id}"
+                )
+            except Exception:
+                _log_error(
+                    f"[DesktopEnvTool] release: failed to close client_session "
+                    f"instance_id={instance_id}: {traceback.format_exc()}"
+                )
