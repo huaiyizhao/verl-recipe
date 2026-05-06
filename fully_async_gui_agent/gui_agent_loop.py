@@ -29,6 +29,7 @@ The loop packs intermediate trajectories using
   transparently via ``self.server_manager.generate()``.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -84,6 +85,18 @@ def _log(msg: str, *, debug: bool = False) -> None:
     if debug and not _DEBUG_ENABLED:
         return
     print(f"[{_ts()}] {msg}", file=sys.stderr, flush=True)
+
+
+def _log_error(msg: str) -> None:
+    """Always-on error logger.
+
+    Bypasses ``_DEBUG_ENABLED`` so anything we deem "diagnostically must
+    see" still surfaces in the default (non-DEBUG) configuration. Use for
+    rollout failures, env-level errors, and anything we'd grep for during
+    incident response. Lines start with ``[POTENTIAL ERROR]`` so they sort
+    next to the structured error markers we emit elsewhere.
+    """
+    print(f"[{_ts()}] [POTENTIAL ERROR] {msg}", file=sys.stderr, flush=True)
 
 
 @register("gui_agent")
@@ -205,12 +218,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # Traceback is already printed by desktop_env_tool._post via
             # logger.error(..., exc_info=True); keep a single summary line
             # here to avoid duplicating the full stack.
-            _log(
+            _log_error(
                 f"[GUIAgentLoop] Failed to create env for {task_id} {base_log_tag}, "
                 f"discarding rollout: {exc!r}"
             )
-            _log(
-                f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][create_failed] "
+            _log_error(
+                f"[GUIAgentLoop][RETURN_NONE][create_failed] "
                 f"task_id={task_id} request_id={request_id} sample_index={sample_index} "
                 f"rollout_n={rollout_n} step={global_step} err={exc!r}"
             )
@@ -383,14 +396,14 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         consecutive_tool_failures = 0
                     except Exception as exec_exc:
                         consecutive_tool_failures += 1
-                        _log(
+                        _log_error(
                             f"[GUIAgentLoop] Tool execution failed for {task_id} {log_tag} "
                             f"(streak={consecutive_tool_failures}/"
                             f"{max_consecutive_tool_failures}): "
                             f"{exec_exc!r}\n{traceback.format_exc()}"
                         )
-                        _log(
-                            f"[POTENTIAL ERROR][GUIAgentLoop][SOFT_ERROR][tool_execute] "
+                        _log_error(
+                            f"[GUIAgentLoop][SOFT_ERROR][tool_execute] "
                             f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                             f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                             f"turn={turn} action={action} err={exec_exc!r} "
@@ -404,8 +417,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             # socket, auth lost). Further turns cannot make
                             # progress; exit the loop and let the post-loop
                             # logic keep whatever ``last_turn_ctx`` we have.
-                            _log(
-                                f"[POTENTIAL ERROR][GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
+                            _log_error(
+                                f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
                                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                                 f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                                 f"turn={turn} action={action} err={exec_exc!r}"
@@ -509,12 +522,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # reward=0 training samples would incorrectly punish the model
             # for env instability. Discard the rollout instead.
             if fatal_error:
-                _log(
+                _log_error(
                     f"[GUIAgentLoop] Fatal error for {task_id} {log_tag} at turn={turn}, "
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
-                _log(
-                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][fatal_error] "
+                _log_error(
+                    f"[GUIAgentLoop][RETURN_NONE][fatal_error] "
                     f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                     f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                     f"turn={turn}"
@@ -522,11 +535,11 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 return None
 
             if last_turn_ctx is None:
-                _log(
+                _log_error(
                     f"[GUIAgentLoop] No turns produced for {task_id} {log_tag}, discarding rollout"
                 )
-                _log(
-                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][no_turns_produced] "
+                _log_error(
+                    f"[GUIAgentLoop][RETURN_NONE][no_turns_produced] "
                     f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                     f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                     f"turn={turn}"
@@ -544,12 +557,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             try:
                 shared_reward = await self.desktop_tool.calc_reward(instance_id)
             except Exception as reward_exc:
-                _log(
+                _log_error(
                     f"[GUIAgentLoop] calc_reward failed for {task_id} {log_tag}: {reward_exc!r}; "
                     f"discarding rollout (env-level failure, not model's fault)"
                 )
-                _log(
-                    f"[POTENTIAL ERROR][GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
+                _log_error(
+                    f"[GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
                     f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                     f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                     f"turn={turn} err={reward_exc!r}"
@@ -602,10 +615,27 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             return final_output
 
         finally:
+            # ``release`` must run to completion even if the surrounding
+            # coroutine is being cancelled (e.g. Ray actor restart, parameter
+            # sync dropping rollouts mid-flight). A bare ``await release()``
+            # inside ``finally`` is NOT cancel-safe: if the cancellation
+            # arrives while ``release`` is itself awaiting the HTTP close
+            # request, that inner await is cancelled too, the HTTP request
+            # is never sent, and the desktop-env slot leaks server-side.
+            #
+            # ``asyncio.shield`` protects the inner coroutine from outer
+            # cancellation. We still re-raise CancelledError after shielding
+            # so that the framework can propagate cancellation upstream.
             try:
-                await self.desktop_tool.release(instance_id)
+                await asyncio.shield(self.desktop_tool.release(instance_id))
+            except asyncio.CancelledError:
+                _log_error(
+                    f"[GUIAgentLoop] release shielded but coroutine cancelled "
+                    f"for {task_id} {log_tag}"
+                )
+                raise
             except Exception:
-                _log(
+                _log_error(
                     f"[GUIAgentLoop] Failed to release env for {task_id} {log_tag}\n{traceback.format_exc()}"
                 )
             _log(

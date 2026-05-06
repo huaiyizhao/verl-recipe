@@ -566,8 +566,9 @@ class DesktopEnvTool(BaseTool):
         if not task_id:
             raise ValueError("create_kwargs must contain 'task_id'")
 
-        _log(
-            f"[DesktopEnvTool] create session task_id={task_id} instance_id={instance_id}"
+        _log_error(
+            f"[DesktopEnvTool] create session task_id={task_id} "
+            f"instance_id={instance_id}"
         )
         resp = await self._post(
             "/session/create",
@@ -580,7 +581,27 @@ class DesktopEnvTool(BaseTool):
                 f"/session/create did not return session_id; response={resp!r}"
             )
 
-        self._instances[instance_id] = {"session_id": session_id, "task_id": task_id}
+        # Even one missed assignment here would leak the server-side slot
+        # (server already moved it to IN_USE). If anything between this
+        # ``await`` and the dict assignment cancels the coroutine, the
+        # session_id is unreachable from release(). Emit a best-effort
+        # close on cancel/exception to keep server-side state consistent.
+        try:
+            self._instances[instance_id] = {"session_id": session_id, "task_id": task_id}
+        except BaseException:
+            try:
+                await self._post(f"/session/{session_id}/close")
+            except Exception:
+                _log_error(
+                    f"[DesktopEnvTool] create cleanup: failed to close orphan "
+                    f"session_id={session_id}"
+                )
+            raise
+
+        _log_error(
+            f"[DesktopEnvTool] create session OK task_id={task_id} "
+            f"instance_id={instance_id} session_id={session_id}"
+        )
 
         observation = resp.get("observation") or {}
         screenshot = _decode_screenshot(observation.get("screenshot"))
@@ -759,18 +780,22 @@ class DesktopEnvTool(BaseTool):
         """Close the session. MUST be called in a ``finally`` block."""
         info = self._instances.pop(instance_id, None)
         if info is None:
-            _log(
-                f"[DesktopEnvTool] release: no-op for unknown instance_id={instance_id}",
-                debug=True,
+            _log_error(
+                f"[DesktopEnvTool] release: no-op for unknown "
+                f"instance_id={instance_id} (already released or never registered)"
             )
             return
         session_id = info["session_id"]
-        _log(
+        _log_error(
             f"[DesktopEnvTool] release session_id={session_id} "
-            f"task_id={info.get('task_id')}"
+            f"task_id={info.get('task_id')} instance_id={instance_id}"
         )
         try:
             await self._post(f"/session/{session_id}/close")
+            _log_error(
+                f"[DesktopEnvTool] release OK session_id={session_id} "
+                f"instance_id={instance_id}"
+            )
         except Exception:
             _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
             logger.warning(
