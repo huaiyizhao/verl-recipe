@@ -551,13 +551,22 @@ class DesktopEnvTool(BaseTool):
             resp = await self._post(
                 client_session,
                 "/session/create",
-                {"task_id": task_id, "require_a11y_tree": False},
-                timeout=aiohttp.ClientTimeout(total=120),
+                {
+                    "session_id": instance_id,
+                    "task_id": task_id,
+                    "require_a11y_tree": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=180),
             )
             session_id = resp.get("session_id")
             if not session_id:
                 raise RuntimeError(
                     f"/session/create did not return session_id; response={resp!r}"
+                )
+            if session_id != instance_id:
+                raise RuntimeError(
+                    f"/session/create returned unexpected session_id={session_id!r}; "
+                    f"expected instance_id={instance_id!r}"
                 )
 
             # Once server returned a session_id, the slot is IN_USE on the
@@ -578,7 +587,9 @@ class DesktopEnvTool(BaseTool):
             if server_session_id:
                 try:
                     await self._post(
-                        client_session, f"/session/{server_session_id}/close"
+                        client_session,
+                        f"/session/{server_session_id}/close",
+                        timeout=aiohttp.ClientTimeout(total=180),
                     )
                 except Exception:
                     _log_error(
@@ -624,10 +635,15 @@ class DesktopEnvTool(BaseTool):
         session_id = info["session_id"]
         client_session = info["client_session"]
         try:
+            request_id = str(uuid4())
             resp = await self._post(
                 client_session,
                 f"/session/{session_id}/step",
-                {"action": "import time; time.sleep(0)", "pause": 0},
+                {
+                    "request_id": request_id,
+                    "action": "import time; time.sleep(0)",
+                    "pause": 0,
+                },
             )
             observation = resp.get("observation") or {}
             screenshot = _decode_screenshot(observation.get("screenshot"))
@@ -711,10 +727,11 @@ class DesktopEnvTool(BaseTool):
             f"[DesktopEnvTool] step session_id={session_id} action={action} code={code}",
             debug=True,
         )
+        request_id = str(uuid4())
         resp = await self._post(
             client_session,
             f"/session/{session_id}/step",
-            {"action": code, "pause": self.pause},
+            {"request_id": request_id, "action": code, "pause": self.pause},
         )
 
         observation = resp.get("observation") or {}
@@ -795,7 +812,14 @@ class DesktopEnvTool(BaseTool):
         )
         try:
             try:
-                await self._post(client_session, f"/session/{session_id}/close")
+                # /close synchronously waits for container recycle (destroy
+                # old + boot fresh replacement) before returning, so it
+                # needs a generous timeout — match /create's 180s.
+                await self._post(
+                    client_session,
+                    f"/session/{session_id}/close",
+                    timeout=aiohttp.ClientTimeout(total=180),
+                )
                 _log_error(
                     f"[DesktopEnvTool] release OK session_id={session_id} "
                     f"instance_id={instance_id}"
