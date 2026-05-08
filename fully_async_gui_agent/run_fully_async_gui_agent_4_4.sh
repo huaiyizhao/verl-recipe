@@ -102,7 +102,7 @@ train_prompt_mini_bsz=${train_prompt_mini_bsz:-6}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 total_epochs=200
-test_freq=-1  # disabled: validation competes for desktop-env containers
+test_freq=-5  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
@@ -204,7 +204,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.total_epochs="${total_epochs}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.test_freq="${test_freq}" \
     trainer.save_freq=-1 \
     trainer.resume_mode=disable \

@@ -239,8 +239,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--api-base-url",
-        default=os.environ.get("DESKTOP_API_BASE_URL", "http://10.192.64.33:2354"),
-        help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://10.192.64.33:2354).",
+        default=os.environ.get("DESKTOP_API_BASE_URL", "http://10.192.64.238:2354"),
+        help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://10.192.64.238:2354).",
     )
     parser.add_argument("--domain", default=None, help="Filter tasks by domain (chrome/gimp/...).")
     parser.add_argument("--limit", type=int, default=0, help="Keep only the first N tasks (after filter). 0 = all.")
