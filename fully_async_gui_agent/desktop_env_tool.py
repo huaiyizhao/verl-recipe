@@ -43,7 +43,6 @@ import logging
 import os
 import sys
 import time
-import traceback
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -394,18 +393,10 @@ class DesktopEnvTool(BaseTool):
         self.max_retries = int(config.get("max_retries", 3))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
-        # instance_id → {"session_id": str, "task_id": str,
-        #                  "client_session": aiohttp.ClientSession}
-        # One ClientSession per rollout: bound to the desktop env session's
-        # lifetime (created in ``create()``, closed in ``release()``).
-        # Rationale: a single per-tool shared session was prone to silent
-        # re-creation (when the connector got closed mid-run) which left
-        # orphan sessions for the GC to reap, surfacing as repeated
-        # ``Unclosed client session`` warnings; a per-_post session caused
-        # high-frequency fd churn that crashed the Ray core-worker inside
-        # libuv's ``uv__epoll_ctl_flush``. Per-rollout strikes the right
-        # balance: ~32 live sessions in steady state, created/destroyed
-        # only on rollout boundaries (a few times per minute).
+        # instance_id → {"session_id": str, "task_id": str}
+        # HTTP connections are intentionally not reused: each _post attempt
+        # creates and closes its own aiohttp.ClientSession to avoid stale
+        # connector/transport state after timeout/cancellation.
         self._instances: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -414,67 +405,74 @@ class DesktopEnvTool(BaseTool):
 
     async def _post(
         self,
-        session: aiohttp.ClientSession,
         path: str,
         payload: dict | None = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
     ) -> dict:
         """POST JSON to the desktop env service and return the JSON response.
 
-        Logs the request payload and response body at INFO level. On any
-        failure, retry up to ``self.max_retries`` times, sleeping
-        ``self.retry_interval`` seconds between attempts. If all retries
-        fail, raise so the caller (agent loop) can abort the rollout.
+        Each retry attempt uses a fresh aiohttp.ClientSession and closes it
+        immediately. This intentionally disables keep-alive/connection reuse so
+        timeout/cancellation cannot leave a stale connector transport around for
+        the next request.
         """
         url = f"{self.api_base_url}{path}"
         attempts = self.max_retries + 1  # initial attempt + retries
         last_exc: Optional[BaseException] = None
         effective_timeout = timeout if timeout is not None else self.timeout
         request_body = payload or {}
+        request_id = request_body.get("request_id", "<none>")
 
-        _log(f"[DesktopEnvTool] -> POST {url} payload={_short_repr(request_body)}")
+        _log_error(
+            f"[DesktopEnvTool] -> POST path={path} request_id={request_id} "
+            f"payload={_short_repr(request_body)}"
+        )
 
         for attempt in range(1, attempts + 1):
             try:
-                async with session.post(
-                    url, json=request_body, timeout=effective_timeout
-                ) as resp:
-                    status = resp.status
-                    content_type = resp.content_type
-                    # Always read the full body so we can log it (and show
-                    # it in error messages).
-                    text_body = await resp.text()
-                    if status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            request_info=resp.request_info,
-                            history=resp.history,
-                            status=status,
-                            message=text_body or resp.reason or "",
-                            headers=resp.headers,
-                        )
-                    if content_type == "application/json" and text_body:
-                        import json as _json
-                        try:
-                            data = _json.loads(text_body)
-                        except _json.JSONDecodeError as je:
-                            _log_error(
-                                f"[DesktopEnvTool] <- POST {url} status={status} "
-                                f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
+                connector = aiohttp.TCPConnector(force_close=True)
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=effective_timeout,
+                    headers={"Connection": "close"},
+                ) as session:
+                    async with session.post(url, json=request_body) as resp:
+                        status = resp.status
+                        content_type = resp.content_type
+                        # Always read the full body so we can log it (and show
+                        # it in error messages).
+                        text_body = await resp.text()
+                        if status >= 400:
+                            raise aiohttp.ClientResponseError(
+                                request_info=resp.request_info,
+                                history=resp.history,
+                                status=status,
+                                message=text_body or resp.reason or "",
+                                headers=resp.headers,
                             )
-                            raise RuntimeError(
-                                f"POST {path} returned non-JSON body: {text_body!r}"
-                            ) from je
-                        _log(
-                            f"[DesktopEnvTool] <- POST {url} status={status} "
-                            f"response={_short_repr(data)}"
+                        if content_type == "application/json" and text_body:
+                            import json as _json
+                            try:
+                                data = _json.loads(text_body)
+                            except _json.JSONDecodeError as je:
+                                _log_error(
+                                    f"[DesktopEnvTool] <- POST {url} status={status} "
+                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
+                                )
+                                raise RuntimeError(
+                                    f"POST {path} returned non-JSON body: {text_body!r}"
+                                ) from je
+                            _log_error(
+                                f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                                f"status={status} response={_short_repr(data)}"
+                            )
+                            return data
+                        # Empty body is allowed for endpoints like /close.
+                        _log_error(
+                            f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                            f"status={status} empty body (content_type={content_type})"
                         )
-                        return data
-                    # Empty body is allowed for endpoints like /close.
-                    _log(
-                        f"[DesktopEnvTool] <- POST {url} status={status} "
-                        f"empty body (content_type={content_type})"
-                    )
-                    return {}
+                        return {}
             except Exception as exc:
                 last_exc = exc
                 # Extract as much detail as possible from the exception.
@@ -486,8 +484,9 @@ class DesktopEnvTool(BaseTool):
                     )
                 if attempt >= attempts:
                     _log_error(
-                        f"[DesktopEnvTool] POST {path} failed after {attempts} attempts: "
-                        f"{detail} | payload={_short_repr(request_body)}"
+                        f"[DesktopEnvTool] POST {path} request_id={request_id} "
+                        f"failed after {attempts} attempts: {detail} | "
+                        f"payload={_short_repr(request_body)}"
                     )
                     # Preserve stack trace via the logging framework (ERROR
                     # is not filtered out by the default WARNING config).
@@ -498,8 +497,9 @@ class DesktopEnvTool(BaseTool):
                     )
                     break
                 _log_error(
-                    f"[DesktopEnvTool] POST {path} failed (attempt {attempt}/{attempts}): "
-                    f"{detail}. Retrying in {self.retry_interval:.1f}s"
+                    f"[DesktopEnvTool] POST {path} request_id={request_id} "
+                    f"failed (attempt {attempt}/{attempts}): {detail}. "
+                    f"Retrying in {self.retry_interval:.1f}s"
                 )
                 await asyncio.sleep(self.retry_interval)
 
@@ -542,14 +542,8 @@ class DesktopEnvTool(BaseTool):
             f"instance_id={instance_id}"
         )
 
-        # Per-rollout ClientSession: bound to this desktop env session's
-        # lifetime. Created here, closed in ``release()``. We build it
-        # *before* the first HTTP call so that even a failed
-        # ``/session/create`` goes through a session we own and can close.
-        client_session = aiohttp.ClientSession(timeout=self.timeout)
         try:
             resp = await self._post(
-                client_session,
                 "/session/create",
                 {
                     "session_id": instance_id,
@@ -571,23 +565,20 @@ class DesktopEnvTool(BaseTool):
 
             # Once server returned a session_id, the slot is IN_USE on the
             # server side. Anything failing between here and the dict
-            # assignment (incl. CancelledError) must close both the
-            # client-side ClientSession AND the server-side session, else
-            # we leak. Catch BaseException to cover CancelledError too.
+            # assignment (incl. CancelledError) must close the server-side
+            # session, else we leak. Catch BaseException to cover
+            # CancelledError too.
             self._instances[instance_id] = {
                 "session_id": session_id,
                 "task_id": task_id,
-                "client_session": client_session,
             }
         except BaseException:
             # Best-effort cleanup. If we already have a server session_id,
-            # try to close it on the server through our (still-open)
-            # ClientSession before closing the client session.
-            server_session_id = locals().get("session_id")
+            # try to close it on the server.
+            server_session_id = locals().get("session_id", instance_id)
             if server_session_id:
                 try:
                     await self._post(
-                        client_session,
                         f"/session/{server_session_id}/close",
                         timeout=aiohttp.ClientTimeout(total=180),
                     )
@@ -596,13 +587,6 @@ class DesktopEnvTool(BaseTool):
                         f"[DesktopEnvTool] create cleanup: failed to close orphan "
                         f"server session_id={server_session_id}"
                     )
-            try:
-                await client_session.close()
-            except Exception:
-                _log_error(
-                    f"[DesktopEnvTool] create cleanup: failed to close "
-                    f"client_session for instance_id={instance_id}"
-                )
             raise
 
         _log_error(
@@ -633,11 +617,13 @@ class DesktopEnvTool(BaseTool):
         if info is None:
             return []
         session_id = info["session_id"]
-        client_session = info["client_session"]
         try:
             request_id = str(uuid4())
+            _log_error(
+                f"[DesktopEnvTool] screenshot step request_id={request_id} "
+                f"session_id={session_id}"
+            )
             resp = await self._post(
-                client_session,
                 f"/session/{session_id}/step",
                 {
                     "request_id": request_id,
@@ -668,7 +654,6 @@ class DesktopEnvTool(BaseTool):
         if info is None:
             raise ValueError(f"Unknown instance_id: {instance_id}")
         session_id = info["session_id"]
-        client_session = info["client_session"]
 
         action = parameters.get("action", "")
 
@@ -723,13 +708,12 @@ class DesktopEnvTool(BaseTool):
             )
 
         code = _translate_action_to_pyautogui(parameters, self.real_screen_width, self.real_screen_height)
-        _log(
-            f"[DesktopEnvTool] step session_id={session_id} action={action} code={code}",
-            debug=True,
-        )
         request_id = str(uuid4())
+        _log_error(
+            f"[DesktopEnvTool] step request_id={request_id} "
+            f"session_id={session_id} action={action} code={code}"
+        )
         resp = await self._post(
-            client_session,
             f"/session/{session_id}/step",
             {"request_id": request_id, "action": code, "pause": self.pause},
         )
@@ -744,8 +728,9 @@ class DesktopEnvTool(BaseTool):
 
         # Forward non-observation metadata (reward / done / info / step_count).
         meta = {k: v for k, v in resp.items() if k != "observation"}
-        _log(
-            f"[DesktopEnvTool] step done session_id={session_id} action={action} "
+        _log_error(
+            f"[DesktopEnvTool] step done request_id={request_id} "
+            f"session_id={session_id} action={action} "
             f"has_screenshot={bool(screenshot)} done={meta.get('done')} "
             f"step_count={meta.get('step_count')}"
         )
@@ -765,7 +750,6 @@ class DesktopEnvTool(BaseTool):
             )
             return 0.0
         session_id = info["session_id"]
-        client_session = info["client_session"]
 
         _log(
             f"[DesktopEnvTool] evaluate session_id={session_id} "
@@ -773,7 +757,6 @@ class DesktopEnvTool(BaseTool):
         )
         try:
             resp = await self._post(
-                client_session,
                 f"/session/{session_id}/evaluate",
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
@@ -805,43 +788,24 @@ class DesktopEnvTool(BaseTool):
             )
             return
         session_id = info["session_id"]
-        client_session = info["client_session"]
         _log_error(
             f"[DesktopEnvTool] release session_id={session_id} "
             f"task_id={info.get('task_id')} instance_id={instance_id}"
         )
         try:
-            try:
-                # /close synchronously waits for container recycle (destroy
-                # old + boot fresh replacement) before returning, so it
-                # needs a generous timeout — match /create's 180s.
-                await self._post(
-                    client_session,
-                    f"/session/{session_id}/close",
-                    timeout=aiohttp.ClientTimeout(total=180),
-                )
-                _log_error(
-                    f"[DesktopEnvTool] release OK session_id={session_id} "
-                    f"instance_id={instance_id}"
-                )
-            except Exception:
-                _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
-                logger.warning(
-                    "Failed to close session %s", session_id, exc_info=True
-                )
-        finally:
-            # Always close the per-rollout ClientSession, even if /close
-            # failed or the coroutine was cancelled mid-_post. This is the
-            # only place that closes it, so missing this would directly
-            # cause "Unclosed client session" warnings at GC time.
-            try:
-                await client_session.close()
-                _log_error(
-                    f"[DesktopEnvTool] release closed client_session "
-                    f"instance_id={instance_id} session_id={session_id}"
-                )
-            except Exception:
-                _log_error(
-                    f"[DesktopEnvTool] release: failed to close client_session "
-                    f"instance_id={instance_id}: {traceback.format_exc()}"
-                )
+            # /close synchronously waits for container recycle (destroy old +
+            # boot fresh replacement) before returning, so it needs a generous
+            # timeout — match /create's 180s.
+            await self._post(
+                f"/session/{session_id}/close",
+                timeout=aiohttp.ClientTimeout(total=180),
+            )
+            _log_error(
+                f"[DesktopEnvTool] release OK session_id={session_id} "
+                f"instance_id={instance_id}"
+            )
+        except Exception:
+            _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
+            logger.warning(
+                "Failed to close session %s", session_id, exc_info=True
+            )
