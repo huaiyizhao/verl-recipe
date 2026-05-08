@@ -18,6 +18,7 @@ env_vars:
   VLLM_USE_V1: "1"
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
   WANDB_API_KEY: "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"
+  VERL_LOGGING_LEVEL: "DEBUG"
   MLFLOW_TRACKING_URI: "http://172.20.70.149:29004"  # MLflow server 地址
   HF_HOME: "/efs/data/hf"
 
