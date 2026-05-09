@@ -204,7 +204,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.total_epochs="${total_epochs}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq="${test_freq}" \
     trainer.save_freq=-1 \
     trainer.resume_mode=disable \
