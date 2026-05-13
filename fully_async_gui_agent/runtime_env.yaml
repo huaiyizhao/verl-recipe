@@ -31,4 +31,4 @@ env_vars:
   GRPC_VERBOSITY: "ERROR"
   RAY_task_events_report_interval_ms: "10000"
   RAY_task_events_max_num_status_events_buffer_on_worker: "1024"
-  RAY_RAYLET_ULIMIT_NOFILE: "65536"
+  RAY_RAYLET_ULIMIT_NOFILE: "1048576"
