@@ -197,6 +197,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
+    ++async_training.image_refs.enabled=True \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
