@@ -755,6 +755,8 @@ class DesktopEnvTool(BaseTool):
             f"[DesktopEnvTool] evaluate session_id={session_id} "
             f"settle={self.evaluate_settle_seconds}s"
         )
+        if self.evaluate_settle_seconds > 0:
+            await asyncio.sleep(self.evaluate_settle_seconds)
         try:
             resp = await self._post(
                 f"/session/{session_id}/evaluate",
