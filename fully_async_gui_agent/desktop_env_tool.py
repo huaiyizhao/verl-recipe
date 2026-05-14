@@ -61,7 +61,9 @@ from verl.utils.rollout_trace import rollout_trace_op
 # is valuable.
 logger = logging.getLogger(__name__)
 
-_DEBUG_ENABLED = os.getenv("VERL_LOGGING_LEVEL", "INFO").upper() == "DEBUG"
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+_LOG_LEVEL = os.getenv("GUI_AGENT_LOGGING_LEVEL", "ERROR").upper()
+_LOG_THRESHOLD = _LOG_LEVELS.get(_LOG_LEVEL, _LOG_LEVELS["ERROR"])
 
 
 def _ts() -> str:
@@ -72,29 +74,17 @@ def _ts() -> str:
     return f"{time.strftime('%Y-%m-%d %H:%M:%S', lt)}.{ms:03d}"
 
 
-def _log(msg: str, *, debug: bool = False) -> None:
-    """Print-based logger that bypasses the ``logging`` framework entirely.
+def _log(msg: str, *, level: str = "DEBUG", debug: bool | None = None) -> None:
+    """Print-based logger controlled by ``GUI_AGENT_LOGGING_LEVEL``.
 
-    Normal info-level traces are only emitted when ``VERL_LOGGING_LEVEL=DEBUG``
-    (so the default run stays quiet). The ``debug`` kwarg is kept for backwards
-    compatibility with existing callsites; all info lines are now gated on the
-    same ``_DEBUG_ENABLED`` flag regardless of its value. Use
-    :func:`_log_error` for anything that should always surface.
-
+    Normal DesktopEnv traces use DEBUG level; failures use ERROR level.
     ``flush=True`` + ``stderr`` ensures lines survive worker crashes.
     """
-    del debug  # unused; kept for backward compatibility
-    if not _DEBUG_ENABLED:
+    if debug:
+        level = "DEBUG"
+    level = level.upper()
+    if _LOG_LEVELS.get(level, _LOG_LEVELS["INFO"]) < _LOG_THRESHOLD:
         return
-    print(msg, file=sys.stderr, flush=True)
-
-
-def _log_error(msg: str) -> None:
-    """Always-on error log with a millisecond timestamp.
-
-    Use for failures that must be visible even in the default (non-DEBUG)
-    configuration.
-    """
     print(f"[{_ts()}] {msg}", file=sys.stderr, flush=True)
 
 
@@ -455,9 +445,10 @@ class DesktopEnvTool(BaseTool):
                             try:
                                 data = _json.loads(text_body)
                             except _json.JSONDecodeError as je:
-                                _log_error(
+                                _log(
                                     f"[DesktopEnvTool] <- POST {url} status={status} "
-                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}"
+                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}",
+                                    level="ERROR"
                                 )
                                 raise RuntimeError(
                                     f"POST {path} returned non-JSON body: {text_body!r}"
@@ -483,10 +474,11 @@ class DesktopEnvTool(BaseTool):
                         f"url={exc.request_info.url if exc.request_info else url}"
                     )
                 if attempt >= attempts:
-                    _log_error(
+                    _log(
                         f"[DesktopEnvTool] POST {path} request_id={request_id} "
                         f"failed after {attempts} attempts: {detail} | "
-                        f"payload={_short_repr(request_body)}"
+                        f"payload={_short_repr(request_body)}",
+                        level="ERROR"
                     )
                     # Preserve stack trace via the logging framework (ERROR
                     # is not filtered out by the default WARNING config).
@@ -496,10 +488,11 @@ class DesktopEnvTool(BaseTool):
                         exc_info=True,
                     )
                     break
-                _log_error(
+                _log(
                     f"[DesktopEnvTool] POST {path} request_id={request_id} "
                     f"failed (attempt {attempt}/{attempts}): {detail}. "
-                    f"Retrying in {self.retry_interval:.1f}s"
+                    f"Retrying in {self.retry_interval:.1f}s",
+                    level="ERROR"
                 )
                 await asyncio.sleep(self.retry_interval)
 
@@ -583,9 +576,10 @@ class DesktopEnvTool(BaseTool):
                         timeout=aiohttp.ClientTimeout(total=180),
                     )
                 except Exception:
-                    _log_error(
+                    _log(
                         f"[DesktopEnvTool] create cleanup: failed to close orphan "
-                        f"server session_id={server_session_id}"
+                        f"server session_id={server_session_id}",
+                        level="ERROR"
                     )
             raise
 
@@ -635,8 +629,9 @@ class DesktopEnvTool(BaseTool):
             screenshot = _decode_screenshot(observation.get("screenshot"))
             return [screenshot] if screenshot is not None else []
         except Exception:
-            _log_error(
-                f"[DesktopEnvTool] screenshot failed for session_id={session_id}"
+            _log(
+                f"[DesktopEnvTool] screenshot failed for session_id={session_id}",
+                level="ERROR"
             )
             return []
 
@@ -666,9 +661,10 @@ class DesktopEnvTool(BaseTool):
         # valid action vocabulary through tool feedback.
         if action not in _VALID_COMPUTER_USE_ACTIONS:
             valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] invalid action={action!r} "
-                f"session_id={session_id} (returning soft error with screenshot)"
+                f"session_id={session_id} (returning soft error with screenshot)",
+                level="ERROR"
             )
             # Attach a fresh screenshot so the agent always has visual context
             # even when the action was invalid.
@@ -744,9 +740,10 @@ class DesktopEnvTool(BaseTool):
         """Compute the terminal reward via ``/evaluate``."""
         info = self._instances.get(instance_id)
         if info is None:
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] calc_reward: unknown instance_id={instance_id} "
-                f"(already released?)"
+                f"(already released?)",
+                level="ERROR"
             )
             return 0.0
         session_id = info["session_id"]
@@ -763,7 +760,7 @@ class DesktopEnvTool(BaseTool):
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
         except Exception:
-            _log_error(f"[DesktopEnvTool] Failed to evaluate session {session_id}")
+            _log(f"[DesktopEnvTool] Failed to evaluate session {session_id}", level="ERROR")
             logger.warning(
                 "Failed to evaluate session %s", session_id, exc_info=True
             )
@@ -772,9 +769,10 @@ class DesktopEnvTool(BaseTool):
         try:
             reward = float(resp.get("reward", 0.0))
         except (TypeError, ValueError):
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] evaluate session_id={session_id} "
-                f"returned non-numeric reward: {resp.get('reward')!r}"
+                f"returned non-numeric reward: {resp.get('reward')!r}",
+                level="ERROR"
             )
             return 0.0
         _log(f"[DesktopEnvTool] evaluate session_id={session_id} reward={reward:.4f}")
@@ -784,9 +782,10 @@ class DesktopEnvTool(BaseTool):
         """Close the session. MUST be called in a ``finally`` block."""
         info = self._instances.pop(instance_id, None)
         if info is None:
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] release: no-op for unknown "
-                f"instance_id={instance_id} (already released or never registered)"
+                f"instance_id={instance_id} (already released or never registered)",
+                level="ERROR"
             )
             return
         session_id = info["session_id"]
@@ -807,7 +806,7 @@ class DesktopEnvTool(BaseTool):
                 f"instance_id={instance_id}"
             )
         except Exception:
-            _log_error(f"[DesktopEnvTool] Failed to close session {session_id}")
+            _log(f"[DesktopEnvTool] Failed to close session {session_id}", level="ERROR")
             logger.warning(
                 "Failed to close session %s", session_id, exc_info=True
             )
