@@ -423,7 +423,7 @@ class DesktopEnvTool(BaseTool):
         request_body = payload or {}
         request_id = request_body.get("request_id", "<none>")
 
-        _log_error(
+        _log(
             f"[DesktopEnvTool] -> POST path={path} request_id={request_id} "
             f"payload={_short_repr(request_body)}"
         )
@@ -462,13 +462,13 @@ class DesktopEnvTool(BaseTool):
                                 raise RuntimeError(
                                     f"POST {path} returned non-JSON body: {text_body!r}"
                                 ) from je
-                            _log_error(
+                            _log(
                                 f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
                                 f"status={status} response={_short_repr(data)}"
                             )
                             return data
                         # Empty body is allowed for endpoints like /close.
-                        _log_error(
+                        _log(
                             f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
                             f"status={status} empty body (content_type={content_type})"
                         )
@@ -537,7 +537,7 @@ class DesktopEnvTool(BaseTool):
         if not task_id:
             raise ValueError("create_kwargs must contain 'task_id'")
 
-        _log_error(
+        _log(
             f"[DesktopEnvTool] create session task_id={task_id} "
             f"instance_id={instance_id}"
         )
@@ -589,7 +589,7 @@ class DesktopEnvTool(BaseTool):
                     )
             raise
 
-        _log_error(
+        _log(
             f"[DesktopEnvTool] create session OK task_id={task_id} "
             f"instance_id={instance_id} session_id={session_id}"
         )
@@ -619,7 +619,7 @@ class DesktopEnvTool(BaseTool):
         session_id = info["session_id"]
         try:
             request_id = str(uuid4())
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] screenshot step request_id={request_id} "
                 f"session_id={session_id}"
             )
@@ -709,7 +709,7 @@ class DesktopEnvTool(BaseTool):
 
         code = _translate_action_to_pyautogui(parameters, self.real_screen_width, self.real_screen_height)
         request_id = str(uuid4())
-        _log_error(
+        _log(
             f"[DesktopEnvTool] step request_id={request_id} "
             f"session_id={session_id} action={action} code={code}"
         )
@@ -728,7 +728,7 @@ class DesktopEnvTool(BaseTool):
 
         # Forward non-observation metadata (reward / done / info / step_count).
         meta = {k: v for k, v in resp.items() if k != "observation"}
-        _log_error(
+        _log(
             f"[DesktopEnvTool] step done request_id={request_id} "
             f"session_id={session_id} action={action} "
             f"has_screenshot={bool(screenshot)} done={meta.get('done')} "
@@ -790,7 +790,7 @@ class DesktopEnvTool(BaseTool):
             )
             return
         session_id = info["session_id"]
-        _log_error(
+        _log(
             f"[DesktopEnvTool] release session_id={session_id} "
             f"task_id={info.get('task_id')} instance_id={instance_id}"
         )
@@ -802,7 +802,7 @@ class DesktopEnvTool(BaseTool):
                 f"/session/{session_id}/close",
                 timeout=aiohttp.ClientTimeout(total=180),
             )
-            _log_error(
+            _log(
                 f"[DesktopEnvTool] release OK session_id={session_id} "
                 f"instance_id={instance_id}"
             )
