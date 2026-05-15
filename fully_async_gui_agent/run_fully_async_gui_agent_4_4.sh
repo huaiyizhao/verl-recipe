@@ -63,8 +63,8 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Fully-async resource split: rollout vs training GPUs.
 # With 2 nodes: each node contributes 4 GPUs for rollout + 4 GPUs for training.
 # This forces Ray to distribute workers across both nodes.
-n_gpus_rollout=${n_gpus_rollout:-4}
-n_gpus_training=${n_gpus_training:-4}
+n_gpus_rollout=${n_gpus_rollout:-2}
+n_gpus_training=${n_gpus_training:-6}
 rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
@@ -89,25 +89,25 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 # ================= algorithm =================
 adv_estimator=grpo
 
-max_turns=${max_turns:-50}
+max_turns=${max_turns:-30}
 max_prompt_length=${max_prompt_length:-16384}
-max_response_length=${max_response_length:-8192}
+max_response_length=${max_response_length:-2048}
 actor_lr=${actor_lr:-1e-6}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-8}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-6}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
 total_epochs=200
-test_freq=-5  # disabled: validation competes for desktop-env containers
+test_freq=-1  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-1}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-1}
 partial_rollout=${partial_rollout:-False}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
@@ -129,8 +129,8 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3 / 2))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 
 project_name=${project_name:-fully_async_gui_agent}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
