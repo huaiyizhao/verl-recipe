@@ -558,9 +558,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"{log_tag} Reached max_turns={self.max_turns} without model terminate"
                 )
 
-            # Compute terminal reward. If the reward service itself fails,
-            # that's an env-level problem (we cannot grade this rollout
-            # honestly), so discard rather than defaulting to 0.
+            # Compute terminal reward. If evaluation keeps failing after the
+            # env tool's retries, it returns reward=0 rather than discarding
+            # the rollout.
             try:
                 shared_reward = await self.desktop_tool.calc_reward(instance_id)
             except Exception as reward_exc:

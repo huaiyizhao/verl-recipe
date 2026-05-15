@@ -760,10 +760,11 @@ class DesktopEnvTool(BaseTool):
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
         except Exception:
-            _log(f"[DesktopEnvTool] Failed to evaluate session {session_id}", level="ERROR")
-            logger.warning(
-                "Failed to evaluate session %s", session_id, exc_info=True
+            _log(
+                f"[DesktopEnvTool] Evaluation failed for session {session_id} after retries; treating reward as 0",
+                level="ERROR",
             )
+            logger.warning("Evaluation failed for session %s after retries; reward=0", session_id, exc_info=True)
             return 0.0
 
         try:
