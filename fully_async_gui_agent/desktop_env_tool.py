@@ -377,9 +377,9 @@ class DesktopEnvTool(BaseTool):
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
         self.step_reward = float(config.get("step_reward", 0.0))
 
-        # HTTP retry config: retry ``max_retries`` times with a fixed
-        # ``retry_interval`` seconds between attempts. After that, _post
-        # raises and the caller (agent loop) will abort the rollout.
+        # HTTP retry config: retry timeout failures ``max_retries`` times with
+        # a fixed ``retry_interval`` seconds between attempts. Non-timeout
+        # errors fail fast because the server has already returned a result.
         self.max_retries = int(config.get("max_retries", 3))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
@@ -473,31 +473,32 @@ class DesktopEnvTool(BaseTool):
                         f"status={exc.status} message={exc.message!r} "
                         f"url={exc.request_info.url if exc.request_info else url}"
                     )
-                if attempt >= attempts:
+                is_timeout = isinstance(exc, TimeoutError)
+                if (not is_timeout) or attempt >= attempts:
                     _log(
                         f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                        f"failed after {attempts} attempts: {detail} | "
+                        f"failed after {attempt} attempt(s): {detail} | "
                         f"payload={_short_repr(request_body)}",
                         level="ERROR"
                     )
                     # Preserve stack trace via the logging framework (ERROR
                     # is not filtered out by the default WARNING config).
                     logger.error(
-                        "[DesktopEnvTool] POST %s failed after %d attempts",
-                        path, attempts,
+                        "[DesktopEnvTool] POST %s failed after %d attempt(s)",
+                        path, attempt,
                         exc_info=True,
                     )
                     break
                 _log(
                     f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                    f"failed (attempt {attempt}/{attempts}): {detail}. "
+                    f"timed out (attempt {attempt}/{attempts}): {detail}. "
                     f"Retrying in {self.retry_interval:.1f}s",
                     level="ERROR"
                 )
                 await asyncio.sleep(self.retry_interval)
 
         raise RuntimeError(
-            f"POST {path} failed after {attempts} attempts: {last_exc}"
+            f"POST {path} failed: {last_exc}"
         ) from last_exc
 
     # ------------------------------------------------------------------
@@ -543,7 +544,7 @@ class DesktopEnvTool(BaseTool):
                     "task_id": task_id,
                     "require_a11y_tree": False,
                 },
-                timeout=aiohttp.ClientTimeout(total=180),
+                timeout=aiohttp.ClientTimeout(total=300),
             )
             session_id = resp.get("session_id")
             if not session_id:
