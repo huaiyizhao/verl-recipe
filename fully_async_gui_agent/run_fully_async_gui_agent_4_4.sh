@@ -97,7 +97,7 @@ actor_lr=${actor_lr:-1e-6}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-8}
+n_resp_per_prompt=${n_resp_per_prompt:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
@@ -106,7 +106,7 @@ test_freq=-1  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-1}
+staleness_threshold=${staleness_threshold:-0}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-1}
 partial_rollout=${partial_rollout:-False}
 
