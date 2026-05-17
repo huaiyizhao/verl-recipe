@@ -280,7 +280,6 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 image_data = multi_modal_data.get("images")
                 prompt_ids = await self.apply_chat_template(
                     messages,
-                    tools=self.tool_schemas,
                     images=image_data if image_data else None,
                 )
                 original_prompt_len = len(prompt_ids)
@@ -342,6 +341,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
                 tool_args: dict[str, Any] | None = None
                 action: str = ""
+                parse_error_text: str | None = None
                 if tool_calls:
                     try:
                         tool_args = json.loads(tool_calls[0].arguments)
@@ -351,8 +351,19 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             f"{log_tag}[turn={turn}] Failed to parse tool arguments: "
                             f"{tool_calls[0]} (error: {parse_exc!r})"
                         )
+                        parse_error_text = (
+                            "Error: failed to parse the computer_use tool arguments. "
+                            "Please output exactly one valid <tool_call> JSON block with "
+                            "name=computer_use and arguments containing an action."
+                        )
                         tool_args = None
                         action = ""
+                else:
+                    parse_error_text = (
+                        "Error: missing or invalid tool call. Please output exactly one "
+                        "valid <tool_call> JSON block with name=computer_use and "
+                        "arguments containing an action."
+                    )
 
                 if tool_args is not None:
                     _log(
@@ -370,10 +381,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 )
 
                 # 5. Decide whether this turn ends the rollout.
-                is_final_turn = tool_args is None or action == "terminate" or turn >= self.max_turns
+                # Malformed/missing tool calls are model errors, so feed them
+                # back as the next user message instead of ending immediately.
+                is_final_turn = action == "terminate" or turn >= self.max_turns
 
                 # 6. Execute the tool when we have a real action to run.
-                error_text: str | None = None
+                error_text: str | None = parse_error_text
                 if tool_args is not None and action != "terminate":
                     try:
                         with simple_timer("tool_calls", metrics):
