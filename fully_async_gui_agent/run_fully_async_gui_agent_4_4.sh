@@ -90,14 +90,14 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-30}
-max_prompt_length=${max_prompt_length:-16384}
+max_prompt_length=${max_prompt_length:-10000}
 max_response_length=${max_response_length:-2048}
 actor_lr=${actor_lr:-1e-6}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-16}
+n_resp_per_prompt=${n_resp_per_prompt:-10}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-1000}
@@ -113,7 +113,7 @@ partial_rollout=${partial_rollout:-False}
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-16}
+max_concurrent_rollouts=${max_concurrent_rollouts:-30}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -129,8 +129,8 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 10))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 15))
 
 project_name=${project_name:-fully_async_gui_agent}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
@@ -163,6 +163,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.loss_agg_mode=rollout-mean-token-mean \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -181,7 +182,6 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.max_model_len=32768 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.multi_turn.enable=True \

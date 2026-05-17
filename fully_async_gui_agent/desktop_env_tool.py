@@ -205,28 +205,34 @@ def _build_tool_schema(screen_width: int, screen_height: int) -> OpenAIFunctionT
 # ---------------------------------------------------------------------------
 
 
-def _denorm_coord(coord, screen_width: int, screen_height: int) -> tuple[int, int]:
-    """Convert Qwen-VL normalized coordinates [0, 1000] to absolute pixel coordinates.
-
-    Qwen-VL outputs coordinates in the range [0, 1000] regardless of the actual
-    screen resolution. This function scales them to the real pixel space.
-    """
+def _denorm_coord(
+    coord,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> tuple[int, int]:
+    """Scale model coordinates from prompt screen space to real desktop pixels."""
     x, y = coord
-    abs_x = int(float(x) / 1000.0 * screen_width)
-    abs_y = int(float(y) / 1000.0 * screen_height)
+    abs_x = int(float(x) / float(source_width) * target_width)
+    abs_y = int(float(y) / float(source_height) * target_height)
+    abs_x = max(0, min(target_width - 1, abs_x))
+    abs_y = max(0, min(target_height - 1, abs_y))
     return abs_x, abs_y
 
 
 def _translate_action_to_pyautogui(
     parameters: dict[str, Any],
-    screen_width: int,
-    screen_height: int,
+    source_screen_width: int,
+    source_screen_height: int,
+    real_screen_width: int,
+    real_screen_height: int,
 ) -> Optional[str]:
     """Translate a Qwen-VL computer_use structured action into a pyautogui code line.
 
-    Coordinates output by Qwen-VL are normalized to [0, 1000] and are
-    denormalized to absolute pixels using ``screen_width`` / ``screen_height``
-    before being embedded in the generated pyautogui snippet.
+    Coordinates output by Qwen-VL are interpreted in the prompt screen space
+    and scaled to the real desktop pixels before being embedded in the
+    generated pyautogui snippet.
 
     Returns ``None`` for virtual actions that are handled by the agent loop
     directly (``terminate``, ``answer``) and do not map to a backend step.
@@ -238,31 +244,31 @@ def _translate_action_to_pyautogui(
         return None
 
     if action == "mouse_move":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.moveTo({x}, {y})"
 
     if action == "left_click":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.click(x={x}, y={y}, button='left')"
 
     if action == "right_click":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.click(x={x}, y={y}, button='right')"
 
     if action == "middle_click":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.click(x={x}, y={y}, button='middle')"
 
     if action == "double_click":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.doubleClick(x={x}, y={y})"
 
     if action == "triple_click":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         return f"pyautogui.tripleClick(x={x}, y={y})"
 
     if action == "left_click_drag":
-        x, y = _denorm_coord(coord, screen_width, screen_height)
+        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
         # Drag *to* the target from the current cursor position, mouse button held left.
         return f"pyautogui.dragTo({x}, {y}, button='left')"
 
@@ -377,21 +383,89 @@ class DesktopEnvTool(BaseTool):
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
         self.step_reward = float(config.get("step_reward", 0.0))
 
-        # HTTP retry config: retry timeout failures ``max_retries`` times with
-        # a fixed ``retry_interval`` seconds between attempts. Non-timeout
-        # errors fail fast because the server has already returned a result.
+        # HTTP retry config. _post itself does not catch/retry; callers decide
+        # whether an endpoint is safe to retry.
         self.max_retries = int(config.get("max_retries", 3))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
         # instance_id → {"session_id": str, "task_id": str}
-        # HTTP connections are intentionally not reused: each _post attempt
-        # creates and closes its own aiohttp.ClientSession to avoid stale
-        # connector/transport state after timeout/cancellation.
         self._instances: dict[str, dict[str, Any]] = {}
+
+        # One persistent aiohttp session per tool/process event loop. It is
+        # lazily created from the running loop, shared by all requests in this
+        # worker process, reset on transport errors, and closed when the worker
+        # has no active desktop instances.
+        self._http_session: aiohttp.ClientSession | None = None
+        self._http_session_loop: asyncio.AbstractEventLoop | None = None
+        self._http_inflight = 0
+        self._http_reset_pending = False
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        loop = asyncio.get_running_loop()
+        if self._http_reset_pending and self._http_inflight == 0:
+            await self._close_http_session()
+        if (
+            self._http_session is None
+            or self._http_session.closed
+            or self._http_session_loop is not loop
+        ):
+            await self._close_http_session()
+            connector = aiohttp.TCPConnector(
+                limit=128,
+                limit_per_host=128,
+                enable_cleanup_closed=True,
+                ttl_dns_cache=300,
+            )
+            self._http_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=self.timeout,
+            )
+            self._http_session_loop = loop
+        return self._http_session
+
+    async def _close_http_session(self) -> None:
+        self._http_reset_pending = False
+        session = self._http_session
+        self._http_session = None
+        self._http_session_loop = None
+        if session is not None and not session.closed:
+            await session.close()
+
+    async def _reset_http_session(self) -> None:
+        if self._http_inflight == 0:
+            await self._close_http_session()
+        else:
+            self._http_reset_pending = True
+
+    @staticmethod
+    def _is_retryable_transport_error(exc: BaseException) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        if isinstance(
+            exc,
+            (
+                aiohttp.ClientConnectorError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientOSError,
+                aiohttp.ClientPayloadError,
+                OSError,
+            ),
+        ):
+            return True
+        return isinstance(exc, RuntimeError) and "is used by transport" in str(exc)
+
+    @staticmethod
+    def _error_detail(exc: BaseException) -> str:
+        if isinstance(exc, aiohttp.ClientResponseError):
+            return (
+                f"status={exc.status} message={exc.message!r} "
+                f"url={exc.request_info.url if exc.request_info else '<unknown>'}"
+            )
+        return str(exc) or repr(exc)
 
     async def _post(
         self,
@@ -399,107 +473,105 @@ class DesktopEnvTool(BaseTool):
         payload: dict | None = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
     ) -> dict:
-        """POST JSON to the desktop env service and return the JSON response.
+        """POST JSON once and return the JSON response.
 
-        Each retry attempt uses a fresh aiohttp.ClientSession and closes it
-        immediately. This intentionally disables keep-alive/connection reuse so
-        timeout/cancellation cannot leave a stale connector transport around for
-        the next request.
+        This method does not catch/retry errors. Callers choose endpoint-specific
+        retry policy based on whether the operation is idempotent.
         """
         url = f"{self.api_base_url}{path}"
-        attempts = self.max_retries + 1  # initial attempt + retries
-        last_exc: Optional[BaseException] = None
-        effective_timeout = timeout if timeout is not None else self.timeout
         request_body = payload or {}
         request_id = request_body.get("request_id", "<none>")
+        effective_timeout = timeout if timeout is not None else self.timeout
 
         _log(
             f"[DesktopEnvTool] -> POST path={path} request_id={request_id} "
             f"payload={_short_repr(request_body)}"
         )
 
+        session = await self._get_http_session()
+        self._http_inflight += 1
+        try:
+            async with session.post(url, json=request_body, timeout=effective_timeout) as resp:
+                status = resp.status
+                content_type = resp.content_type
+                text_body = await resp.text()
+                if status >= 400:
+                    raise aiohttp.ClientResponseError(
+                        request_info=resp.request_info,
+                        history=resp.history,
+                        status=status,
+                        message=text_body or resp.reason or "",
+                        headers=resp.headers,
+                    )
+                if content_type == "application/json" and text_body:
+                    import json as _json
+
+                    try:
+                        data = _json.loads(text_body)
+                    except _json.JSONDecodeError as je:
+                        _log(
+                            f"[DesktopEnvTool] <- POST {url} status={status} "
+                            f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}",
+                            level="ERROR",
+                        )
+                        raise RuntimeError(f"POST {path} returned non-JSON body: {text_body!r}") from je
+                    _log(
+                        f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                        f"status={status} response={_short_repr(data)}"
+                    )
+                    return data
+                _log(
+                    f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                    f"status={status} empty body (content_type={content_type})"
+                )
+                return {}
+        finally:
+            self._http_inflight = max(0, self._http_inflight - 1)
+
+    async def _post_with_retries(
+        self,
+        path: str,
+        payload: dict | None = None,
+        timeout: Optional[aiohttp.ClientTimeout] = None,
+        *,
+        max_retries: int | None = None,
+        retry_transport: bool = True,
+    ) -> dict:
+        attempts = (self.max_retries if max_retries is None else max_retries) + 1
+        request_body = payload or {}
+        request_id = request_body.get("request_id", "<none>")
+        last_exc: BaseException | None = None
         for attempt in range(1, attempts + 1):
             try:
-                connector = aiohttp.TCPConnector(force_close=True)
-                async with aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=effective_timeout,
-                    headers={"Connection": "close"},
-                ) as session:
-                    async with session.post(url, json=request_body) as resp:
-                        status = resp.status
-                        content_type = resp.content_type
-                        # Always read the full body so we can log it (and show
-                        # it in error messages).
-                        text_body = await resp.text()
-                        if status >= 400:
-                            raise aiohttp.ClientResponseError(
-                                request_info=resp.request_info,
-                                history=resp.history,
-                                status=status,
-                                message=text_body or resp.reason or "",
-                                headers=resp.headers,
-                            )
-                        if content_type == "application/json" and text_body:
-                            import json as _json
-                            try:
-                                data = _json.loads(text_body)
-                            except _json.JSONDecodeError as je:
-                                _log(
-                                    f"[DesktopEnvTool] <- POST {url} status={status} "
-                                    f"non-JSON body (content_type={content_type}): {_short_repr(text_body)}",
-                                    level="ERROR"
-                                )
-                                raise RuntimeError(
-                                    f"POST {path} returned non-JSON body: {text_body!r}"
-                                ) from je
-                            _log(
-                                f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
-                                f"status={status} response={_short_repr(data)}"
-                            )
-                            return data
-                        # Empty body is allowed for endpoints like /close.
-                        _log(
-                            f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
-                            f"status={status} empty body (content_type={content_type})"
-                        )
-                        return {}
+                return await self._post(path, request_body, timeout=timeout)
             except Exception as exc:
                 last_exc = exc
-                # Extract as much detail as possible from the exception.
-                detail = str(exc) or repr(exc)
-                if isinstance(exc, aiohttp.ClientResponseError):
-                    detail = (
-                        f"status={exc.status} message={exc.message!r} "
-                        f"url={exc.request_info.url if exc.request_info else url}"
-                    )
-                is_timeout = isinstance(exc, TimeoutError)
-                if (not is_timeout) or attempt >= attempts:
+                retryable = retry_transport and self._is_retryable_transport_error(exc)
+                if retryable:
+                    await self._reset_http_session()
+                if (not retryable) or attempt >= attempts:
                     _log(
                         f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                        f"failed after {attempt} attempt(s): {detail} | "
+                        f"failed after {attempt} attempt(s): {self._error_detail(exc)} | "
                         f"payload={_short_repr(request_body)}",
-                        level="ERROR"
+                        level="ERROR",
                     )
-                    # Preserve stack trace via the logging framework (ERROR
-                    # is not filtered out by the default WARNING config).
                     logger.error(
                         "[DesktopEnvTool] POST %s failed after %d attempt(s)",
-                        path, attempt,
+                        path,
+                        attempt,
                         exc_info=True,
                     )
-                    break
+                    raise
                 _log(
                     f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                    f"timed out (attempt {attempt}/{attempts}): {detail}. "
+                    f"transport error (attempt {attempt}/{attempts}): {self._error_detail(exc)}. "
                     f"Retrying in {self.retry_interval:.1f}s",
-                    level="ERROR"
+                    level="ERROR",
                 )
                 await asyncio.sleep(self.retry_interval)
-
-        raise RuntimeError(
-            f"POST {path} failed: {last_exc}"
-        ) from last_exc
+        assert last_exc is not None
+        raise last_exc
 
     # ------------------------------------------------------------------
     # BaseTool interface
@@ -537,7 +609,7 @@ class DesktopEnvTool(BaseTool):
         )
 
         try:
-            resp = await self._post(
+            resp = await self._post_with_retries(
                 "/session/create",
                 {
                     "session_id": instance_id,
@@ -572,9 +644,10 @@ class DesktopEnvTool(BaseTool):
             server_session_id = locals().get("session_id", instance_id)
             if server_session_id:
                 try:
-                    await self._post(
+                    await self._post_with_retries(
                         f"/session/{server_session_id}/close",
-                        timeout=aiohttp.ClientTimeout(total=180),
+                        timeout=aiohttp.ClientTimeout(total=300),
+                        max_retries=max(self.max_retries, 5),
                     )
                 except Exception:
                     _log(
@@ -618,7 +691,7 @@ class DesktopEnvTool(BaseTool):
                 f"[DesktopEnvTool] screenshot step request_id={request_id} "
                 f"session_id={session_id}"
             )
-            resp = await self._post(
+            resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
                 {
                     "request_id": request_id,
@@ -704,13 +777,19 @@ class DesktopEnvTool(BaseTool):
                 {"action": action},
             )
 
-        code = _translate_action_to_pyautogui(parameters, self.real_screen_width, self.real_screen_height)
+        code = _translate_action_to_pyautogui(
+            parameters,
+            self.screen_width,
+            self.screen_height,
+            self.real_screen_width,
+            self.real_screen_height,
+        )
         request_id = str(uuid4())
         _log(
             f"[DesktopEnvTool] step request_id={request_id} "
             f"session_id={session_id} action={action} code={code}"
         )
-        resp = await self._post(
+        resp = await self._post_with_retries(
             f"/session/{session_id}/step",
             {"request_id": request_id, "action": code, "pause": self.pause},
         )
@@ -756,7 +835,7 @@ class DesktopEnvTool(BaseTool):
         if self.evaluate_settle_seconds > 0:
             await asyncio.sleep(self.evaluate_settle_seconds)
         try:
-            resp = await self._post(
+            resp = await self._post_with_retries(
                 f"/session/{session_id}/evaluate",
                 {"settle_seconds": self.evaluate_settle_seconds},
             )
@@ -782,7 +861,7 @@ class DesktopEnvTool(BaseTool):
 
     async def release(self, instance_id: str, **kwargs) -> None:
         """Close the session. MUST be called in a ``finally`` block."""
-        info = self._instances.pop(instance_id, None)
+        info = self._instances.get(instance_id)
         if info is None:
             _log(
                 f"[DesktopEnvTool] release: no-op for unknown "
@@ -799,9 +878,10 @@ class DesktopEnvTool(BaseTool):
             # /close synchronously waits for container recycle (destroy old +
             # boot fresh replacement) before returning, so it needs a generous
             # timeout — match /create's 180s.
-            await self._post(
+            await self._post_with_retries(
                 f"/session/{session_id}/close",
-                timeout=aiohttp.ClientTimeout(total=180),
+                timeout=aiohttp.ClientTimeout(total=300),
+                max_retries=max(self.max_retries, 5),
             )
             _log(
                 f"[DesktopEnvTool] release OK session_id={session_id} "
@@ -812,3 +892,7 @@ class DesktopEnvTool(BaseTool):
             logger.warning(
                 "Failed to close session %s", session_id, exc_info=True
             )
+        finally:
+            self._instances.pop(instance_id, None)
+            if not self._instances:
+                await self._close_http_session()

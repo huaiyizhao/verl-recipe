@@ -9,8 +9,8 @@ tools:
       api_base_url: ${oc.env:DESKTOP_API_BASE_URL,http://localhost:2354}
       screen_width: 1000   # shown to the model in the prompt (Qwen-VL normalized space)
       screen_height: 1000  # shown to the model in the prompt (Qwen-VL normalized space)
-      real_screen_width: 1920   # actual desktop resolution for coordinate denormalization
-      real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
+      real_screen_width: 1280   # actual desktop resolution for coordinate denormalization
+      real_screen_height: 720   # actual desktop resolution for coordinate denormalization
       timeout: 30
       pause: 2.0
       evaluate_settle_seconds: 10
