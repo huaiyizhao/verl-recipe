@@ -105,7 +105,11 @@ def _short_repr(obj: Any, limit: int = _MAX_LOG_BODY) -> str:
                     redacted[k] = f"<{k}: {len(v)} chars elided>"
                 elif isinstance(v, dict):
                     redacted[k] = {
-                        sk: (f"<{sk}: {len(sv)} chars elided>" if isinstance(sv, str) and len(sv) > 200 and sk in ("screenshot", "image", "a11y_tree") else sv)
+                        sk: (
+                            f"<{sk}: {len(sv)} chars elided>"
+                            if isinstance(sv, str) and len(sv) > 200 and sk in ("screenshot", "image", "a11y_tree")
+                            else sv
+                        )
                         for sk, sv in v.items()
                     }
                 else:
@@ -162,9 +166,20 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                         "* `answer`: Answer a question."
                     ),
                     "enum": [
-                        "key", "type", "mouse_move", "left_click", "left_click_drag",
-                        "right_click", "middle_click", "double_click", "triple_click",
-                        "scroll", "hscroll", "wait", "terminate", "answer",
+                        "key",
+                        "type",
+                        "mouse_move",
+                        "left_click",
+                        "left_click_drag",
+                        "right_click",
+                        "middle_click",
+                        "double_click",
+                        "triple_click",
+                        "scroll",
+                        "hscroll",
+                        "wait",
+                        "terminate",
+                        "answer",
                     ],
                     "type": "string",
                 },
@@ -408,11 +423,7 @@ class DesktopEnvTool(BaseTool):
         loop = asyncio.get_running_loop()
         if self._http_reset_pending and self._http_inflight == 0:
             await self._close_http_session()
-        if (
-            self._http_session is None
-            or self._http_session.closed
-            or self._http_session_loop is not loop
-        ):
+        if self._http_session is None or self._http_session.closed or self._http_session_loop is not loop:
             await self._close_http_session()
             connector = aiohttp.TCPConnector(
                 limit=128,
@@ -483,10 +494,7 @@ class DesktopEnvTool(BaseTool):
         request_id = request_body.get("request_id", "<none>")
         effective_timeout = timeout if timeout is not None else self.timeout
 
-        _log(
-            f"[DesktopEnvTool] -> POST path={path} request_id={request_id} "
-            f"payload={_short_repr(request_body)}"
-        )
+        _log(f"[DesktopEnvTool] -> POST path={path} request_id={request_id} payload={_short_repr(request_body)}")
 
         session = await self._get_http_session()
         self._http_inflight += 1
@@ -556,11 +564,10 @@ class DesktopEnvTool(BaseTool):
                         f"payload={_short_repr(request_body)}",
                         level="ERROR",
                     )
-                    logger.error(
+                    logger.exception(
                         "[DesktopEnvTool] POST %s failed after %d attempt(s)",
                         path,
                         attempt,
-                        exc_info=True,
                     )
                     raise
                 _log(
@@ -603,10 +610,7 @@ class DesktopEnvTool(BaseTool):
         if not task_id:
             raise ValueError("create_kwargs must contain 'task_id'")
 
-        _log(
-            f"[DesktopEnvTool] create session task_id={task_id} "
-            f"instance_id={instance_id}"
-        )
+        _log(f"[DesktopEnvTool] create session task_id={task_id} instance_id={instance_id}")
 
         try:
             resp = await self._post_with_retries(
@@ -620,9 +624,7 @@ class DesktopEnvTool(BaseTool):
             )
             session_id = resp.get("session_id")
             if not session_id:
-                raise RuntimeError(
-                    f"/session/create did not return session_id; response={resp!r}"
-                )
+                raise RuntimeError(f"/session/create did not return session_id; response={resp!r}")
             if session_id != instance_id:
                 raise RuntimeError(
                     f"/session/create returned unexpected session_id={session_id!r}; "
@@ -653,22 +655,16 @@ class DesktopEnvTool(BaseTool):
                     _log(
                         f"[DesktopEnvTool] create cleanup: failed to close orphan "
                         f"server session_id={server_session_id}",
-                        level="ERROR"
+                        level="ERROR",
                     )
             raise
 
-        _log(
-            f"[DesktopEnvTool] create session OK task_id={task_id} "
-            f"instance_id={instance_id} session_id={session_id}"
-        )
+        _log(f"[DesktopEnvTool] create session OK task_id={task_id} instance_id={instance_id} session_id={session_id}")
 
         observation = resp.get("observation") or {}
         screenshot = _decode_screenshot(observation.get("screenshot"))
         images = [screenshot] if screenshot is not None else []
-        _log(
-            f"[DesktopEnvTool] created session_id={session_id} "
-            f"has_screenshot={bool(screenshot)}"
-        )
+        _log(f"[DesktopEnvTool] created session_id={session_id} has_screenshot={bool(screenshot)}")
         return instance_id, ToolResponse(image=images)
 
     async def screenshot(self, instance_id: str) -> list:
@@ -687,10 +683,7 @@ class DesktopEnvTool(BaseTool):
         session_id = info["session_id"]
         try:
             request_id = str(uuid4())
-            _log(
-                f"[DesktopEnvTool] screenshot step request_id={request_id} "
-                f"session_id={session_id}"
-            )
+            _log(f"[DesktopEnvTool] screenshot step request_id={request_id} session_id={session_id}")
             resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
                 {
@@ -703,16 +696,11 @@ class DesktopEnvTool(BaseTool):
             screenshot = _decode_screenshot(observation.get("screenshot"))
             return [screenshot] if screenshot is not None else []
         except Exception:
-            _log(
-                f"[DesktopEnvTool] screenshot failed for session_id={session_id}",
-                level="ERROR"
-            )
+            _log(f"[DesktopEnvTool] screenshot failed for session_id={session_id}", level="ERROR")
             return []
 
     @rollout_trace_op
-    async def execute(
-        self, instance_id: str, parameters: dict[str, Any], **kwargs
-    ) -> tuple[ToolResponse, float, dict]:
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         """Execute an action on the desktop environment.
 
         Structured ``computer_use`` parameters are translated into
@@ -738,7 +726,7 @@ class DesktopEnvTool(BaseTool):
             _log(
                 f"[DesktopEnvTool] invalid action={action!r} "
                 f"session_id={session_id} (returning soft error with screenshot)",
-                level="ERROR"
+                level="ERROR",
             )
             # Attach a fresh screenshot so the agent always has visual context
             # even when the action was invalid.
@@ -750,7 +738,7 @@ class DesktopEnvTool(BaseTool):
                         f"Error: unknown action {action!r}. "
                         f"No screen state change. "
                         f"Valid computer_use actions are: {valid_list}."
-                    )
+                    ),
                 ),
                 0.0,
                 {"action": action, "invalid_action": True},
@@ -763,9 +751,7 @@ class DesktopEnvTool(BaseTool):
                 f"status={parameters.get('status', 'unknown')}"
             )
             return (
-                ToolResponse(
-                    text=f"Task terminated with status: {parameters.get('status', 'unknown')}"
-                ),
+                ToolResponse(text=f"Task terminated with status: {parameters.get('status', 'unknown')}"),
                 0.0,
                 {"action": action},
             )
@@ -784,10 +770,21 @@ class DesktopEnvTool(BaseTool):
             self.real_screen_width,
             self.real_screen_height,
         )
+        actual_coordinate: tuple[int, int] | None = None
+        raw_coordinate = parameters.get("coordinate")
+        if raw_coordinate is not None:
+            actual_coordinate = _denorm_coord(
+                raw_coordinate,
+                self.screen_width,
+                self.screen_height,
+                self.real_screen_width,
+                self.real_screen_height,
+            )
         request_id = str(uuid4())
         _log(
             f"[DesktopEnvTool] step request_id={request_id} "
-            f"session_id={session_id} action={action} code={code}"
+            f"session_id={session_id} action={action} raw_coordinate={raw_coordinate} "
+            f"actual_coordinate={actual_coordinate} code={code}"
         )
         resp = await self._post_with_retries(
             f"/session/{session_id}/step",
@@ -801,9 +798,19 @@ class DesktopEnvTool(BaseTool):
         action_summary = f"Executed action: {action}"
         if "coordinate" in parameters:
             action_summary += f" at {parameters['coordinate']}"
+            if actual_coordinate is not None:
+                action_summary += f" -> actual {list(actual_coordinate)}"
+        action_summary += f"; code: {code}"
 
         # Forward non-observation metadata (reward / done / info / step_count).
         meta = {k: v for k, v in resp.items() if k != "observation"}
+        meta["code"] = code
+        if raw_coordinate is not None:
+            meta["raw_coordinate"] = raw_coordinate
+        if actual_coordinate is not None:
+            meta["actual_coordinate"] = list(actual_coordinate)
+            meta["source_screen_size"] = [self.screen_width, self.screen_height]
+            meta["real_screen_size"] = [self.real_screen_width, self.real_screen_height]
         _log(
             f"[DesktopEnvTool] step done request_id={request_id} "
             f"session_id={session_id} action={action} "
@@ -820,18 +827,11 @@ class DesktopEnvTool(BaseTool):
         """Compute the terminal reward via ``/evaluate``."""
         info = self._instances.get(instance_id)
         if info is None:
-            _log(
-                f"[DesktopEnvTool] calc_reward: unknown instance_id={instance_id} "
-                f"(already released?)",
-                level="ERROR"
-            )
+            _log(f"[DesktopEnvTool] calc_reward: unknown instance_id={instance_id} (already released?)", level="ERROR")
             return 0.0
         session_id = info["session_id"]
 
-        _log(
-            f"[DesktopEnvTool] evaluate session_id={session_id} "
-            f"settle={self.evaluate_settle_seconds}s"
-        )
+        _log(f"[DesktopEnvTool] evaluate session_id={session_id} settle={self.evaluate_settle_seconds}s")
         if self.evaluate_settle_seconds > 0:
             await asyncio.sleep(self.evaluate_settle_seconds)
         try:
@@ -853,7 +853,7 @@ class DesktopEnvTool(BaseTool):
             _log(
                 f"[DesktopEnvTool] evaluate session_id={session_id} "
                 f"returned non-numeric reward: {resp.get('reward')!r}",
-                level="ERROR"
+                level="ERROR",
             )
             return 0.0
         _log(f"[DesktopEnvTool] evaluate session_id={session_id} reward={reward:.4f}")
@@ -866,13 +866,12 @@ class DesktopEnvTool(BaseTool):
             _log(
                 f"[DesktopEnvTool] release: no-op for unknown "
                 f"instance_id={instance_id} (already released or never registered)",
-                level="ERROR"
+                level="ERROR",
             )
             return
         session_id = info["session_id"]
         _log(
-            f"[DesktopEnvTool] release session_id={session_id} "
-            f"task_id={info.get('task_id')} instance_id={instance_id}"
+            f"[DesktopEnvTool] release session_id={session_id} task_id={info.get('task_id')} instance_id={instance_id}"
         )
         try:
             # /close synchronously waits for container recycle (destroy old +
@@ -883,15 +882,10 @@ class DesktopEnvTool(BaseTool):
                 timeout=aiohttp.ClientTimeout(total=300),
                 max_retries=max(self.max_retries, 5),
             )
-            _log(
-                f"[DesktopEnvTool] release OK session_id={session_id} "
-                f"instance_id={instance_id}"
-            )
+            _log(f"[DesktopEnvTool] release OK session_id={session_id} instance_id={instance_id}")
         except Exception:
             _log(f"[DesktopEnvTool] Failed to close session {session_id}", level="ERROR")
-            logger.warning(
-                "Failed to close session %s", session_id, exc_info=True
-            )
+            logger.warning("Failed to close session %s", session_id, exc_info=True)
         finally:
             self._instances.pop(instance_id, None)
             if not self._instances:
