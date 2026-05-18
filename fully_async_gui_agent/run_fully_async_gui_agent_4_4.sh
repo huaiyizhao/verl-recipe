@@ -117,7 +117,9 @@ max_concurrent_rollouts=${max_concurrent_rollouts:-30}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
-actor_offload=${actor_offload:-False}
+actor_param_offload=${actor_param_offload:-False}
+actor_optimizer_offload=${actor_optimizer_offload:-True}
+actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-True}
 # H200 140GB: fsdp_size=4 (4-way sharding within each node).
 # Per-GPU: actor 4GB + optimizer 24GB + ref 4GB + activation ~25GB ≈ 57GB, fits 140GB.
@@ -129,7 +131,7 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 6))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 4))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 8))
 
 project_name=${project_name:-fully_async_gui_agent}
@@ -161,8 +163,9 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
-    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
+    actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=rollout-mean-token-mean \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
