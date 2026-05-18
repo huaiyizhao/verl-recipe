@@ -129,8 +129,8 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 10))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 15))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 6))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 8))
 
 project_name=${project_name:-fully_async_gui_agent}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}

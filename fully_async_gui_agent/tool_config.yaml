@@ -12,6 +12,9 @@ tools:
       real_screen_width: 1920   # actual desktop resolution for coordinate denormalization
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
       timeout: 30
+      http_keepalive_timeout: 30  # keep idle TCP connections within one rollout for up to 30s
+      http_session_max_age: 0     # 0 disables age-based ClientSession reset; release closes it
+      http_force_close: false     # keep ClientSession/TCP pooling enabled within a rollout
       pause: 2.0
       evaluate_settle_seconds: 10
       step_reward: 0.0

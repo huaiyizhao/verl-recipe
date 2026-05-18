@@ -375,6 +375,12 @@ class DesktopEnvTool(BaseTool):
             ``/evaluate`` when computing the terminal reward (default 20).
         step_reward (float): Per-step reward returned by ``execute()``
             (default 0.0).
+        http_keepalive_timeout (float): Seconds to keep idle TCP connections
+            in the aiohttp connector pool (default 30.0).
+        http_session_max_age (float): Maximum age of the aiohttp ClientSession
+            in seconds. ``0`` disables age-based reset (default 0.0).
+        http_force_close (bool): If true, close TCP connections after every
+            request while still reusing the ClientSession object (default False).
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -403,15 +409,23 @@ class DesktopEnvTool(BaseTool):
         self.max_retries = int(config.get("max_retries", 3))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
+        # HTTP connection-pool config. By default, one rollout keeps one
+        # ClientSession alive until release(), while idle TCP connections are
+        # allowed to expire from the connector pool.
+        self.http_keepalive_timeout = float(config.get("http_keepalive_timeout", 30.0))
+        self.http_session_max_age = float(config.get("http_session_max_age", 0.0))
+        self.http_force_close = bool(config.get("http_force_close", False))
+
         # instance_id → {"session_id": str, "task_id": str}
         self._instances: dict[str, dict[str, Any]] = {}
 
-        # One persistent aiohttp session per tool/process event loop. It is
-        # lazily created from the running loop, shared by all requests in this
-        # worker process, reset on transport errors, and closed when the worker
-        # has no active desktop instances.
+        # One persistent aiohttp session per DesktopEnvTool/rollout event loop.
+        # It is lazily created from the running loop, reused by create/step/eval
+        # /close within the rollout, reset on transport errors, and closed by
+        # release().
         self._http_session: aiohttp.ClientSession | None = None
         self._http_session_loop: asyncio.AbstractEventLoop | None = None
+        self._http_session_created_at = 0.0
         self._http_inflight = 0
         self._http_reset_pending = False
 
@@ -421,21 +435,39 @@ class DesktopEnvTool(BaseTool):
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         loop = asyncio.get_running_loop()
-        if self._http_reset_pending and self._http_inflight == 0:
+        now = time.monotonic()
+        session_expired = (
+            self._http_session is not None
+            and self.http_session_max_age > 0
+            and now - self._http_session_created_at > self.http_session_max_age
+            and self._http_inflight == 0
+        )
+        if (self._http_reset_pending or session_expired) and self._http_inflight == 0:
             await self._close_http_session()
         if self._http_session is None or self._http_session.closed or self._http_session_loop is not loop:
             await self._close_http_session()
-            connector = aiohttp.TCPConnector(
-                limit=128,
-                limit_per_host=128,
-                enable_cleanup_closed=True,
-                ttl_dns_cache=300,
-            )
+            connector_kwargs: dict[str, Any] = {
+                "limit": 128,
+                "limit_per_host": 128,
+                "enable_cleanup_closed": True,
+                "ttl_dns_cache": 300,
+            }
+            if self.http_force_close:
+                connector_kwargs["force_close"] = True
+            else:
+                connector_kwargs["keepalive_timeout"] = self.http_keepalive_timeout
+            connector = aiohttp.TCPConnector(**connector_kwargs)
             self._http_session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=self.timeout,
             )
             self._http_session_loop = loop
+            self._http_session_created_at = now
+            _log(
+                f"[DesktopEnvTool] HTTP session created keepalive_timeout={self.http_keepalive_timeout} "
+                f"max_age={self.http_session_max_age} force_close={self.http_force_close}",
+                debug=True,
+            )
         return self._http_session
 
     async def _close_http_session(self) -> None:
@@ -443,6 +475,7 @@ class DesktopEnvTool(BaseTool):
         session = self._http_session
         self._http_session = None
         self._http_session_loop = None
+        self._http_session_created_at = 0.0
         if session is not None and not session.closed:
             await session.close()
 
