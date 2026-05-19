@@ -15,6 +15,9 @@ env_vars:
   PYTHONPATH: .
   # Needed by Ray workers on all nodes
   DESKTOP_API_BASE_URL: "http://10.192.64.238:2354"
+  # Ray enables uvloop by default when the package is installed. Disable it to
+  # avoid uvloop/aiohttp fd ownership bugs under timeout/retry-heavy rollouts.
+  RAY_USE_UVLOOP: "0"
   VLLM_USE_V1: "1"
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
   WANDB_API_KEY: "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"

@@ -42,6 +42,9 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 export HYDRA_FULL_ERROR=1
 # export VERL_LOGGING_LEVEL=DEBUG
 export WANDB_API_KEY=${WANDB_API_KEY:-}
+# Ray defaults to uvloop when installed; disable it before Ray workers start to
+# avoid uvloop/aiohttp fd ownership bugs under timeout/retry-heavy rollouts.
+export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 
 # ================= data / model =================

@@ -40,6 +40,7 @@ import base64
 import copy
 import io
 import logging
+import math
 import os
 import sys
 import time
@@ -335,6 +336,63 @@ _VALID_COMPUTER_USE_ACTIONS: tuple[str, ...] = (
     "terminate",
     "answer",
 )
+_COORD_ACTIONS = {
+    "mouse_move",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "left_click_drag",
+}
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _validate_coordinate(coord: Any) -> str | None:
+    if not isinstance(coord, list | tuple) or len(coord) != 2:
+        return "coordinate must be an array [x, y] with two numbers"
+    if not all(_is_finite_number(value) for value in coord):
+        return "coordinate must be an array [x, y] with two finite numbers"
+    return None
+
+
+def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
+    action = parameters.get("action")
+    if not isinstance(action, str) or not action:
+        return "action must be a non-empty string"
+
+    if action not in _VALID_COMPUTER_USE_ACTIONS:
+        valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
+        return f"unknown action {action!r}. Valid computer_use actions are: {valid_list}"
+
+    if action in _COORD_ACTIONS:
+        if error := _validate_coordinate(parameters.get("coordinate")):
+            return f"action {action!r} requires {error}"
+    elif action == "type":
+        if "text" not in parameters or not isinstance(parameters.get("text"), str):
+            return "action 'type' requires text as a string"
+    elif action == "key":
+        keys = parameters.get("keys")
+        if not isinstance(keys, list) or not keys or not all(isinstance(key, str) and key for key in keys):
+            return "action 'key' requires keys as a non-empty array of non-empty strings"
+    elif action in {"scroll", "hscroll"}:
+        if "pixels" not in parameters or not _is_finite_number(parameters.get("pixels")):
+            return f"action {action!r} requires pixels as a finite number"
+    elif action == "wait":
+        wait_time = parameters.get("time")
+        if "time" not in parameters or not _is_finite_number(wait_time) or float(wait_time) < 0:
+            return "action 'wait' requires time as a non-negative finite number"
+    elif action == "answer":
+        if "text" not in parameters or not isinstance(parameters.get("text"), str):
+            return "action 'answer' requires text as a string"
+    elif action == "terminate":
+        if parameters.get("status") not in {"success", "failure"}:
+            return "action 'terminate' requires status to be either 'success' or 'failure'"
+
+    return None
 
 
 def _decode_screenshot(b64_png: Optional[str]) -> Optional[Image.Image]:
@@ -400,6 +458,7 @@ class DesktopEnvTool(BaseTool):
         self.real_screen_width = int(config.get("real_screen_width", screen_width))
         self.real_screen_height = int(config.get("real_screen_height", screen_height))
         self.timeout = aiohttp.ClientTimeout(total=config.get("timeout", 30))
+        self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 300))
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
         self.step_reward = float(config.get("step_reward", 0.0))
@@ -653,7 +712,7 @@ class DesktopEnvTool(BaseTool):
                     "task_id": task_id,
                     "require_a11y_tree": False,
                 },
-                timeout=aiohttp.ClientTimeout(total=300),
+                timeout=self.create_timeout,
             )
             session_id = resp.get("session_id")
             if not session_id:
@@ -747,34 +806,24 @@ class DesktopEnvTool(BaseTool):
 
         action = parameters.get("action", "")
 
-        # Reject unknown actions with a structured tool response instead of
-        # raising. Aborting the rollout here was the root cause of many
-        # cold-start training failures where the untrained model kept
-        # emitting schema-invalid action names (``click``, ``press``, ...),
-        # causing the entire rollout to be discarded and the batch to be
-        # empty. Returning a descriptive error lets the agent learn the
-        # valid action vocabulary through tool feedback.
-        if action not in _VALID_COMPUTER_USE_ACTIONS:
-            valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
+        # Reject schema/format-invalid actions with a structured tool response
+        # instead of raising. No backend call is needed because the screen state
+        # has not changed; the next turn will reuse the previous screenshot.
+        if validation_error := _validate_action_parameters(parameters):
             _log(
-                f"[DesktopEnvTool] invalid action={action!r} "
-                f"session_id={session_id} (returning soft error with screenshot)",
+                f"[DesktopEnvTool] invalid action parameters action={action!r} "
+                f"session_id={session_id}: {validation_error}",
                 level="ERROR",
             )
-            # Attach a fresh screenshot so the agent always has visual context
-            # even when the action was invalid.
-            images = await self.screenshot(instance_id)
             return (
                 ToolResponse(
-                    image=images,
                     text=(
-                        f"Error: unknown action {action!r}. "
-                        f"No screen state change. "
-                        f"Valid computer_use actions are: {valid_list}."
+                        f"Error: invalid computer_use action arguments: {validation_error}. "
+                        f"No screen state change. Please output a valid computer_use action."
                     ),
                 ),
                 0.0,
-                {"action": action, "invalid_action": True},
+                {"action": action, "invalid_action": True, "invalid_action_error": validation_error},
             )
 
         # Virtual actions that the agent loop handles directly.

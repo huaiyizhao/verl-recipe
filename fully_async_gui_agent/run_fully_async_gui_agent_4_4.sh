@@ -46,6 +46,9 @@ ulimit -c unlimited || true
 # WandB / Weave config. Set WANDB_API_KEY externally; optionally WANDB_BASE_URL
 # for on-prem wandb. WEAVE_PROJECT defaults to the verl project_name.
 export WANDB_API_KEY=${WANDB_API_KEY:-}
+# Ray defaults to uvloop when installed; disable it before Ray workers start to
+# avoid uvloop/aiohttp fd ownership bugs under timeout/retry-heavy rollouts.
+export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 # Reduce memory fragmentation (helps with the 27GB reserved-but-unallocated).
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 # ================= paths =================
