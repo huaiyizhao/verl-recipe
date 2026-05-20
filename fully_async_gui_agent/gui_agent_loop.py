@@ -283,14 +283,19 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     images=image_data if image_data else None,
                 )
                 original_prompt_len = len(prompt_ids)
-                truncated = False
-                if len(prompt_ids) > self.prompt_length:
-                    prompt_ids = prompt_ids[-self.prompt_length :]
-                    truncated = True
+                image_count = len(image_data) if image_data else 0
+                if original_prompt_len > self.prompt_length:
+                    _log(
+                        f"{log_tag}[turn={turn}] [OVERLONG_PROMPT] "
+                        f"prompt_ids={original_prompt_len} > max_prompt_length={self.prompt_length}, "
+                        f"images={image_count}. Discarding rollout.",
+                        level="ERROR",
+                    )
+                    return None
                 _log(
                     f"{log_tag}[turn={turn}] prompt_ids={len(prompt_ids)} "
-                    f"(orig={original_prompt_len}, truncated={truncated}), "
-                    f"images={len(image_data) if image_data else 0}",
+                    f"(orig={original_prompt_len}, truncated=False), "
+                    f"images={image_count}",
                     debug=True,
                 )
 
