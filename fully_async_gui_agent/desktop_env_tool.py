@@ -228,10 +228,12 @@ def _denorm_coord(
     target_width: int,
     target_height: int,
 ) -> tuple[int, int]:
-    """Scale model coordinates from prompt screen space to real desktop pixels."""
+    """Scale model coordinates from a 0..(source-1) grid to real desktop pixels."""
     x, y = coord
-    abs_x = int(float(x) / float(source_width) * target_width)
-    abs_y = int(float(y) / float(source_height) * target_height)
+    source_x_max = max(1, source_width - 1)
+    source_y_max = max(1, source_height - 1)
+    abs_x = int(float(x) / float(source_x_max) * target_width)
+    abs_y = int(float(y) / float(source_y_max) * target_height)
     abs_x = max(0, min(target_width - 1, abs_x))
     abs_y = max(0, min(target_height - 1, abs_y))
     return abs_x, abs_y
