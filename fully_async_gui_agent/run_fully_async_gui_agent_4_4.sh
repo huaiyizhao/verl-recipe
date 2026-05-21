@@ -100,23 +100,23 @@ actor_lr=${actor_lr:-1e-6}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-10}
+n_resp_per_prompt=${n_resp_per_prompt:-8}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
-total_rollout_steps=${total_rollout_steps:-1000}
-total_epochs=200
+total_rollout_steps=${total_rollout_steps:-10000}
+total_epochs=100
 test_freq=-1  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-0}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-1}
+staleness_threshold=${staleness_threshold:-1}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-False}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-30}
+max_concurrent_rollouts=${max_concurrent_rollouts:-24}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
