@@ -93,8 +93,8 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-30}
-max_prompt_length=${max_prompt_length:-10000}
-max_response_length=${max_response_length:-2048}
+max_prompt_length=${max_prompt_length:-16384}
+max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-1e-6}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
