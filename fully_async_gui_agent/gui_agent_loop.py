@@ -340,40 +340,46 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     "extra_fields": extra_fields,
                 }
 
-                # 4. Parse tool call.
+                # 4. Parse tool calls. A single model response may contain
+                # multiple computer_use calls; execute them sequentially below.
                 tool_schemas_all = [tool.tool_schema for tool in self.tools.values()]
                 _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids, tool_schemas_all)
 
-                tool_args: dict[str, Any] | None = None
-                action: str = ""
+                tool_args_list: list[dict[str, Any]] = []
+                actions: list[str] = []
                 parse_error_text: str | None = None
                 if tool_calls:
-                    try:
-                        tool_args = json.loads(tool_calls[0].arguments)
-                        action = tool_args.get("action", "")
-                    except Exception as parse_exc:
-                        _log(
-                            f"{log_tag}[turn={turn}] Failed to parse tool arguments: "
-                            f"{tool_calls[0]} (error: {parse_exc!r})"
-                        )
-                        parse_error_text = (
-                            "Error: failed to parse the computer_use tool arguments. "
-                            "Please output exactly one valid <tool_call> JSON block with "
-                            "name=computer_use and arguments containing an action."
-                        )
-                        tool_args = None
-                        action = ""
-                else:
-                    parse_error_text = (
-                        "Error: missing or invalid tool call. Please output exactly one "
-                        "valid <tool_call> JSON block with name=computer_use and "
-                        "arguments containing an action."
+                    for tool_call_idx, tool_call in enumerate(tool_calls, start=1):
+                        try:
+                            parsed_args = json.loads(tool_call.arguments)
+                            if not isinstance(parsed_args, dict):
+                                raise ValueError("tool arguments must be a JSON object")
+                            action_name = parsed_args.get("action", "")
+                            if not action_name:
+                                _log(
+                                    f"{log_tag}[turn={turn}] Tool call has no action; "
+                                    f"skipping tool_call_index={tool_call_idx}: {tool_call}"
+                                )
+                                continue
+                            tool_args_list.append(parsed_args)
+                            actions.append(action_name)
+                        except Exception as parse_exc:
+                            _log(
+                                f"{log_tag}[turn={turn}] Failed to parse tool arguments; "
+                                f"skipping tool_call_index={tool_call_idx}: {tool_call} "
+                                f"(error: {parse_exc!r})"
+                            )
+                if not tool_args_list:
+                    _log(
+                        f"{log_tag}[turn={turn}] No valid tool call/action parsed; "
+                        "continuing without environment step",
+                        debug=True,
                     )
 
-                if tool_args is not None:
+                if tool_args_list:
                     _log(
-                        f"{log_tag}[turn={turn}] Tool call: action={action}, "
-                        f"args={ {k: v for k, v in tool_args.items() if k != 'action'} }"
+                        f"{log_tag}[turn={turn}] Tool calls: "
+                        f"{[(args.get('action', ''), {k: v for k, v in args.items() if k != 'action'}) for args in tool_args_list]}"
                     )
 
                 # Decode assistant text and extract low_level_instruction.
@@ -382,23 +388,41 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     lambda ids=response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
                 )
                 low_level_instruction = self._extract_low_level_instruction(
-                    assistant_text, fallback_action=action or None
+                    assistant_text, fallback_action=actions[0] if actions else None
                 )
 
                 # 5. Decide whether this turn ends the rollout.
-                # Malformed/missing tool calls are model errors, so feed them
-                # back as the next user message instead of ending immediately.
-                is_final_turn = action == "terminate" or turn >= self.max_turns
+                # Missing or malformed tool calls match eval behavior: no
+                # environment step, no explicit error feedback, continue.
+                is_final_turn = turn >= self.max_turns
+                terminated_by_model = False
+                backend_done = False
 
-                # 6. Execute the tool when we have a real action to run.
+                # 6. Execute parsed tool calls sequentially.
                 error_text: str | None = parse_error_text
-                if tool_args is not None and action != "terminate":
+                tool_response = None
+                for tool_call_idx, tool_args in enumerate(tool_args_list, start=1):
+                    action = tool_args.get("action", "")
+                    if action == "terminate":
+                        terminated_by_model = True
+                        is_final_turn = True
+                        _log(
+                            f"{log_tag}[turn={turn}] Model requested terminate "
+                            f"at tool_call_index={tool_call_idx}"
+                        )
+                        break
+
                     try:
                         with simple_timer("tool_calls", metrics):
                             tool_response, _, tool_info = await self.desktop_tool.execute(instance_id, tool_args)
                         consecutive_tool_failures = 0
                         if tool_info.get("invalid_action") and tool_response.text:
                             error_text = tool_response.text
+                            break
+                        if tool_info.get("done"):
+                            backend_done = True
+                            is_final_turn = True
+                            break
                     except Exception as exec_exc:
                         consecutive_tool_failures += 1
                         _log(
@@ -412,7 +436,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             f"[GUIAgentLoop][SOFT_ERROR][tool_execute] "
                             f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                             f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                            f"turn={turn} action={action} err={exec_exc!r} "
+                            f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r} "
                             f"streak={consecutive_tool_failures}/"
                             f"{max_consecutive_tool_failures}",
                             level="ERROR",
@@ -423,7 +447,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                                 f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
                                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                                 f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                                f"turn={turn} action={action} err={exec_exc!r}",
+                                f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r}",
                                 level="ERROR",
                             )
                             fatal_error = True
@@ -442,21 +466,24 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             ),
                         )
                         error_text = tool_response.text
+                        break
                     else:
                         _log(
                             f"{log_tag}[turn={turn}] Tool executed OK: "
-                            f"got_image={bool(tool_response and tool_response.image)}",
+                            f"tool_call_index={tool_call_idx}/{len(tool_args_list)} "
+                            f"action={action} got_image={bool(tool_response and tool_response.image)}",
                             debug=True,
                         )
-                else:
-                    tool_response = None
+
+                if fatal_error:
+                    break
 
                 # 7. If this turn is the final one, record it and exit.
                 if is_final_turn:
-                    if tool_args is None:
-                        stop_reason = "no_tool_call"
-                    elif action == "terminate":
+                    if terminated_by_model:
                         stop_reason = "model_terminate"
+                    elif backend_done:
+                        stop_reason = "env_done"
                     else:
                         stop_reason = "max_turns"
                     _log(f"{log_tag}[turn={turn}] Rollout ends: reason={stop_reason}")

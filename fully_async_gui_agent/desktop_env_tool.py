@@ -311,8 +311,7 @@ def _translate_action_to_pyautogui(
         return f"pyautogui.hscroll({pixels})"
 
     if action == "wait":
-        seconds = float(parameters.get("time", 0) or 0)
-        return f"import time; time.sleep({seconds})"
+        return "WAIT"
 
     raise ValueError(f"Unknown computer_use action: {action!r}")
 
@@ -385,8 +384,8 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
             return f"action {action!r} requires pixels as a finite number"
     elif action == "wait":
         wait_time = parameters.get("time")
-        if "time" not in parameters or not _is_finite_number(wait_time) or float(wait_time) < 0:
-            return "action 'wait' requires time as a non-negative finite number"
+        if wait_time is not None and (not _is_finite_number(wait_time) or float(wait_time) < 0):
+            return "action 'wait' time must be a non-negative finite number when provided"
     elif action == "answer":
         if "text" not in parameters or not isinstance(parameters.get("text"), str):
             return "action 'answer' requires text as a string"
@@ -864,15 +863,16 @@ class DesktopEnvTool(BaseTool):
                 self.real_screen_width,
                 self.real_screen_height,
             )
+        pause = float(parameters.get("time", self.pause)) if action == "wait" else self.pause
         request_id = str(uuid4())
         _log(
             f"[DesktopEnvTool] step request_id={request_id} "
             f"session_id={session_id} action={action} raw_coordinate={raw_coordinate} "
-            f"actual_coordinate={actual_coordinate} code={code}"
+            f"actual_coordinate={actual_coordinate} code={code} pause={pause}"
         )
         resp = await self._post_with_retries(
             f"/session/{session_id}/step",
-            {"request_id": request_id, "action": code, "pause": self.pause},
+            {"request_id": request_id, "action": code, "pause": pause},
         )
 
         observation = resp.get("observation") or {}
