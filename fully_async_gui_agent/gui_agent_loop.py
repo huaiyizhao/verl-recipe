@@ -371,8 +371,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                                     f"skipping tool_call_index={tool_call_idx}: {tool_call}"
                                 )
                                 continue
-                            tool_args_list.append(parsed_args)
-                            actions.append(action_name)
+                            if action_name == "scroll" and "coordinate" in parsed_args:
+                                scroll_args = dict(parsed_args)
+                                coordinate = scroll_args.pop("coordinate")
+                                tool_args_list.append({"action": "mouse_move", "coordinate": coordinate})
+                                actions.append("mouse_move")
+                                tool_args_list.append(scroll_args)
+                                actions.append(action_name)
+                            else:
+                                tool_args_list.append(parsed_args)
+                                actions.append(action_name)
                         except Exception as parse_exc:
                             _log(
                                 f"{log_tag}[turn={turn}] Failed to parse tool arguments; "
