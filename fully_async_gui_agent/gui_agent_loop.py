@@ -313,6 +313,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     debug=True,
                 )
 
+                if len(output.token_ids) == 0:
+                    error_msg = (
+                        f"{log_tag}[turn={turn}] Empty LLM response in rollout: "
+                        f"prompt_ids={len(prompt_ids)}, images={image_count}, "
+                        f"response_length={self.response_length}, stop_reason={output.stop_reason!r}, "
+                        f"num_preempted={output.num_preempted}, extra_fields={output.extra_fields}"
+                    )
+                    _log(f"[GUIAgentLoop][EMPTY_RESPONSE] {error_msg}", level="ERROR")
+                    raise RuntimeError(error_msg)
+
                 if metrics.get("num_preempted") is None:
                     metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
                 else:
