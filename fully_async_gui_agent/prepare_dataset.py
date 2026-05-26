@@ -39,6 +39,15 @@ Single-domain smoke dataset::
         --limit 20 \\
         --train-ratio 0.8 \\
         --output-dir /tmp/cua_smoke
+
+Stable task-file dataset::
+
+    uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
+        --api-base-url http://10.192.64.33:2354 \\
+        --output-dir /tmp/cua_stable
+
+By default, ``--task-file`` is ``test_stable.json``; the rl server resolves it
+under its configured task examples directory.
 """
 
 from __future__ import annotations
@@ -51,6 +60,9 @@ import sys
 import urllib.parse
 import urllib.request
 from typing import Any
+
+
+DEFAULT_TASK_FILE = "test_stable.json"
 
 
 # Default system prompt used when no ``--system-prompt`` is passed.
@@ -159,10 +171,15 @@ Rules:
 # ---------------------------------------------------------------------------
 
 
-def fetch_tasks(api_base_url: str, domain: str | None, timeout: int) -> list[dict[str, Any]]:
+def fetch_tasks(api_base_url: str, domain: str | None, task_file: str | None, timeout: int) -> list[dict[str, Any]]:
     url = api_base_url.rstrip("/") + "/tasks"
+    params = {}
     if domain:
-        url += "?" + urllib.parse.urlencode({"domain": domain})
+        params["domain"] = domain
+    if task_file:
+        params["task_file"] = task_file
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
 
     print(f"[prepare_dataset] GET {url}")
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -228,9 +245,8 @@ def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str,
     ]
 
     # ``create_kwargs`` forwarded to ``DesktopEnvTool.create()``. ``task_id``
-    # is the only field consumed by the current HTTP desktop service; extra
-    # knobs (``keep_last_k_images``) are read by the agent loop / context
-    # strategy.
+    # uniquely selects the task. Extra knobs (``keep_last_k_images``) are read
+    # by the agent loop / context strategy.
     create_kwargs = {
         "task_id": task_id,
         "keep_last_k_images": 3,
@@ -318,8 +334,16 @@ def parse_args() -> argparse.Namespace:
         help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://10.192.64.238:2354).",
     )
     parser.add_argument("--domain", default=None, help="Filter tasks by domain (chrome/gimp/...).")
+    parser.add_argument(
+        "--task-file",
+        default=DEFAULT_TASK_FILE,
+        help=(
+            "Local task subset JSON path or file:// URL passed to the desktop service /tasks API "
+            f"(default: {DEFAULT_TASK_FILE})."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=0, help="Keep only the first N tasks (after filter). 0 = all.")
-    parser.add_argument("--train-ratio", type=float, default=0.9, help="Fraction of tasks for train split (default 0.9).")
+    parser.add_argument("--train-ratio", type=float, default=0.95, help="Fraction of tasks for train split (default 0.9).")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed.")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
     parser.add_argument(
@@ -344,7 +368,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    tasks = fetch_tasks(args.api_base_url, args.domain, args.timeout)
+    tasks = fetch_tasks(args.api_base_url, args.domain, args.task_file, args.timeout)
     if not tasks:
         print("[prepare_dataset] ERROR: /tasks returned zero tasks", file=sys.stderr)
         return 1

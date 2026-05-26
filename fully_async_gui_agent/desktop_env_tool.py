@@ -706,13 +706,14 @@ class DesktopEnvTool(BaseTool):
         _log(f"[DesktopEnvTool] create session task_id={task_id} instance_id={instance_id}")
 
         try:
+            payload = {
+                "session_id": instance_id,
+                "task_id": task_id,
+                "require_a11y_tree": False,
+            }
             resp = await self._post_with_retries(
                 "/session/create",
-                {
-                    "session_id": instance_id,
-                    "task_id": task_id,
-                    "require_a11y_tree": False,
-                },
+                payload,
                 timeout=self.create_timeout,
             )
             session_id = resp.get("session_id")
@@ -829,14 +830,31 @@ class DesktopEnvTool(BaseTool):
 
         # Virtual actions that the agent loop handles directly.
         if action == "terminate":
+            status = parameters.get("status")
+            code = "FAIL" if status == "failure" else "DONE"
+            request_id = str(uuid4())
             _log(
-                f"[DesktopEnvTool] virtual action=terminate session_id={session_id} "
-                f"status={parameters.get('status', 'unknown')}"
+                f"[DesktopEnvTool] terminate step request_id={request_id} "
+                f"session_id={session_id} status={status} code={code}"
+            )
+            resp = await self._post_with_retries(
+                f"/session/{session_id}/step",
+                {"request_id": request_id, "action": code, "pause": self.pause},
+            )
+            observation = resp.get("observation") or {}
+            screenshot = _decode_screenshot(observation.get("screenshot"))
+            images = [screenshot] if screenshot is not None else []
+            meta = {k: v for k, v in resp.items() if k != "observation"}
+            meta["code"] = code
+            _log(
+                f"[DesktopEnvTool] terminate step done request_id={request_id} "
+                f"session_id={session_id} status={status} done={meta.get('done')} "
+                f"step_count={meta.get('step_count')}"
             )
             return (
-                ToolResponse(text=f"Task terminated with status: {parameters.get('status', 'unknown')}"),
-                0.0,
-                {"action": action},
+                ToolResponse(image=images, text=f"Task terminated with status: {status}; code: {code}"),
+                self.step_reward,
+                {"action": action, **meta},
             )
         if action == "answer":
             _log(f"[DesktopEnvTool] virtual action=answer session_id={session_id}")

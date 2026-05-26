@@ -421,14 +421,6 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 tool_response = None
                 for tool_call_idx, tool_args in enumerate(tool_args_list, start=1):
                     action = tool_args.get("action", "")
-                    if action == "terminate":
-                        terminated_by_model = True
-                        is_final_turn = True
-                        _log(
-                            f"{log_tag}[turn={turn}] Model requested terminate "
-                            f"at tool_call_index={tool_call_idx}"
-                        )
-                        break
 
                     try:
                         with simple_timer("tool_calls", metrics):
@@ -436,6 +428,15 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         consecutive_tool_failures = 0
                         if tool_info.get("invalid_action") and tool_response.text:
                             error_text = tool_response.text
+                            break
+                        if action == "terminate":
+                            terminated_by_model = True
+                            is_final_turn = True
+                            _log(
+                                f"{log_tag}[turn={turn}] Model requested terminate "
+                                f"at tool_call_index={tool_call_idx}; "
+                                f"sent OSWorld step={tool_info.get('code')}"
+                            )
                             break
                         if tool_info.get("done"):
                             backend_done = True

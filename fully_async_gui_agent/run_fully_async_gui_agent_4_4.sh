@@ -72,7 +72,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525d-8b-general-osworld-plus-new/v0-20260525-155027/checkpoint-810-merged"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -93,30 +93,42 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-30}
-max_prompt_length=${max_prompt_length:-16384}
-max_response_length=${max_response_length:-4096}
+max_prompt_length=${max_prompt_length:-24576}
+max_response_length=${max_response_length:-8192}
 actor_lr=${actor_lr:-1e-6}
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.28}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-5}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
+n_resp_per_prompt=${n_resp_per_prompt:-8}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
 require_batches=${require_batches:-1}
-total_rollout_steps=${total_rollout_steps:-10000}
-total_epochs=100
-test_freq=-1  # disabled: validation competes for desktop-env containers
+total_rollout_steps=${total_rollout_steps:-100000}
+total_epochs=100000
+test_freq=-20  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-1}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
-partial_rollout=${partial_rollout:-False}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
+partial_rollout=${partial_rollout:-True}
+
+# Rollout correction preset: RolloutCorrectionConfig.bypass_ppo_clip_geo_rs().
+rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
+rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
+rollout_correction_is=${rollout_correction_is:-null}
+rollout_correction_rs=${rollout_correction_rs:-seq_mean_k1}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.999_1.001}
+
+# Entropy is computed for logging only; keep entropy_coeff=0 to avoid changing the objective.
+calculate_entropy=${calculate_entropy:-True}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-20}
+max_concurrent_rollouts=${max_concurrent_rollouts:-16}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -173,7 +185,10 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.use_rollout_log_probs=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
@@ -198,6 +213,11 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     algorithm.use_kl_in_reward=False \
+    algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
+    algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
+    algorithm.rollout_correction.rollout_is=${rollout_correction_is} \
+    algorithm.rollout_correction.rollout_rs=${rollout_correction_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
