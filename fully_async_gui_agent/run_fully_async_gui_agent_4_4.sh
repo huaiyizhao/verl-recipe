@@ -149,7 +149,7 @@ fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=48000
 infer_ppo_max_token_len=96000
 
-project_name=${project_name:-fully_async_gui_agent}
+project_name=${project_name:-fully_async_gui_agent_0526}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
 
 # ================= launch =================
