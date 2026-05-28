@@ -130,8 +130,8 @@ case "${rollout_correction_bypass_mode}" in
         ;;
 esac
 
-# Entropy is logging-only because entropy_coeff=0. Keep it off by default for
-# 32B training; entropy-from-logits can add several GiB of peak memory.
+# Entropy is logging-only because entropy_coeff=0. The local FSDP engine computes
+# it under no_grad in this case, so CE can still use inplace backward.
 calculate_entropy=${calculate_entropy:-True}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
@@ -198,6 +198,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
+    actor_rollout_ref.actor.fsdp_config.entropy_from_logits_with_chunking=True \
     actor_rollout_ref.actor.grad_clip=2.0 \
     actor_rollout_ref.actor.use_rollout_log_probs=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=${actor_policy_loss_mode} \
