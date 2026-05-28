@@ -130,7 +130,8 @@ case "${rollout_correction_bypass_mode}" in
         ;;
 esac
 
-# Entropy is computed for logging only; keep entropy_coeff=0 to avoid changing the objective.
+# Entropy is logging-only because entropy_coeff=0. Keep it off by default for
+# 32B training; entropy-from-logits can add several GiB of peak memory.
 calculate_entropy=${calculate_entropy:-True}
 
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
@@ -140,7 +141,7 @@ max_concurrent_rollouts=${max_concurrent_rollouts:-20}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
-actor_param_offload=${actor_param_offload:-False}
+actor_param_offload=${actor_param_offload:-True}
 actor_optimizer_offload=${actor_optimizer_offload:-True}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-True}
