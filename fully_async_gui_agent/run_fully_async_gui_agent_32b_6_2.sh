@@ -143,6 +143,8 @@ max_concurrent_rollouts=${max_concurrent_rollouts:-20}
 infer_tp=${infer_tp:-1}
 actor_param_offload=${actor_param_offload:-True}
 actor_optimizer_offload=${actor_optimizer_offload:-True}
+actor_activation_offload=${actor_activation_offload:-False}
+actor_sp_size=${actor_sp_size:-2}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-True}
 # H200 140GB: fsdp_size=4 (4-way sharding within each node).
@@ -179,6 +181,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_activation_offload=${actor_activation_offload} \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
@@ -189,6 +192,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
+    actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=rollout-mean-token-mean \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -210,6 +214,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
+    actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
