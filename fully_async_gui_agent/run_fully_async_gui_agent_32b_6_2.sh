@@ -200,11 +200,11 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.grad_clip=2.0 \
     actor_rollout_ref.actor.use_rollout_log_probs=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=${actor_policy_loss_mode} \
-    actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
-    actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type=${rollout_correction_loss_type} \
-    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=${rollout_correction_is} \
-    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_correction_rs} \
-    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type=${rollout_correction_loss_type} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=${rollout_correction_is} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_correction_rs} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
