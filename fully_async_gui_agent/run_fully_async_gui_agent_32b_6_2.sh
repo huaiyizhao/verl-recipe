@@ -72,7 +72,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525b-32b-osworld-plus-new/v0-20260525-111328/checkpoint-810-merged"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -102,12 +102,12 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-8}
+n_resp_per_prompt=${n_resp_per_prompt:-5}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
-test_freq=-20  # disabled: validation competes for desktop-env containers
+test_freq=-1  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
@@ -121,6 +121,14 @@ rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k1}
 rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.999_1.001}
+case "${rollout_correction_bypass_mode}" in
+    True|true|TRUE|1)
+        actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
+        ;;
+    *)
+        actor_policy_loss_mode=${actor_policy_loss_mode:-vanilla}
+        ;;
+esac
 
 # Entropy is computed for logging only; keep entropy_coeff=0 to avoid changing the objective.
 calculate_entropy=${calculate_entropy:-True}
@@ -128,7 +136,7 @@ calculate_entropy=${calculate_entropy:-True}
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-16}
+max_concurrent_rollouts=${max_concurrent_rollouts:-20}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -146,10 +154,10 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=48000
-infer_ppo_max_token_len=96000
+actor_ppo_max_token_len=32768
+infer_ppo_max_token_len=65536
 
-project_name=${project_name:-fully_async_gui_agent_0526}
+project_name=${project_name:-fully_async_gui_agent_32b_0528}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
 
 # ================= launch =================
@@ -189,8 +197,14 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
-    actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.grad_clip=2.0 \
     actor_rollout_ref.actor.use_rollout_log_probs=True \
+    actor_rollout_ref.actor.policy_loss.loss_mode=${actor_policy_loss_mode} \
+    actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
+    actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type=${rollout_correction_loss_type} \
+    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=${rollout_correction_is} \
+    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_correction_rs} \
+    actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
@@ -201,7 +215,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.max_model_len=32768 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
@@ -233,7 +247,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.total_epochs="${total_epochs}" \
     trainer.val_before_train=False \
     trainer.test_freq="${test_freq}" \
-    trainer.save_freq=-1 \
+    trainer.save_freq="${test_freq}" \
     trainer.resume_mode=disable \
     trainer.nnodes="${trainer_nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
