@@ -153,11 +153,9 @@ ref_offload=${ref_offload:-True}
 fsdp_size=${n_gpus_training}
 
 # Max packed-sequence length per GPU per micro-batch (dynamic_bsz on).
-# With Qwen3-VL-8B + FSDP2, a 64k packed sequence OOMs on 140GB even with
-# param/optimizer offload, because the (seq_len^2) attention activations plus
-# FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
-# ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=32768
+# prepare_micro_batches multiplies this by SP size, so keep the SP-group token
+# cap at roughly max_prompt+max_response instead of doubling it when SP=2.
+actor_ppo_max_token_len=16384
 infer_ppo_max_token_len=65536
 
 project_name=${project_name:-fully_async_gui_agent_32b_0528}
