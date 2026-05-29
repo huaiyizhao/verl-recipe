@@ -121,7 +121,7 @@ rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k1}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.999_1.001}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.5_2.0}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
