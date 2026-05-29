@@ -82,6 +82,7 @@ export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://10.192.64.238:2354}
 # ================= rollout / agent loop =================
 rollout_mode="async"
 rollout_name=${rollout_name:-vllm}
+rollout_logprobs_mode=${rollout_logprobs_mode:-raw_logprobs}
 if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
 fi
@@ -159,7 +160,7 @@ actor_ppo_max_token_len=16384
 infer_ppo_max_token_len=65536
 
 project_name=${project_name:-fully_async_gui_agent_32b_0528}
-experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
+experiment_name=${experiment_name:-qwen3vl_32b_fsdp_async}
 
 # ================= launch =================
 # Hydra's config uses ``hydra.searchpath: file://verl/trainer/config`` which is
@@ -216,6 +217,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.logprobs_mode=${rollout_logprobs_mode} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
