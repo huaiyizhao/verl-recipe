@@ -72,7 +72,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
