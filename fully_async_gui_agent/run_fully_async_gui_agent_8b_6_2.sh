@@ -72,7 +72,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -120,8 +120,8 @@ partial_rollout=${partial_rollout:-True}
 rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
-rollout_correction_rs=${rollout_correction_rs:-seq_mean_k1}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.5_2.0}
+rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.01}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
