@@ -103,12 +103,12 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-5}
+n_resp_per_prompt=${n_resp_per_prompt:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
-test_freq=-1  # disabled: validation competes for desktop-env containers
+test_freq=20  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
@@ -138,7 +138,7 @@ calculate_entropy=${calculate_entropy:-True}
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-20}
+max_concurrent_rollouts=${max_concurrent_rollouts:-160}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -193,7 +193,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
-    actor_rollout_ref.actor.loss_agg_mode=rollout-mean-token-mean \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \

@@ -387,6 +387,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                                 f"skipping tool_call_index={tool_call_idx}: {tool_call} "
                                 f"(error: {parse_exc!r})"
                             )
+                            parse_error_text = (
+                                "Error: invalid tool call format. "
+                                "The <tool_call> content must be valid JSON with an "
+                                "'action' field and the required arguments for that action. "
+                                "Please emit exactly one valid computer_use tool call."
+                            )
                 if not tool_args_list:
                     _log(
                         f"{log_tag}[turn={turn}] No valid tool call/action parsed; "
