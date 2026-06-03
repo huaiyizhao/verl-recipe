@@ -516,7 +516,7 @@ class DesktopEnvTool(BaseTool):
         self.real_screen_width = int(config.get("real_screen_width", screen_width))
         self.real_screen_height = int(config.get("real_screen_height", screen_height))
         self.timeout = aiohttp.ClientTimeout(total=config.get("timeout", 30))
-        self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 30))
+        self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 600))
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))

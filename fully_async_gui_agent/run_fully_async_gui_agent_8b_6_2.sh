@@ -112,7 +112,7 @@ test_freq=20  # disabled: validation competes for desktop-env containers
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-1}
+staleness_threshold=${staleness_threshold:-2}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
 partial_rollout=${partial_rollout:-True}
 
