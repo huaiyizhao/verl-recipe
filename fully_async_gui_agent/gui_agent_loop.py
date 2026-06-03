@@ -364,23 +364,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             parsed_args = json.loads(tool_call.arguments)
                             if not isinstance(parsed_args, dict):
                                 raise ValueError("tool arguments must be a JSON object")
-                            action_name = parsed_args.get("action", "")
-                            if not action_name:
-                                _log(
-                                    f"{log_tag}[turn={turn}] Tool call has no action; "
-                                    f"skipping tool_call_index={tool_call_idx}: {tool_call}"
-                                )
-                                continue
-                            if action_name == "scroll" and "coordinate" in parsed_args:
-                                scroll_args = dict(parsed_args)
-                                coordinate = scroll_args.pop("coordinate")
-                                tool_args_list.append({"action": "mouse_move", "coordinate": coordinate})
-                                actions.append("mouse_move")
-                                tool_args_list.append(scroll_args)
-                                actions.append(action_name)
-                            else:
-                                tool_args_list.append(parsed_args)
-                                actions.append(action_name)
+                            tool_args_list.append(parsed_args)
+                            actions.append(str(parsed_args.get("action", "")))
                         except Exception as parse_exc:
                             _log(
                                 f"{log_tag}[turn={turn}] Failed to parse tool arguments; "
@@ -389,13 +374,12 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             )
                             parse_error_text = (
                                 "Error: invalid tool call format. "
-                                "The <tool_call> content must be valid JSON with an "
-                                "'action' field and the required arguments for that action. "
+                                "The <tool_call> content must be a valid JSON object. "
                                 "Please emit exactly one valid computer_use tool call."
                             )
                 if not tool_args_list:
                     _log(
-                        f"{log_tag}[turn={turn}] No valid tool call/action parsed; "
+                        f"{log_tag}[turn={turn}] No valid tool call parsed; "
                         "continuing without environment step",
                         debug=True,
                     )

@@ -18,7 +18,7 @@ following endpoints::
 
     POST /session/create                           body: {"task_id": ...}
     POST /session/{session_id}/step                body: {"action": "pyautogui...", "pause": 2.0}
-    POST /session/{session_id}/evaluate            body: {"settle_seconds": 20}
+    POST /session/{session_id}/evaluate
     POST /session/{session_id}/close
 
 Lifecycle: ``create → (step)* → evaluate → close``.
@@ -247,11 +247,12 @@ def _translate_action_to_pyautogui(
     real_screen_width: int,
     real_screen_height: int,
 ) -> Optional[str]:
-    """Translate a Qwen-VL computer_use structured action into a pyautogui code line.
+    """Translate a Qwen-VL computer_use structured action into pyautogui code.
 
     Coordinates output by Qwen-VL are interpreted in the prompt screen space
     and scaled to the real desktop pixels before being embedded in the
-    generated pyautogui snippet.
+    generated pyautogui snippet. The action semantics intentionally mirror
+    OSWorld's ``Qwen3VLAgent.parse_response``.
 
     Returns ``None`` for virtual actions that are handled by the agent loop
     directly (``terminate``, ``answer``) and do not map to a backend step.
@@ -262,54 +263,98 @@ def _translate_action_to_pyautogui(
     if action == "terminate" or action == "answer":
         return None
 
+    def adjusted_coordinate(default: tuple[int, int] | None = None) -> tuple[int, int] | None:
+        if coord is None:
+            return default
+        return _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
+
     if action == "mouse_move":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
+        x, y = adjusted_coordinate(default=(0, 0))
         return f"pyautogui.moveTo({x}, {y})"
 
     if action == "left_click":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        return f"pyautogui.click(x={x}, y={y}, button='left')"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return "pyautogui.click()"
+        x, y = adjusted
+        return f"pyautogui.click({x}, {y})"
 
     if action == "right_click":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        return f"pyautogui.click(x={x}, y={y}, button='right')"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return "pyautogui.rightClick()"
+        x, y = adjusted
+        return f"pyautogui.rightClick({x}, {y})"
 
     if action == "middle_click":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        return f"pyautogui.click(x={x}, y={y}, button='middle')"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return "pyautogui.middleClick()"
+        x, y = adjusted
+        return f"pyautogui.middleClick({x}, {y})"
 
     if action == "double_click":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        return f"pyautogui.doubleClick(x={x}, y={y})"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return "pyautogui.doubleClick()"
+        x, y = adjusted
+        return f"pyautogui.doubleClick({x}, {y})"
 
     if action == "triple_click":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        return f"pyautogui.tripleClick(x={x}, y={y})"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return "pyautogui.tripleClick()"
+        x, y = adjusted
+        return f"pyautogui.tripleClick({x}, {y})"
 
     if action == "left_click_drag":
-        x, y = _denorm_coord(coord, source_screen_width, source_screen_height, real_screen_width, real_screen_height)
-        # Drag *to* the target from the current cursor position, mouse button held left.
-        return f"pyautogui.dragTo({x}, {y}, button='left')"
+        adjusted = adjusted_coordinate(default=(0, 0))
+        x, y = adjusted
+        duration = parameters.get("duration", 0.5)
+        return f"pyautogui.dragTo({x}, {y}, duration={duration})"
 
     if action == "type":
         text = parameters.get("text", "")
-        # Use write() for plain ASCII typing; repr to safely embed the string.
-        return f"pyautogui.write({text!r}, interval=0.02)"
+        code_lines = []
+        lines = text.split("\n")
+        for idx, line in enumerate(lines):
+            if line:
+                code_lines.append(f"pyautogui.typewrite({line!r}, interval=0.03)")
+            if idx < len(lines) - 1:
+                code_lines.append("pyautogui.press('enter')")
+        return "\n".join(code_lines)
 
     if action == "key":
         keys = parameters.get("keys", []) or []
-        # hotkey() presses keys together (e.g. ctrl+c); this matches the
-        # "press-then-release-in-reverse" semantics described by the schema.
-        key_repr = ", ".join(repr(str(k)) for k in keys)
-        return f"pyautogui.hotkey({key_repr})"
+        cleaned_keys = []
+        for key in keys:
+            if isinstance(key, str):
+                if key.startswith("keys=["):
+                    key = key[6:]
+                if key.endswith("]"):
+                    key = key[:-1]
+                if key.startswith("['") or key.startswith('["'):
+                    key = key[2:] if len(key) > 2 else key
+                if key.endswith("']") or key.endswith('"]'):
+                    key = key[:-2] if len(key) > 2 else key
+                key = key.strip()
+            cleaned_keys.append(key)
+        keys_str = ", ".join(repr(str(key)) for key in cleaned_keys)
+        if len(cleaned_keys) > 1:
+            return f"pyautogui.hotkey({keys_str})"
+        return f"pyautogui.press({keys_str})"
 
     if action == "scroll":
         pixels = int(parameters.get("pixels", 0) or 0)
-        return f"pyautogui.scroll({pixels})"
+        adjusted = adjusted_coordinate()
+        if adjusted is None:
+            return f"pyautogui.scroll({pixels})"
+        x, y = adjusted
+        return f"pyautogui.moveTo({x}, {y})\npyautogui.scroll({pixels})"
 
     if action == "hscroll":
         pixels = int(parameters.get("pixels", 0) or 0)
-        return f"pyautogui.hscroll({pixels})"
+        return f"pyautogui.scroll({pixels})"
 
     if action == "wait":
         return "WAIT"
@@ -371,17 +416,23 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
         return f"unknown action {action!r}. Valid computer_use actions are: {valid_list}"
 
     if action in _COORD_ACTIONS:
-        if error := _validate_coordinate(parameters.get("coordinate")):
-            return f"action {action!r} requires {error}"
-    elif action == "type":
-        if "text" not in parameters or not isinstance(parameters.get("text"), str):
+        coord = parameters.get("coordinate")
+        if coord is not None:
+            if error := _validate_coordinate(coord):
+                return f"action {action!r} has invalid {error}"
+    if action == "type":
+        if "text" in parameters and not isinstance(parameters.get("text"), str):
             return "action 'type' requires text as a string"
     elif action == "key":
         keys = parameters.get("keys")
-        if not isinstance(keys, list) or not keys or not all(isinstance(key, str) and key for key in keys):
-            return "action 'key' requires keys as a non-empty array of non-empty strings"
+        if keys is not None and not isinstance(keys, list):
+            return "action 'key' requires keys as an array when provided"
     elif action in {"scroll", "hscroll"}:
-        if "pixels" not in parameters or not _is_finite_number(parameters.get("pixels")):
+        coord = parameters.get("coordinate")
+        if coord is not None:
+            if error := _validate_coordinate(coord):
+                return f"action {action!r} has invalid {error}"
+        if "pixels" in parameters and not _is_finite_number(parameters.get("pixels")):
             return f"action {action!r} requires pixels as a finite number"
     elif action == "wait":
         wait_time = parameters.get("time")
@@ -391,7 +442,7 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
         if "text" not in parameters or not isinstance(parameters.get("text"), str):
             return "action 'answer' requires text as a string"
     elif action == "terminate":
-        if parameters.get("status") not in {"success", "failure"}:
+        if parameters.get("status") is not None and parameters.get("status") not in {"success", "failure"}:
             return "action 'terminate' requires status to be either 'success' or 'failure'"
 
     return None
@@ -431,16 +482,21 @@ class DesktopEnvTool(BaseTool):
         timeout (int): HTTP request timeout in seconds (default 30).
         pause (float): ``pause`` value forwarded to ``/step`` after each
             action (default 2.0).
-        evaluate_settle_seconds (int): ``settle_seconds`` value forwarded to
-            ``/evaluate`` when computing the terminal reward (default 20).
+        evaluate_settle_seconds (int): local sleep before ``/evaluate`` when
+            computing the terminal reward (default 3).
         step_reward (float): Per-step reward returned by ``execute()``
             (default 0.0).
+        http_reuse_session (bool): If true, keep one aiohttp ClientSession
+            alive for the tool lifetime. Defaults to false, so every request
+            gets a fresh ClientSession/TCP connection.
         http_keepalive_timeout (float): Seconds to keep idle TCP connections
-            in the aiohttp connector pool (default 30.0).
+            in the aiohttp connector pool when http_reuse_session is true
+            (default 30.0).
         http_session_max_age (float): Maximum age of the aiohttp ClientSession
-            in seconds. ``0`` disables age-based reset (default 0.0).
+            in seconds when http_reuse_session is true. ``0`` disables
+            age-based reset (default 0.0).
         http_force_close (bool): If true, close TCP connections after every
-            request while still reusing the ClientSession object (default False).
+            request (default True).
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -460,30 +516,28 @@ class DesktopEnvTool(BaseTool):
         self.real_screen_width = int(config.get("real_screen_width", screen_width))
         self.real_screen_height = int(config.get("real_screen_height", screen_height))
         self.timeout = aiohttp.ClientTimeout(total=config.get("timeout", 30))
-        self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 300))
+        self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 30))
         self.pause = float(config.get("pause", 2.0))
-        self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 20))
+        self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))
 
         # HTTP retry config. _post itself does not catch/retry; callers decide
         # whether an endpoint is safe to retry.
-        self.max_retries = int(config.get("max_retries", 3))
+        self.max_retries = int(config.get("max_retries", 2))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
-        # HTTP connection-pool config. By default, one rollout keeps one
-        # ClientSession alive until release(), while idle TCP connections are
-        # allowed to expire from the connector pool.
+        # HTTP connection config. By default, each request gets a fresh
+        # ClientSession/TCP connection. Session reuse is opt-in.
+        self.http_reuse_session = bool(config.get("http_reuse_session", False))
         self.http_keepalive_timeout = float(config.get("http_keepalive_timeout", 30.0))
         self.http_session_max_age = float(config.get("http_session_max_age", 0.0))
-        self.http_force_close = bool(config.get("http_force_close", False))
+        self.http_force_close = bool(config.get("http_force_close", True))
 
         # instance_id → {"session_id": str, "task_id": str}
         self._instances: dict[str, dict[str, Any]] = {}
 
-        # One persistent aiohttp session per DesktopEnvTool/rollout event loop.
-        # It is lazily created from the running loop, reused by create/step/eval
-        # /close within the rollout, reset on transport errors, and closed by
-        # release().
+        # Optional persistent aiohttp session per DesktopEnvTool/rollout event
+        # loop. Only used when http_reuse_session=true.
         self._http_session: aiohttp.ClientSession | None = None
         self._http_session_loop: asyncio.AbstractEventLoop | None = None
         self._http_session_created_at = 0.0
@@ -526,10 +580,24 @@ class DesktopEnvTool(BaseTool):
             self._http_session_created_at = now
             _log(
                 f"[DesktopEnvTool] HTTP session created keepalive_timeout={self.http_keepalive_timeout} "
-                f"max_age={self.http_session_max_age} force_close={self.http_force_close}",
+                f"max_age={self.http_session_max_age} force_close={self.http_force_close} "
+                f"reuse={self.http_reuse_session}",
                 debug=True,
             )
         return self._http_session
+
+    def _make_http_connector(self) -> aiohttp.TCPConnector:
+        connector_kwargs: dict[str, Any] = {
+            "limit": 128,
+            "limit_per_host": 128,
+            "enable_cleanup_closed": True,
+            "ttl_dns_cache": 300,
+        }
+        if self.http_force_close:
+            connector_kwargs["force_close"] = True
+        else:
+            connector_kwargs["keepalive_timeout"] = self.http_keepalive_timeout
+        return aiohttp.TCPConnector(**connector_kwargs)
 
     async def _close_http_session(self) -> None:
         self._http_reset_pending = False
@@ -590,8 +658,17 @@ class DesktopEnvTool(BaseTool):
 
         _log(f"[DesktopEnvTool] -> POST path={path} request_id={request_id} payload={_short_repr(request_body)}")
 
-        session = await self._get_http_session()
-        self._http_inflight += 1
+        if self.http_reuse_session:
+            session = await self._get_http_session()
+            self._http_inflight += 1
+            close_session = False
+        else:
+            session = aiohttp.ClientSession(
+                connector=self._make_http_connector(),
+                timeout=self.timeout,
+            )
+            close_session = True
+
         try:
             async with session.post(url, json=request_body, timeout=effective_timeout) as resp:
                 status = resp.status
@@ -628,7 +705,10 @@ class DesktopEnvTool(BaseTool):
                 )
                 return {}
         finally:
-            self._http_inflight = max(0, self._http_inflight - 1)
+            if close_session:
+                await session.close()
+            else:
+                self._http_inflight = max(0, self._http_inflight - 1)
 
     async def _post_with_retries(
         self,
@@ -743,8 +823,6 @@ class DesktopEnvTool(BaseTool):
                 try:
                     await self._post_with_retries(
                         f"/session/{server_session_id}/close",
-                        timeout=aiohttp.ClientTimeout(total=300),
-                        max_retries=max(self.max_retries, 5),
                     )
                 except Exception:
                     _log(
@@ -934,13 +1012,12 @@ class DesktopEnvTool(BaseTool):
             return 0.0
         session_id = info["session_id"]
 
-        _log(f"[DesktopEnvTool] evaluate session_id={session_id} settle={self.evaluate_settle_seconds}s")
+        _log(f"[DesktopEnvTool] evaluate session_id={session_id} local_settle={self.evaluate_settle_seconds}s")
         if self.evaluate_settle_seconds > 0:
             await asyncio.sleep(self.evaluate_settle_seconds)
         try:
             resp = await self._post_with_retries(
                 f"/session/{session_id}/evaluate",
-                {"settle_seconds": self.evaluate_settle_seconds},
             )
         except Exception:
             _log(
@@ -977,13 +1054,8 @@ class DesktopEnvTool(BaseTool):
             f"[DesktopEnvTool] release session_id={session_id} task_id={info.get('task_id')} instance_id={instance_id}"
         )
         try:
-            # /close synchronously waits for container recycle (destroy old +
-            # boot fresh replacement) before returning, so it needs a generous
-            # timeout — match /create's 180s.
             await self._post_with_retries(
                 f"/session/{session_id}/close",
-                timeout=aiohttp.ClientTimeout(total=300),
-                max_retries=max(self.max_retries, 5),
             )
             _log(f"[DesktopEnvTool] release OK session_id={session_id} instance_id={instance_id}")
         except Exception:

@@ -12,10 +12,11 @@ tools:
       real_screen_width: 1920   # actual desktop resolution for coordinate denormalization
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
       timeout: 30
-      create_timeout: 600  # /session/create may need longer for container/session startup
-      http_keepalive_timeout: 30  # keep idle TCP connections within one rollout for up to 30s
-      http_session_max_age: 0     # 0 disables age-based ClientSession reset; release closes it
-      http_force_close: false     # keep ClientSession/TCP pooling enabled within a rollout
+      create_timeout: 30
+      max_retries: 2
+      retry_interval: 30
+      http_reuse_session: false
+      http_force_close: true      # close TCP connections after every request to avoid stale keep-alive reuse
       pause: 2.0
-      evaluate_settle_seconds: 10
+      evaluate_settle_seconds: 3
       step_reward: 0.0
