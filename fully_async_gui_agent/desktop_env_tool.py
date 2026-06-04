@@ -485,6 +485,8 @@ class DesktopEnvTool(BaseTool):
         real_screen_height (int): Actual desktop resolution height used to
             denormalize model coordinates (default: same as screen_height).
         timeout (int): HTTP request timeout in seconds (default 30).
+        evaluate_timeout (int): HTTP request timeout in seconds for
+            ``/evaluate`` (default 180).
         pause (float): ``pause`` value forwarded to ``/step`` after each
             action (default 2.0).
         evaluate_settle_seconds (int): local sleep before ``/evaluate`` when
@@ -525,6 +527,7 @@ class DesktopEnvTool(BaseTool):
         self.timeout_seconds = float(config.get("timeout", 30))
         self.timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 600))
+        self.evaluate_timeout = aiohttp.ClientTimeout(total=config.get("evaluate_timeout", 180))
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))
@@ -1092,6 +1095,7 @@ class DesktopEnvTool(BaseTool):
         try:
             resp = await self._post_with_retries(
                 f"/session/{session_id}/evaluate",
+                timeout=self.evaluate_timeout,
                 retry_timeout_only=True,
             )
         except Exception:

@@ -13,6 +13,7 @@ tools:
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
       timeout: 30
       create_timeout: 600
+      evaluate_timeout: 180
       step_timeout_margin: 10
       max_retries: 2
       retry_interval: 30
