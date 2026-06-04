@@ -40,6 +40,7 @@ from uuid import uuid4
 
 from recipe.fully_async_gui_agent.context_manager import Qwen3VLHistoryStrategy, TurnRecord
 from recipe.fully_async_gui_agent.data_flow_logger import log_message
+from recipe.fully_async_gui_agent.desktop_env_tool import DesktopEnvStepError
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
@@ -434,6 +435,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             break
                     except Exception as exec_exc:
                         consecutive_tool_failures += 1
+                        if isinstance(exec_exc, DesktopEnvStepError):
+                            _log(
+                                f"[GUIAgentLoop][FATAL_ERROR][desktop_step_failed] "
+                                f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
+                                f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                                f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r}",
+                                level="ERROR",
+                            )
+                            fatal_error = True
+                            break
                         _log(
                             f"[GUIAgentLoop] Tool execution failed for {task_id} {log_tag} "
                             f"(streak={consecutive_tool_failures}/"

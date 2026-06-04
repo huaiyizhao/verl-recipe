@@ -14,7 +14,7 @@ env_vars:
   NCCL_DEBUG: INFO
   PYTHONPATH: .
   # Needed by Ray workers on all nodes
-  DESKTOP_API_BASE_URL: "http://10.192.64.238:2354"
+  DESKTOP_API_BASE_URL: "http://172.31.13.38:2354"
   # Ray enables uvloop by default when the package is installed. Disable it to
   # avoid uvloop/aiohttp fd ownership bugs under timeout/retry-heavy rollouts.
   RAY_USE_UVLOOP: "0"
