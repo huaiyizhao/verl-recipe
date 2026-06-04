@@ -137,7 +137,7 @@ calculate_entropy=${calculate_entropy:-True}
 # Hard cap on in-flight rollouts. The desktop-env service only allows a
 # limited number of concurrent sessions (e.g. 32), so we must throttle the
 # rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-160}
+max_concurrent_rollouts=${max_concurrent_rollouts:-108}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
