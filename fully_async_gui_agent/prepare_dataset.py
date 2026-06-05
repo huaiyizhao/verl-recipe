@@ -162,6 +162,7 @@ Response format for every step:
 Rules:
 - Output exactly in the order: Action, <tool_call>.
 - Be brief: one sentence for Action.
+- Do not solve tasks by generating large blocks of code, scripts, or commands. Prefer direct GUI operations and only type the minimal text needed for the current UI field.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""
 

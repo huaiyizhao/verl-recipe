@@ -72,7 +72,8 @@ rollout_nnodes=${rollout_nnodes:-1}
 trainer_nnodes=${trainer_nnodes:-1}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
+# HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -95,7 +96,7 @@ adv_estimator=grpo
 
 max_turns=${max_turns:-30}
 max_prompt_length=${max_prompt_length:-24576}
-max_response_length=${max_response_length:-8192}
+max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-1e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
@@ -103,8 +104,8 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-16}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
+n_resp_per_prompt=${n_resp_per_prompt:-8}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
@@ -113,7 +114,7 @@ test_freq=20  # disabled: validation competes for desktop-env containers
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-2}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-True}
 
 # Rollout correction preset: RolloutCorrectionConfig.bypass_ppo_clip_geo_rs().
@@ -134,10 +135,11 @@ esac
 # Entropy is computed for logging only; keep entropy_coeff=0 to avoid changing the objective.
 calculate_entropy=${calculate_entropy:-True}
 
-# Hard cap on in-flight rollouts. The desktop-env service only allows a
-# limited number of concurrent sessions (e.g. 32), so we must throttle the
-# rollouter here to avoid flooding the backend.
-max_concurrent_rollouts=${max_concurrent_rollouts:-108}
+# Hard cap on in-flight rollout trajectories / desktop-env sessions.
+# Sample-level in-flight capacity is derived from max_required_samples; do not
+# add an extra sample cap here, otherwise long-tail samples can block later
+# samples from filling newly available env slots.
+max_concurrent_rollouts=${max_concurrent_rollouts:-128}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -158,7 +160,7 @@ fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=48000
 infer_ppo_max_token_len=96000
 
-project_name=${project_name:-fully_async_gui_agent_0526}
+project_name=${project_name:-fully_async_gui_agent_0605}
 experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
 
 # ================= launch =================
