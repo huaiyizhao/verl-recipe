@@ -513,8 +513,10 @@ class DesktopEnvTool(BaseTool):
             age-based reset (default 0.0).
         http_force_close (bool): If true, close TCP connections after every
             request (default True).
+        connect_max_retries (int): Retry budget for connection-stage failures
+            (default follows ``max_retries``).
         connect_retry_interval (float): Sleep before retrying connection-stage
-            failures (default 1.0). Other retryable failures use
+            failures (default 5.0). Other retryable failures use
             ``retry_interval``.
     """
 
@@ -542,7 +544,8 @@ class DesktopEnvTool(BaseTool):
         # HTTP retry config. _post itself does not catch/retry; callers decide
         # whether an endpoint is safe to retry.
         self.max_retries = int(config.get("max_retries", 1))
-        self.connect_retry_interval = float(config.get("connect_retry_interval", 1.0))
+        self.connect_max_retries = int(config.get("connect_max_retries", self.max_retries))
+        self.connect_retry_interval = float(config.get("connect_retry_interval", 5.0))
         self.retry_interval = float(config.get("retry_interval", 30.0))
         self.connect_timeout_seconds = float(config.get("connect_timeout", 10.0))
 
@@ -773,27 +776,42 @@ class DesktopEnvTool(BaseTool):
         retry_timeout_only: bool = False,
         error_context: str | None = None,
     ) -> dict:
-        attempts = (self.max_retries if max_retries is None else max_retries) + 1
+        transport_max_retries = self.max_retries if max_retries is None else max_retries
+        connect_max_retries = self.connect_max_retries if max_retries is None else max_retries
         request_body = payload or {}
         request_id = request_body.get("request_id", "<none>")
         last_exc: BaseException | None = None
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        transport_failures = 0
+        connect_failures = 0
+        while True:
+            attempt += 1
             try:
                 return await self._post(path, request_body, timeout=timeout)
             except Exception as exc:
                 last_exc = exc
+                is_connect_error = self._is_connect_error(exc)
                 if retry_timeout_only:
                     retryable = self._is_timeout_error(exc)
                 else:
                     retryable = retry_transport and self._is_retryable_transport_error(exc)
                 if retryable:
                     await self._reset_http_session()
-                if (not retryable) or attempt >= attempts:
+                if is_connect_error:
+                    connect_failures += 1
+                    current_failures = connect_failures
+                    max_failures = connect_max_retries + 1
+                else:
+                    transport_failures += 1
+                    current_failures = transport_failures
+                    max_failures = transport_max_retries + 1
+                if (not retryable) or current_failures >= max_failures:
                     context = f" | {error_context}" if error_context else ""
                     error_kind = self._transport_error_kind(exc)
                     _log(
                         f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                        f"failed after {attempt} attempt(s) ({error_kind}): {self._error_detail(exc)} | "
+                        f"failed after {attempt} attempt(s) ({error_kind}, "
+                        f"{error_kind} failures={current_failures}/{max_failures}): {self._error_detail(exc)} | "
                         f"payload={_short_repr(request_body)}{context}",
                         level="ERROR",
                     )
@@ -805,10 +823,11 @@ class DesktopEnvTool(BaseTool):
                     )
                     raise
                 error_kind = self._transport_error_kind(exc)
-                retry_interval = self.connect_retry_interval if self._is_connect_error(exc) else self.retry_interval
+                retry_interval = self.connect_retry_interval if is_connect_error else self.retry_interval
                 _log(
                     f"[DesktopEnvTool] POST {path} request_id={request_id} "
-                    f"{error_kind} (attempt {attempt}/{attempts}): {self._error_detail(exc)}. "
+                    f"{error_kind} (attempt {attempt}, {error_kind} failures "
+                    f"{current_failures}/{max_failures}): {self._error_detail(exc)}. "
                     f"Retrying in {retry_interval:.1f}s"
                     f"{' | ' + error_context if error_context else ''}",
                     level="ERROR",
