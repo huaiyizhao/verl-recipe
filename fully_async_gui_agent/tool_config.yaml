@@ -11,11 +11,14 @@ tools:
       screen_height: 1000  # shown to the model in the prompt (Qwen-VL normalized space)
       real_screen_width: 1920   # actual desktop resolution for coordinate denormalization
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
-      timeout: 30
+      timeout: 60
       create_timeout: 600
-      evaluate_timeout: 180
-      step_timeout_margin: 10
-      max_retries: 2
+      evaluate_timeout: 300
+      typewrite_seconds_per_char: 0.08
+      typewrite_enter_seconds: 0.25
+      typewrite_call_seconds: 0.20
+      step_base_seconds: 5.0
+      max_retries: 1
       retry_interval: 30
       http_reuse_session: false
       http_force_close: true      # close TCP connections after every request to avoid stale keep-alive reuse

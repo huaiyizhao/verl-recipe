@@ -484,9 +484,10 @@ class DesktopEnvTool(BaseTool):
             denormalize model coordinates (default: same as screen_width).
         real_screen_height (int): Actual desktop resolution height used to
             denormalize model coordinates (default: same as screen_height).
-        timeout (int): HTTP request timeout in seconds (default 30).
+        timeout (int): Base HTTP request timeout in seconds for ordinary
+            ``/step`` calls and non-special endpoints (default 60).
         evaluate_timeout (int): HTTP request timeout in seconds for
-            ``/evaluate`` (default 180).
+            ``/evaluate`` (default 300).
         pause (float): ``pause`` value forwarded to ``/step`` after each
             action (default 2.0).
         evaluate_settle_seconds (int): local sleep before ``/evaluate`` when
@@ -504,8 +505,16 @@ class DesktopEnvTool(BaseTool):
             age-based reset (default 0.0).
         http_force_close (bool): If true, close TCP connections after every
             request (default True).
-        step_timeout_margin (float): Extra HTTP timeout margin added on top of
-            the estimated action execution time for ``/step`` (default 10.0).
+        typewrite_seconds_per_char (float): Conservative timeout estimate per
+            typed character. This is intentionally larger than pyautogui's
+            interval because VM/UI/input latency adds overhead (default 0.08).
+        typewrite_enter_seconds (float): Conservative timeout estimate per
+            explicit Enter press in split type actions (default 0.25).
+        typewrite_call_seconds (float): Conservative timeout estimate for each
+            ``pyautogui.typewrite`` Python call (default 0.20).
+        step_base_seconds (float): Fixed timeout estimate for /step overhead
+            outside the pyautogui action itself, including process dispatch and
+            screenshot capture (default 5.0).
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -524,18 +533,21 @@ class DesktopEnvTool(BaseTool):
         # Falls back to screen_width/screen_height if not configured.
         self.real_screen_width = int(config.get("real_screen_width", screen_width))
         self.real_screen_height = int(config.get("real_screen_height", screen_height))
-        self.timeout_seconds = float(config.get("timeout", 30))
+        self.timeout_seconds = float(config.get("timeout", 60))
         self.timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         self.create_timeout = aiohttp.ClientTimeout(total=config.get("create_timeout", 600))
-        self.evaluate_timeout = aiohttp.ClientTimeout(total=config.get("evaluate_timeout", 180))
+        self.evaluate_timeout = aiohttp.ClientTimeout(total=config.get("evaluate_timeout", 300))
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))
-        self.step_timeout_margin = float(config.get("step_timeout_margin", 10.0))
+        self.typewrite_seconds_per_char = float(config.get("typewrite_seconds_per_char", 0.08))
+        self.typewrite_enter_seconds = float(config.get("typewrite_enter_seconds", 0.25))
+        self.typewrite_call_seconds = float(config.get("typewrite_call_seconds", 0.20))
+        self.step_base_seconds = float(config.get("step_base_seconds", 5.0))
 
         # HTTP retry config. _post itself does not catch/retry; callers decide
         # whether an endpoint is safe to retry.
-        self.max_retries = int(config.get("max_retries", 2))
+        self.max_retries = int(config.get("max_retries", 1))
         self.retry_interval = float(config.get("retry_interval", 30.0))
 
         # HTTP connection config. By default, each request gets a fresh
@@ -658,22 +670,34 @@ class DesktopEnvTool(BaseTool):
 
     def _estimate_step_execution_seconds(self, action: str, parameters: dict, pause: float) -> float:
         """Estimate server-side step execution time for timeout sizing."""
-        estimated = pause
+        estimated = pause + self.step_base_seconds
         if action == "type":
             text = parameters.get("text", "")
             if isinstance(text, str):
                 lines = text.split("\n")
                 char_count = sum(len(line) for line in lines)
                 enter_count = max(0, len(lines) - 1)
-                estimated += char_count * 0.03 + enter_count * 0.10
+                typewrite_call_count = sum(1 for line in lines if line)
+                estimated += (
+                    char_count * self.typewrite_seconds_per_char
+                    + enter_count * self.typewrite_enter_seconds
+                    + typewrite_call_count * self.typewrite_call_seconds
+                )
         elif action == "wait":
             estimated += 0.0
         return max(0.0, estimated)
 
     def _step_timeout_for_action(self, action: str, parameters: dict, pause: float) -> aiohttp.ClientTimeout:
         expected_seconds = self._estimate_step_execution_seconds(action, parameters, pause)
-        total = max(self.timeout_seconds, expected_seconds + self.step_timeout_margin)
+        total = self.timeout_seconds + expected_seconds if action == "type" else self.timeout_seconds
         return aiohttp.ClientTimeout(total=total)
+
+    @staticmethod
+    def _proxy_timeout_seconds(timeout: aiohttp.ClientTimeout) -> float:
+        total = timeout.total
+        if total is None:
+            return 1.0
+        return max(1.0, float(total) - 5.0)
 
     async def _post(
         self,
@@ -900,13 +924,18 @@ class DesktopEnvTool(BaseTool):
         session_id = info["session_id"]
         try:
             request_id = str(uuid4())
-            _log(f"[DesktopEnvTool] screenshot step request_id={request_id} session_id={session_id}")
+            proxy_timeout = self._proxy_timeout_seconds(self.timeout)
+            _log(
+                f"[DesktopEnvTool] screenshot step request_id={request_id} "
+                f"session_id={session_id} timeout={self.timeout.total} proxy_timeout={proxy_timeout}"
+            )
             resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
                 {
                     "request_id": request_id,
                     "action": "import time; time.sleep(0)",
                     "pause": 0,
+                    "timeout_seconds": proxy_timeout,
                 },
                 retry_timeout_only=True,
             )
@@ -957,21 +986,26 @@ class DesktopEnvTool(BaseTool):
             status = parameters.get("status")
             code = "FAIL" if status == "failure" else "DONE"
             request_id = str(uuid4())
-            terminate_timeout = aiohttp.ClientTimeout(
-                total=max(self.timeout_seconds, self.pause + self.step_timeout_margin)
-            )
+            terminate_timeout = self.timeout
+            proxy_timeout = self._proxy_timeout_seconds(terminate_timeout)
             error_context = (
                 f"step_action={action} actual_action={code!r} "
-                f"timeout={terminate_timeout.total}s pause={self.pause}"
+                f"timeout={terminate_timeout.total}s proxy_timeout={proxy_timeout}s pause={self.pause}"
             )
             _log(
                 f"[DesktopEnvTool] terminate step request_id={request_id} "
-                f"session_id={session_id} status={status} code={code} timeout={terminate_timeout.total}"
+                f"session_id={session_id} status={status} code={code} "
+                f"timeout={terminate_timeout.total} proxy_timeout={proxy_timeout}"
             )
             try:
                 resp = await self._post_with_retries(
                     f"/session/{session_id}/step",
-                    {"request_id": request_id, "action": code, "pause": self.pause},
+                    {
+                        "request_id": request_id,
+                        "action": code,
+                        "pause": self.pause,
+                        "timeout_seconds": proxy_timeout,
+                    },
                     timeout=terminate_timeout,
                     retry_timeout_only=True,
                     error_context=error_context,
@@ -1023,22 +1057,30 @@ class DesktopEnvTool(BaseTool):
             )
         pause = self.pause
         step_timeout = self._step_timeout_for_action(action, parameters, pause)
+        proxy_timeout = self._proxy_timeout_seconds(step_timeout)
         expected_seconds = self._estimate_step_execution_seconds(action, parameters, pause)
         request_id = str(uuid4())
         _log(
             f"[DesktopEnvTool] step request_id={request_id} "
             f"session_id={session_id} action={action} raw_coordinate={raw_coordinate} "
             f"actual_coordinate={actual_coordinate} code={code} pause={pause} "
-            f"expected_action_seconds={expected_seconds:.2f} timeout={step_timeout.total}"
+            f"expected_action_seconds={expected_seconds:.2f} "
+            f"timeout={step_timeout.total} proxy_timeout={proxy_timeout}"
         )
         error_context = (
             f"step_action={action} actual_action={code!r} "
-            f"timeout={step_timeout.total}s expected_action_seconds={expected_seconds:.2f} pause={pause}"
+            f"timeout={step_timeout.total}s proxy_timeout={proxy_timeout}s "
+            f"expected_action_seconds={expected_seconds:.2f} pause={pause}"
         )
         try:
             resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
-                {"request_id": request_id, "action": code, "pause": pause},
+                {
+                    "request_id": request_id,
+                    "action": code,
+                    "pause": pause,
+                    "timeout_seconds": proxy_timeout,
+                },
                 timeout=step_timeout,
                 retry_timeout_only=True,
                 error_context=error_context,
@@ -1089,14 +1131,21 @@ class DesktopEnvTool(BaseTool):
             return 0.0
         session_id = info["session_id"]
 
-        _log(f"[DesktopEnvTool] evaluate session_id={session_id} local_settle={self.evaluate_settle_seconds}s")
+        evaluate_proxy_timeout = self._proxy_timeout_seconds(self.evaluate_timeout)
+        _log(
+            f"[DesktopEnvTool] evaluate session_id={session_id} "
+            f"local_settle={self.evaluate_settle_seconds}s "
+            f"timeout={self.evaluate_timeout.total} proxy_timeout={evaluate_proxy_timeout}"
+        )
         if self.evaluate_settle_seconds > 0:
             await asyncio.sleep(self.evaluate_settle_seconds)
         try:
             resp = await self._post_with_retries(
                 f"/session/{session_id}/evaluate",
+                {"timeout_seconds": evaluate_proxy_timeout},
                 timeout=self.evaluate_timeout,
                 retry_timeout_only=True,
+                error_context=f"timeout={self.evaluate_timeout.total}s proxy_timeout={evaluate_proxy_timeout}s",
             )
         except Exception:
             _log(
