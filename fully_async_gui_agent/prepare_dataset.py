@@ -39,7 +39,7 @@ Full dataset, 95/5 split, default URL::
 Single-domain smoke dataset::
 
     uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
-        --api-base-url http://10.192.64.33:2354 \\
+        --api-base-url http://172.31.13.38:2354 \\
         --domain chrome \\
         --limit 20 \\
         --train-ratio 0.8 \\
@@ -48,7 +48,7 @@ Single-domain smoke dataset::
 Stable task-file dataset::
 
     uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
-        --api-base-url http://10.192.64.33:2354 \\
+        --api-base-url http://172.31.13.38:2354 \\
         --output-dir /tmp/cua_stable
 
 By default, ``--task-file`` is ``test_stable.json``; the rl server resolves it
@@ -57,7 +57,7 @@ under its configured task examples directory.
 RL-proxy train/eval split dataset::
 
     uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
-        --api-base-url http://10.192.64.238:2354 \\
+        --api-base-url http://172.31.13.38:2354 \\
         --from-proxy-splits \\
         --output-dir /efs/data/cua/rl/osworld
 
@@ -292,8 +292,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--api-base-url",
-        default=os.environ.get("DESKTOP_API_BASE_URL", "http://10.192.64.238:2354"),
-        help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://10.192.64.238:2354).",
+        default=os.environ.get("DESKTOP_API_BASE_URL", "http://172.31.13.38:2354"),
+        help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://172.31.13.38:2354).",
     )
     parser.add_argument(
         "--auth-token",

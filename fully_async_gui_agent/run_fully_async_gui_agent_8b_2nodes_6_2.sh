@@ -95,7 +95,7 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 # ================= algorithm =================
 adv_estimator=grpo
 
-max_turns=${max_turns:-30}
+max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-24576}
 max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-1e-6}
@@ -109,11 +109,11 @@ loss_scale_factor=${loss_scale_factor:-${max_response_length}}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-8}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-32}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
-test_freq=${test_freq:-50}
+test_freq=${test_freq:-30}
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
@@ -144,10 +144,10 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # Two nodes double rollout capacity relative to run_fully_async_gui_agent_8b_6_2.sh.
-max_concurrent_rollouts=${max_concurrent_rollouts:-192}
+max_concurrent_rollouts=${max_concurrent_rollouts:-160}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
-max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-96}
+max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-160}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
