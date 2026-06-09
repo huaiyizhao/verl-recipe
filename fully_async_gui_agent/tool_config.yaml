@@ -19,8 +19,10 @@ tools:
       evaluate_server_timeout: 600
       max_retries: 1
       connect_max_retries: 3
-      connect_retry_interval: 5
+      connect_retry_jitter_min: 3
+      connect_retry_jitter_max: 8
       retry_interval: 30
+      create_jitter_seconds: 5
       http_reuse_session: false
       http_force_close: true      # close TCP connections after every request to avoid stale keep-alive reuse
       pause: 2.0

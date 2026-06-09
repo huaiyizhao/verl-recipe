@@ -37,11 +37,12 @@ screenshots gracefully.
 
 import asyncio
 import base64
-import copy
 import io
+import importlib.util
 import logging
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -54,6 +55,24 @@ from PIL import Image
 from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.utils.rollout_trace import rollout_trace_op
+
+try:
+    from recipe.fully_async_gui_agent.computer_use_schema import (
+        _COMPUTER_USE_TOOL,
+        build_computer_use_system_prompt,
+        build_computer_use_tool_dict,
+    )
+except ModuleNotFoundError:
+    _schema_path = os.path.join(os.path.dirname(__file__), "computer_use_schema.py")
+    _schema_spec = importlib.util.spec_from_file_location("_gui_agent_computer_use_schema", _schema_path)
+    if _schema_spec is None or _schema_spec.loader is None:
+        raise RuntimeError(f"Unable to load computer_use_schema.py from {_schema_path}")
+    _schema_module = importlib.util.module_from_spec(_schema_spec)
+    sys.modules[_schema_spec.name] = _schema_module
+    _schema_spec.loader.exec_module(_schema_module)
+    _COMPUTER_USE_TOOL = _schema_module._COMPUTER_USE_TOOL
+    build_computer_use_system_prompt = _schema_module.build_computer_use_system_prompt
+    build_computer_use_tool_dict = _schema_module.build_computer_use_tool_dict
 
 # We bypass the ``logging`` framework for INFO/DEBUG lines because verl's
 # global ``basicConfig(WARNING)`` plus Ray's early-attached handlers silently
@@ -131,95 +150,18 @@ def _short_repr(obj: Any, limit: int = _MAX_LOG_BODY) -> str:
     return s
 
 
-# ---------------------------------------------------------------------------
-# computer_use tool schema (Qwen-VL compatible)
-# Ref: https://github.com/QwenLM/Qwen3-VL/blob/main/cookbooks/utils/agent_function_call.py
-# ---------------------------------------------------------------------------
-_COMPUTER_USE_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "computer_use",
-        "description": (
-            "Use a mouse and keyboard to interact with a computer, and take screenshots.\n"
-            "* This is an interface to a desktop GUI. You do not have access to a terminal or "
-            "applications menu. You must click on desktop icons to start applications.\n"
-            "* Some applications may take time to start or process actions, so you may need to wait "
-            "and take successive screenshots to see the results of your actions.\n"
-            "* The screen's resolution is {screen_width}x{screen_height}.\n"
-            "* Whenever you intend to move the cursor to click on an element like an icon, you should "
-            "consult a screenshot to determine the coordinates of the element before moving the cursor.\n"
-            "* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of "
-            "the element. Don't click boxes on their edges."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "description": (
-                        "The action to perform. Available actions:\n"
-                        "* `key`: Key down presses on the arguments passed in order, then key releases in reverse.\n"
-                        "* `type`: Type a string of text on the keyboard.\n"
-                        "* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate.\n"
-                        "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate.\n"
-                        "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate.\n"
-                        "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate.\n"
-                        "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate.\n"
-                        "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate.\n"
-                        "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate.\n"
-                        "* `scroll`: Scroll the mouse wheel.\n"
-                        "* `hscroll`: Horizontal scroll.\n"
-                        "* `wait`: Wait specified seconds for the change to happen.\n"
-                        "* `terminate`: Terminate the current task and report its completion status.\n"
-                        "* `answer`: Answer a question."
-                    ),
-                    "enum": [
-                        "key",
-                        "type",
-                        "mouse_move",
-                        "left_click",
-                        "left_click_drag",
-                        "right_click",
-                        "middle_click",
-                        "double_click",
-                        "triple_click",
-                        "scroll",
-                        "hscroll",
-                        "wait",
-                        "terminate",
-                        "answer",
-                    ],
-                    "type": "string",
-                },
-                "keys": {"description": "Required only by `action=key`.", "type": "array"},
-                "text": {"description": "Required only by `action=type` and `action=answer`.", "type": "string"},
-                "coordinate": {
-                    "description": "(x, y): pixel coordinates.",
-                    "type": "array",
-                },
-                "pixels": {
-                    "description": "Scrolling amount; positive scrolls up, negative scrolls down.",
-                    "type": "number",
-                },
-                "time": {"description": "Seconds to wait. Required only by `action=wait`.", "type": "number"},
-                "status": {
-                    "description": "Status of the task. Required only by `action=terminate`.",
-                    "type": "string",
-                    "enum": ["success", "failure"],
-                },
-            },
-            "required": ["action"],
-        },
-    },
-}
+def _request_log_context(request_body: dict) -> str:
+    request_id = request_body.get("request_id", "<none>")
+    session_id = request_body.get("session_id")
+    if session_id is None:
+        return f"request_id={request_id}"
+    return f"request_id={request_id} session_id={session_id}"
 
 
 def _build_tool_schema(screen_width: int, screen_height: int) -> OpenAIFunctionToolSchema:
-    tool = copy.deepcopy(_COMPUTER_USE_TOOL)
-    tool["function"]["description"] = tool["function"]["description"].format(
-        screen_width=screen_width,
-        screen_height=screen_height,
+    return OpenAIFunctionToolSchema.model_validate(
+        build_computer_use_tool_dict(screen_width, screen_height)
     )
-    return OpenAIFunctionToolSchema.model_validate(tool)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +187,36 @@ def _denorm_coord(
     return abs_x, abs_y
 
 
+def _clean_keys(keys: Any) -> list[str]:
+    """Normalize model-emitted key arrays into pyautogui key names."""
+    if not keys:
+        return []
+    cleaned_keys = []
+    for key in keys:
+        if isinstance(key, str):
+            if key.startswith("keys=["):
+                key = key[6:]
+            if key.endswith("]"):
+                key = key[:-1]
+            if key.startswith("['") or key.startswith('["'):
+                key = key[2:] if len(key) > 2 else key
+            if key.endswith("']") or key.endswith('"]'):
+                key = key[:-2] if len(key) > 2 else key
+            key = key.strip()
+        cleaned_keys.append(str(key))
+    return cleaned_keys
+
+
+def _with_held_keys(code: str, keys: list[str]) -> str:
+    """Wrap pyautogui code with keyDown/keyUp for modifier-style actions."""
+    if not keys:
+        return code
+    lines = [f"pyautogui.keyDown({key!r})" for key in keys]
+    lines.extend(line for line in code.split("\n") if line)
+    lines.extend(f"pyautogui.keyUp({key!r})" for key in reversed(keys))
+    return "\n".join(lines)
+
+
 def _translate_action_to_pyautogui(
     parameters: dict[str, Any],
     source_screen_width: int,
@@ -264,6 +236,7 @@ def _translate_action_to_pyautogui(
     """
     action = parameters.get("action", "")
     coord = parameters.get("coordinate")
+    keys = _clean_keys(parameters.get("keys", []))
 
     if action == "terminate" or action == "answer":
         return None
@@ -280,37 +253,37 @@ def _translate_action_to_pyautogui(
     if action == "left_click":
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return "pyautogui.click()"
+            return _with_held_keys("pyautogui.click()", keys)
         x, y = adjusted
-        return f"pyautogui.click({x}, {y})"
+        return _with_held_keys(f"pyautogui.click({x}, {y})", keys)
 
     if action == "right_click":
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return "pyautogui.rightClick()"
+            return _with_held_keys("pyautogui.rightClick()", keys)
         x, y = adjusted
-        return f"pyautogui.rightClick({x}, {y})"
+        return _with_held_keys(f"pyautogui.rightClick({x}, {y})", keys)
 
     if action == "middle_click":
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return "pyautogui.middleClick()"
+            return _with_held_keys("pyautogui.middleClick()", keys)
         x, y = adjusted
-        return f"pyautogui.middleClick({x}, {y})"
+        return _with_held_keys(f"pyautogui.middleClick({x}, {y})", keys)
 
     if action == "double_click":
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return "pyautogui.doubleClick()"
+            return _with_held_keys("pyautogui.doubleClick()", keys)
         x, y = adjusted
-        return f"pyautogui.doubleClick({x}, {y})"
+        return _with_held_keys(f"pyautogui.doubleClick({x}, {y})", keys)
 
     if action == "triple_click":
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return "pyautogui.tripleClick()"
+            return _with_held_keys("pyautogui.tripleClick()", keys)
         x, y = adjusted
-        return f"pyautogui.tripleClick({x}, {y})"
+        return _with_held_keys(f"pyautogui.tripleClick({x}, {y})", keys)
 
     if action == "left_click_drag":
         adjusted = adjusted_coordinate(default=(0, 0))
@@ -330,20 +303,7 @@ def _translate_action_to_pyautogui(
         return "\n".join(code_lines)
 
     if action == "key":
-        keys = parameters.get("keys", []) or []
-        cleaned_keys = []
-        for key in keys:
-            if isinstance(key, str):
-                if key.startswith("keys=["):
-                    key = key[6:]
-                if key.endswith("]"):
-                    key = key[:-1]
-                if key.startswith("['") or key.startswith('["'):
-                    key = key[2:] if len(key) > 2 else key
-                if key.endswith("']") or key.endswith('"]'):
-                    key = key[:-2] if len(key) > 2 else key
-                key = key.strip()
-            cleaned_keys.append(key)
+        cleaned_keys = keys
         keys_str = ", ".join(repr(str(key)) for key in cleaned_keys)
         if len(cleaned_keys) > 1:
             return f"pyautogui.hotkey({keys_str})"
@@ -353,13 +313,14 @@ def _translate_action_to_pyautogui(
         pixels = int(parameters.get("pixels", 0) or 0)
         adjusted = adjusted_coordinate()
         if adjusted is None:
-            return f"pyautogui.scroll({pixels})"
+            return _with_held_keys(f"pyautogui.scroll({pixels})", keys)
         x, y = adjusted
-        return f"pyautogui.moveTo({x}, {y})\npyautogui.scroll({pixels})"
+        scroll_code = _with_held_keys(f"pyautogui.scroll({pixels})", keys)
+        return f"pyautogui.moveTo({x}, {y})\n{scroll_code}"
 
     if action == "hscroll":
         pixels = int(parameters.get("pixels", 0) or 0)
-        return f"pyautogui.scroll({pixels})"
+        return _with_held_keys(f"pyautogui.hscroll({pixels})", keys)
 
     if action == "wait":
         return "WAIT"
@@ -397,6 +358,16 @@ _COORD_ACTIONS = {
     "triple_click",
     "left_click_drag",
 }
+_KEYS_ACTIONS = {
+    "key",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "scroll",
+    "hscroll",
+}
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -420,6 +391,10 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
         valid_list = ", ".join(_VALID_COMPUTER_USE_ACTIONS)
         return f"unknown action {action!r}. Valid computer_use actions are: {valid_list}"
 
+    keys = parameters.get("keys")
+    if keys is not None and action in _KEYS_ACTIONS and not isinstance(keys, list):
+        return f"action {action!r} requires keys as an array when provided"
+
     if action in _COORD_ACTIONS:
         coord = parameters.get("coordinate")
         if coord is not None:
@@ -428,10 +403,6 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
     if action == "type":
         if "text" in parameters and not isinstance(parameters.get("text"), str):
             return "action 'type' requires text as a string"
-    elif action == "key":
-        keys = parameters.get("keys")
-        if keys is not None and not isinstance(keys, list):
-            return "action 'key' requires keys as an array when provided"
     elif action in {"scroll", "hscroll"}:
         coord = parameters.get("coordinate")
         if coord is not None:
@@ -515,9 +486,13 @@ class DesktopEnvTool(BaseTool):
             request (default True).
         connect_max_retries (int): Retry budget for connection-stage failures
             (default follows ``max_retries``).
-        connect_retry_interval (float): Sleep before retrying connection-stage
-            failures (default 5.0). Other retryable failures use
-            ``retry_interval``.
+        connect_retry_jitter_min (float): Minimum sleep before retrying
+            connection-stage failures (default 3.0).
+        connect_retry_jitter_max (float): Maximum sleep before retrying
+            connection-stage failures (default 8.0). Other retryable failures
+            use ``retry_interval``.
+        create_jitter_seconds (float): Maximum random sleep before
+            ``/session/create``. ``0`` disables create jitter (default 0.0).
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -545,9 +520,15 @@ class DesktopEnvTool(BaseTool):
         # whether an endpoint is safe to retry.
         self.max_retries = int(config.get("max_retries", 1))
         self.connect_max_retries = int(config.get("connect_max_retries", self.max_retries))
-        self.connect_retry_interval = float(config.get("connect_retry_interval", 5.0))
+        self.connect_retry_jitter_min = float(config.get("connect_retry_jitter_min", 3.0))
+        self.connect_retry_jitter_max = float(config.get("connect_retry_jitter_max", 8.0))
+        if self.connect_retry_jitter_max < self.connect_retry_jitter_min:
+            raise ValueError("connect_retry_jitter_max must be >= connect_retry_jitter_min")
         self.retry_interval = float(config.get("retry_interval", 30.0))
         self.connect_timeout_seconds = float(config.get("connect_timeout", 10.0))
+        self.create_jitter_seconds = float(config.get("create_jitter_seconds", 0.0))
+        if self.create_jitter_seconds < 0:
+            raise ValueError("create_jitter_seconds must be non-negative")
 
         # HTTP connection config. By default, each request gets a fresh
         # ClientSession/TCP connection. Session reuse is opt-in.
@@ -707,12 +688,12 @@ class DesktopEnvTool(BaseTool):
         """
         url = f"{self.api_base_url}{path}"
         request_body = payload or {}
-        request_id = request_body.get("request_id", "<none>")
+        request_context = _request_log_context(request_body)
         if timeout is None:
             raise ValueError(f"POST {path} requires an explicit timeout")
         effective_timeout = timeout
 
-        _log(f"[DesktopEnvTool] -> POST path={path} request_id={request_id} payload={_short_repr(request_body)}")
+        _log(f"[DesktopEnvTool] -> POST path={path} {request_context} payload={_short_repr(request_body)}")
 
         if self.http_reuse_session:
             session = await self._get_http_session()
@@ -750,12 +731,12 @@ class DesktopEnvTool(BaseTool):
                         )
                         raise RuntimeError(f"POST {path} returned non-JSON body: {text_body!r}") from je
                     _log(
-                        f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                        f"[DesktopEnvTool] <- POST path={path} {request_context} "
                         f"status={status} response={_short_repr(data)}"
                     )
                     return data
                 _log(
-                    f"[DesktopEnvTool] <- POST path={path} request_id={request_id} "
+                    f"[DesktopEnvTool] <- POST path={path} {request_context} "
                     f"status={status} empty body (content_type={content_type})"
                 )
                 return {}
@@ -779,7 +760,7 @@ class DesktopEnvTool(BaseTool):
         transport_max_retries = self.max_retries if max_retries is None else max_retries
         connect_max_retries = self.connect_max_retries if max_retries is None else max_retries
         request_body = payload or {}
-        request_id = request_body.get("request_id", "<none>")
+        request_context = _request_log_context(request_body)
         last_exc: BaseException | None = None
         attempt = 0
         transport_failures = 0
@@ -809,7 +790,7 @@ class DesktopEnvTool(BaseTool):
                     context = f" | {error_context}" if error_context else ""
                     error_kind = self._transport_error_kind(exc)
                     _log(
-                        f"[DesktopEnvTool] POST {path} request_id={request_id} "
+                        f"[DesktopEnvTool] POST {path} {request_context} "
                         f"failed after {attempt} attempt(s) ({error_kind}, "
                         f"{error_kind} failures={current_failures}/{max_failures}): {self._error_detail(exc)} | "
                         f"payload={_short_repr(request_body)}{context}",
@@ -823,9 +804,13 @@ class DesktopEnvTool(BaseTool):
                     )
                     raise
                 error_kind = self._transport_error_kind(exc)
-                retry_interval = self.connect_retry_interval if is_connect_error else self.retry_interval
+                retry_interval = (
+                    random.uniform(self.connect_retry_jitter_min, self.connect_retry_jitter_max)
+                    if is_connect_error
+                    else self.retry_interval
+                )
                 _log(
-                    f"[DesktopEnvTool] POST {path} request_id={request_id} "
+                    f"[DesktopEnvTool] POST {path} {request_context} "
                     f"{error_kind} (attempt {attempt}, {error_kind} failures "
                     f"{current_failures}/{max_failures}): {self._error_detail(exc)}. "
                     f"Retrying in {retry_interval:.1f}s"
@@ -867,6 +852,14 @@ class DesktopEnvTool(BaseTool):
             raise ValueError("create_kwargs must contain 'task_id'")
 
         _log(f"[DesktopEnvTool] create session task_id={task_id} instance_id={instance_id}")
+        if self.create_jitter_seconds > 0:
+            jitter_seconds = random.uniform(0.0, self.create_jitter_seconds)
+            _log(
+                f"[DesktopEnvTool] create jitter sleep={jitter_seconds:.3f}s "
+                f"task_id={task_id} instance_id={instance_id}",
+                debug=True,
+            )
+            await asyncio.sleep(jitter_seconds)
 
         try:
             payload = {
@@ -1043,11 +1036,18 @@ class DesktopEnvTool(BaseTool):
                 {"action": action, **meta},
             )
         if action == "answer":
+            answer_text = parameters.get("text", "")
             _log(f"[DesktopEnvTool] virtual action=answer session_id={session_id}")
             return (
-                ToolResponse(text=f"Answer: {parameters.get('text', '')}"),
+                ToolResponse(text=f"Answer: {answer_text}"),
                 0.0,
-                {"action": action},
+                {
+                    "action": action,
+                    "answer": answer_text,
+                    "code": "DONE",
+                    "done": True,
+                    "status": "success",
+                },
             )
 
         code = _translate_action_to_pyautogui(
