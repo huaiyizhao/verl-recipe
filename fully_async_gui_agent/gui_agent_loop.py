@@ -106,6 +106,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         # Multi-turn config.
         self.max_turns = self.rollout_config.multi_turn.max_assistant_turns or 20
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
+        self.turn_penalty_coef = float(self.rollout_config.agent.get("turn_penalty_coef", 0.0) or 0.0)
         self.keep_last_k = 3  # default; can be overridden per-task via create_kwargs
         self.history_n = 4  # default; can be overridden per-task via create_kwargs
 
@@ -588,7 +589,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # env tool's retries, it returns reward=0 rather than discarding
             # the rollout.
             try:
-                shared_reward = await self.desktop_tool.calc_reward(instance_id)
+                base_reward = await self.desktop_tool.calc_reward(instance_id)
             except Exception as reward_exc:
                 _log(
                     f"[GUIAgentLoop] calc_reward failed for {task_id} {log_tag}: {reward_exc!r}; "
@@ -603,7 +604,13 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     level="ERROR",
                 )
                 return None
-            _log(f"{log_tag} Final reward = {shared_reward:.4f} (turns={turn}, stop_reason={stop_reason})")
+            turn_penalty = self.turn_penalty_coef * max(0, turn - 1) / max(1, self.max_turns)
+            shared_reward = base_reward - turn_penalty
+            _log(
+                f"{log_tag} Final reward = {shared_reward:.4f} "
+                f"(base={base_reward:.4f}, turn_penalty={turn_penalty:.4f}, "
+                f"turns={turn}, stop_reason={stop_reason})"
+            )
 
             # Build the final AgentLoopOutput from the last turn's snapshot.
             final_extra_fields = dict(last_turn_ctx["extra_fields"])
@@ -635,7 +642,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                 f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                 f"turns={turn} stop_reason={stop_reason} "
-                f"reward={shared_reward:.4f} "
+                f"reward={shared_reward:.4f} base_reward={base_reward:.4f} "
+                f"turn_penalty={turn_penalty:.4f} "
                 f"num_intermediate={num_intermediate} "
                 f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
                 f"final_response_len={len(last_turn_ctx['response_ids'])} "

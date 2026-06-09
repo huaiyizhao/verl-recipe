@@ -493,6 +493,10 @@ class DesktopEnvTool(BaseTool):
             use ``retry_interval``.
         create_jitter_seconds (float): Maximum random sleep before
             ``/session/create``. ``0`` disables create jitter (default 0.0).
+        create_status_max_retries (int): Retry budget for retryable HTTP
+            status errors from ``/session/create`` (default 0).
+        create_retry_statuses (list[int]): HTTP statuses treated as retryable
+            for ``/session/create`` (default [429, 500, 502, 503, 504]).
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -529,6 +533,11 @@ class DesktopEnvTool(BaseTool):
         self.create_jitter_seconds = float(config.get("create_jitter_seconds", 0.0))
         if self.create_jitter_seconds < 0:
             raise ValueError("create_jitter_seconds must be non-negative")
+        self.create_status_max_retries = int(config.get("create_status_max_retries", 0))
+        if self.create_status_max_retries < 0:
+            raise ValueError("create_status_max_retries must be non-negative")
+        self.create_retry_statuses = tuple(int(status) for status in config.get("create_retry_statuses", [429, 500, 502, 503, 504]))
+        self.create_status_retry_interval = float(config.get("create_status_retry_interval", 30.0))
 
         # HTTP connection config. By default, each request gets a fresh
         # ClientSession/TCP connection. Session reuse is opt-in.
@@ -658,6 +667,8 @@ class DesktopEnvTool(BaseTool):
 
     @staticmethod
     def _transport_error_kind(exc: BaseException) -> str:
+        if isinstance(exc, aiohttp.ClientResponseError):
+            return f"http {exc.status}"
         if isinstance(exc, aiohttp.ConnectionTimeoutError):
             return "connect timeout"
         if isinstance(exc, aiohttp.ClientConnectorError):
@@ -755,6 +766,9 @@ class DesktopEnvTool(BaseTool):
         max_retries: int | None = None,
         retry_transport: bool = True,
         retry_timeout_only: bool = False,
+        retry_statuses: tuple[int, ...] | None = None,
+        status_max_retries: int = 0,
+        status_retry_interval: float | None = None,
         error_context: str | None = None,
     ) -> dict:
         transport_max_retries = self.max_retries if max_retries is None else max_retries
@@ -765,6 +779,9 @@ class DesktopEnvTool(BaseTool):
         attempt = 0
         transport_failures = 0
         connect_failures = 0
+        status_failures = 0
+        retry_status_set = set(retry_statuses or ())
+        status_retry_interval = self.retry_interval if status_retry_interval is None else status_retry_interval
         while True:
             attempt += 1
             try:
@@ -772,13 +789,24 @@ class DesktopEnvTool(BaseTool):
             except Exception as exc:
                 last_exc = exc
                 is_connect_error = self._is_connect_error(exc)
-                if retry_timeout_only:
+                is_retryable_status = (
+                    isinstance(exc, aiohttp.ClientResponseError)
+                    and exc.status in retry_status_set
+                    and status_max_retries > 0
+                )
+                if is_retryable_status:
+                    retryable = True
+                elif retry_timeout_only:
                     retryable = self._is_timeout_error(exc)
                 else:
                     retryable = retry_transport and self._is_retryable_transport_error(exc)
                 if retryable:
                     await self._reset_http_session()
-                if is_connect_error:
+                if is_retryable_status:
+                    status_failures += 1
+                    current_failures = status_failures
+                    max_failures = status_max_retries + 1
+                elif is_connect_error:
                     connect_failures += 1
                     current_failures = connect_failures
                     max_failures = connect_max_retries + 1
@@ -804,11 +832,13 @@ class DesktopEnvTool(BaseTool):
                     )
                     raise
                 error_kind = self._transport_error_kind(exc)
-                retry_interval = (
-                    random.uniform(self.connect_retry_jitter_min, self.connect_retry_jitter_max)
-                    if is_connect_error
-                    else self.retry_interval
-                )
+                if is_retryable_status:
+                    error_kind = f"http {exc.status}"
+                    retry_interval = status_retry_interval * random.uniform(0.75, 1.25)
+                elif is_connect_error:
+                    retry_interval = random.uniform(self.connect_retry_jitter_min, self.connect_retry_jitter_max)
+                else:
+                    retry_interval = self.retry_interval
                 _log(
                     f"[DesktopEnvTool] POST {path} {request_context} "
                     f"{error_kind} (attempt {attempt}, {error_kind} failures "
@@ -871,6 +901,9 @@ class DesktopEnvTool(BaseTool):
                 "/session/create",
                 payload,
                 timeout=self.create_timeout,
+                retry_statuses=self.create_retry_statuses,
+                status_max_retries=self.create_status_max_retries,
+                status_retry_interval=self.create_status_retry_interval,
             )
             session_id = resp.get("session_id")
             if not session_id:

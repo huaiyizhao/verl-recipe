@@ -99,6 +99,9 @@ max_response_length=${max_response_length:-8192}
 actor_lr=${actor_lr:-1e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
+turn_penalty_coef=${turn_penalty_coef:-0.1}
+loss_agg_mode=${loss_agg_mode:-seq-mean-token-sum-norm}
+loss_scale_factor=${loss_scale_factor:-${max_response_length}}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
@@ -169,6 +172,7 @@ cd "${VERL_ROOT}"
 
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
+    algorithm.norm_adv_by_std_in_grpo=False \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \
@@ -193,7 +197,8 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
-    actor_rollout_ref.actor.loss_agg_mode=token-mean \
+    actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.loss_scale_factor=${loss_scale_factor} \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -233,6 +238,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
+    actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \

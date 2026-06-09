@@ -13,7 +13,7 @@ tools:
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
       close_timeout: 60
       connect_timeout: 10
-      create_timeout: 600
+      create_timeout: 1200
       step_timeout: 400
       evaluate_timeout: 605
       evaluate_server_timeout: 600
@@ -23,6 +23,9 @@ tools:
       connect_retry_jitter_max: 8
       retry_interval: 30
       create_jitter_seconds: 5
+      create_status_max_retries: 1
+      create_status_retry_interval: 30
+      create_retry_statuses: [429, 500, 502, 503, 504]
       http_reuse_session: false
       http_force_close: true      # close TCP connections after every request to avoid stale keep-alive reuse
       pause: 2.0
