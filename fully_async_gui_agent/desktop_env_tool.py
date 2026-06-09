@@ -461,8 +461,9 @@ class DesktopEnvTool(BaseTool):
             intentionally short so connection failures retry quickly (default
             10.0).
         step_timeout (int): Client-side HTTP request timeout in seconds for
-            ``/step`` calls (default 400). ``/step`` does not forward a
-            server-side timeout.
+            ``/step`` calls (default 400).
+        step_server_timeout (int): Timeout seconds forwarded to the desktop
+            service for ``/step`` (default is slightly below step_timeout).
         evaluate_timeout (int): HTTP request timeout in seconds for
             ``/evaluate`` (default 605).
         evaluate_server_timeout (int): Timeout seconds forwarded to the
@@ -497,6 +498,8 @@ class DesktopEnvTool(BaseTool):
             status errors from ``/session/create`` (default 0).
         create_retry_statuses (list[int]): HTTP statuses treated as retryable
             for ``/session/create`` (default [429, 500, 502, 503, 504]).
+        auth_token (str): Optional Bearer token for the desktop service.
+            Defaults to ``$DESKTOP_API_AUTH_TOKEN`` or ``$RL_PROXY_AUTH_TOKEN``.
     """
 
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -509,6 +512,12 @@ class DesktopEnvTool(BaseTool):
         super().__init__(config=config, tool_schema=tool_schema)
 
         self.api_base_url = config["api_base_url"].rstrip("/")
+        self.auth_token = str(
+            config.get("auth_token")
+            or os.getenv("DESKTOP_API_AUTH_TOKEN")
+            or os.getenv("RL_PROXY_AUTH_TOKEN")
+            or ""
+        ).strip() or None
         self.screen_width = screen_width
         self.screen_height = screen_height
         # Real desktop resolution for coordinate denormalization.
@@ -559,13 +568,29 @@ class DesktopEnvTool(BaseTool):
 
         self.close_timeout = self._make_client_timeout(self.close_timeout_seconds)
         self.create_timeout = self._make_client_timeout(float(config.get("create_timeout", 600)))
-        self.step_timeout = self._make_client_timeout(float(config.get("step_timeout", 400)))
+        step_timeout_seconds = float(config.get("step_timeout", 400))
+        self.step_timeout = self._make_client_timeout(step_timeout_seconds)
+        self.step_server_timeout_seconds = float(
+            config.get("step_server_timeout", self._default_server_timeout(step_timeout_seconds))
+        )
+        if self.step_server_timeout_seconds <= 0:
+            raise ValueError("step_server_timeout must be positive")
+        if self.step_server_timeout_seconds >= step_timeout_seconds:
+            raise ValueError("step_server_timeout must be smaller than step_timeout")
         self.evaluate_timeout = self._make_client_timeout(float(config.get("evaluate_timeout", 605)))
         self.evaluate_server_timeout_seconds = float(config.get("evaluate_server_timeout", 600))
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_server_timeout(client_timeout_seconds: float) -> float:
+        """Keep server-side work timeout below the client total timeout."""
+        client_timeout_seconds = float(client_timeout_seconds)
+        if client_timeout_seconds > 60:
+            return max(1.0, client_timeout_seconds - 40.0)
+        return max(1.0, client_timeout_seconds * 0.9)
 
     def _make_client_timeout(self, read_timeout_seconds: float) -> aiohttp.ClientTimeout:
         """Build aiohttp timeout with short connect timeout and endpoint-specific total timeout."""
@@ -717,7 +742,8 @@ class DesktopEnvTool(BaseTool):
             close_session = True
 
         try:
-            async with session.post(url, json=request_body, timeout=effective_timeout) as resp:
+            headers = {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else None
+            async with session.post(url, json=request_body, timeout=effective_timeout, headers=headers) as resp:
                 status = resp.status
                 content_type = resp.content_type
                 text_body = await resp.text()
@@ -967,7 +993,8 @@ class DesktopEnvTool(BaseTool):
             request_id = str(uuid4())
             _log(
                 f"[DesktopEnvTool] screenshot step request_id={request_id} "
-                f"session_id={session_id} timeout={self.step_timeout.total}"
+                f"session_id={session_id} timeout={self.step_timeout.total} "
+                f"server_timeout={self.step_server_timeout_seconds}"
             )
             resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
@@ -975,6 +1002,7 @@ class DesktopEnvTool(BaseTool):
                     "request_id": request_id,
                     "action": "import time; time.sleep(0)",
                     "pause": 0,
+                    "timeout_seconds": self.step_server_timeout_seconds,
                 },
                 timeout=self.step_timeout,
                 retry_timeout_only=True,
@@ -1029,12 +1057,13 @@ class DesktopEnvTool(BaseTool):
             terminate_timeout = self.step_timeout
             error_context = (
                 f"step_action={action} actual_action={code!r} "
-                f"timeout={terminate_timeout.total}s pause={self.pause}"
+                f"timeout={terminate_timeout.total}s "
+                f"server_timeout={self.step_server_timeout_seconds}s pause={self.pause}"
             )
             _log(
                 f"[DesktopEnvTool] terminate step request_id={request_id} "
                 f"session_id={session_id} status={status} code={code} "
-                f"timeout={terminate_timeout.total}"
+                f"timeout={terminate_timeout.total} server_timeout={self.step_server_timeout_seconds}"
             )
             try:
                 resp = await self._post_with_retries(
@@ -1043,6 +1072,7 @@ class DesktopEnvTool(BaseTool):
                         "request_id": request_id,
                         "action": code,
                         "pause": self.pause,
+                        "timeout_seconds": self.step_server_timeout_seconds,
                     },
                     timeout=terminate_timeout,
                     retry_timeout_only=True,
@@ -1107,11 +1137,11 @@ class DesktopEnvTool(BaseTool):
             f"[DesktopEnvTool] step request_id={request_id} "
             f"session_id={session_id} action={action} raw_coordinate={raw_coordinate} "
             f"actual_coordinate={actual_coordinate} code={code} pause={pause} "
-            f"timeout={step_timeout.total}"
+            f"timeout={step_timeout.total} server_timeout={self.step_server_timeout_seconds}"
         )
         error_context = (
             f"step_action={action} actual_action={code!r} "
-            f"timeout={step_timeout.total}s pause={pause}"
+            f"timeout={step_timeout.total}s server_timeout={self.step_server_timeout_seconds}s pause={pause}"
         )
         try:
             resp = await self._post_with_retries(
@@ -1120,6 +1150,7 @@ class DesktopEnvTool(BaseTool):
                     "request_id": request_id,
                     "action": code,
                     "pause": pause,
+                    "timeout_seconds": self.step_server_timeout_seconds,
                 },
                 timeout=step_timeout,
                 retry_timeout_only=True,

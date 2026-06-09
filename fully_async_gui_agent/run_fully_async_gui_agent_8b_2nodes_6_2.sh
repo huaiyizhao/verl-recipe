@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 # Fully-Async GUI Agent (Computer-Use Agent) PPO training.
+# 8B model, two-node topology: each node uses 2 rollout GPUs and 6 training GPUs.
 #
 # Prerequisites:
 #   1. A running desktop environment service accessible via HTTP (endpoints:
@@ -60,16 +61,16 @@ RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERL_ROOT=${VERL_ROOT:-/root/verl}
 
 # ================= cluster topology =================
-NNODES=${NNODES:-1}
+NNODES=${NNODES:-2}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 # Fully-async resource split: rollout vs training GPUs.
-# With 2 nodes: each node contributes 4 GPUs for rollout + 4 GPUs for training.
-# This forces Ray to distribute workers across both nodes.
+# Each node contributes 2 GPUs for rollout + 6 GPUs for training, so the
+# cluster has 4 rollout GPUs and 12 training GPUs in total.
 n_gpus_rollout=${n_gpus_rollout:-2}
 n_gpus_training=${n_gpus_training:-6}
-rollout_nnodes=${rollout_nnodes:-1}
-trainer_nnodes=${trainer_nnodes:-1}
+rollout_nnodes=${rollout_nnodes:-${NNODES}}
+trainer_nnodes=${trainer_nnodes:-${NNODES}}
 
 # ================= data / model =================
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
@@ -142,9 +143,10 @@ calculate_entropy=${calculate_entropy:-True}
 # Sample-level in-flight capacity is derived from max_required_samples; do not
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
-max_concurrent_rollouts=${max_concurrent_rollouts:-96}
+# Two nodes double rollout capacity relative to run_fully_async_gui_agent_8b_6_2.sh.
+max_concurrent_rollouts=${max_concurrent_rollouts:-192}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
-# session pressure bounded independently from training throughput.
+# session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-96}
 
 # ================= performance =================
@@ -153,8 +155,9 @@ actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-True}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-False}
-# FSDP shards within one node across the training GPUs.
-# For this 6+2 split, fsdp_size=6 keeps all-gather within node (NVLink).
+# FSDP shards within each node across the training GPUs.
+# For this 2-node 6+2 split, fsdp_size=6 keeps all-gather within node
+# (NVLink) and avoids cross-node FSDP traffic.
 fsdp_size=${n_gpus_training}
 
 # Max packed-sequence length per GPU per micro-batch (dynamic_bsz on).
@@ -166,7 +169,7 @@ actor_ppo_max_token_len=48000
 infer_ppo_max_token_len=96000
 
 project_name=${project_name:-fully_async_gui_agent_0605}
-experiment_name=${experiment_name:-qwen3vl_8b_fsdp_async}
+experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-${test_freq}}
 

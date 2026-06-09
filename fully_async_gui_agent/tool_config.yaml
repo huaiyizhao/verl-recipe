@@ -7,14 +7,16 @@ tools:
     config:
       type: native
       api_base_url: ${oc.env:DESKTOP_API_BASE_URL,http://localhost:2354}
+      auth_token: ${oc.env:DESKTOP_API_AUTH_TOKEN,}
       screen_width: 1000   # shown to the model in the prompt (Qwen-VL normalized space)
       screen_height: 1000  # shown to the model in the prompt (Qwen-VL normalized space)
       real_screen_width: 1920   # actual desktop resolution for coordinate denormalization
       real_screen_height: 1080  # actual desktop resolution for coordinate denormalization
       close_timeout: 60
       connect_timeout: 10
-      create_timeout: 1200
+      create_timeout: 1800
       step_timeout: 400
+      step_server_timeout: 360
       evaluate_timeout: 605
       evaluate_server_timeout: 600
       max_retries: 1

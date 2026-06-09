@@ -6,7 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Generate a parquet dataset for GUI Agent training from the desktop env's /tasks API.
+"""Generate parquet datasets for GUI Agent training from the desktop env /tasks API.
 
 The desktop environment service exposes ``GET /tasks`` which returns the full
 catalog of available OSWorld tasks::
@@ -14,9 +14,14 @@ catalog of available OSWorld tasks::
     {"tasks": [{"task_id": "...", "domain": "chrome", "instruction": "...",
                 "related_apps": [...]}, ...], "total": N}
 
-This script:
-  1. Pulls the task list (optionally filtered by ``--domain``).
-  2. Shuffles and splits into train / test parquet files.
+This script supports two modes:
+
+  * Default local-split mode:
+      1. Pull one task list (optionally filtered by ``--domain``).
+      2. Shuffle and split it into train / test parquet files.
+  * RL-proxy split mode (``--from-proxy-splits``):
+      1. Pull ``/tasks?split=train`` and ``/tasks?split=test`` separately.
+      2. Write them directly to train / test parquet files.
   3. Writes rows in the schema expected by verl's ``RLHFDataset`` with
      ``data.return_raw_chat=True`` and consumed by
      ``recipe.fully_async_gui_agent.gui_agent_loop.GUIAgentLoop``:
@@ -26,7 +31,7 @@ This script:
 
 Example usage
 -------------
-Full dataset, 90/10 split, default URL::
+Full dataset, 95/5 split, default URL::
 
     uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
         --output-dir /efs/data/cua/rl
@@ -48,6 +53,16 @@ Stable task-file dataset::
 
 By default, ``--task-file`` is ``test_stable.json``; the rl server resolves it
 under its configured task examples directory.
+
+RL-proxy train/eval split dataset::
+
+    uv run python recipe/fully_async_gui_agent/prepare_dataset.py \\
+        --api-base-url http://10.192.64.238:2354 \\
+        --from-proxy-splits \\
+        --output-dir /efs/data/cua/rl/osworld
+
+In this mode the proxy resolves ``split=train`` from ``RL_PROXY_TRAIN_TASK_FILE``
+and ``split=test``/``eval`` from ``RL_PROXY_EVAL_TASK_FILE``.
 """
 
 from __future__ import annotations
@@ -89,18 +104,31 @@ DEFAULT_SYSTEM_PROMPT = _load_computer_use_schema_module().build_computer_use_sy
 # ---------------------------------------------------------------------------
 
 
-def fetch_tasks(api_base_url: str, domain: str | None, task_file: str | None, timeout: int) -> list[dict[str, Any]]:
+def fetch_tasks(
+    api_base_url: str,
+    domain: str | None,
+    task_file: str | None,
+    timeout: int,
+    *,
+    split: str | None = None,
+    auth_token: str | None = None,
+) -> list[dict[str, Any]]:
     url = api_base_url.rstrip("/") + "/tasks"
     params = {}
     if domain:
         params["domain"] = domain
     if task_file:
         params["task_file"] = task_file
+    elif split:
+        params["split"] = split
     if params:
         url += "?" + urllib.parse.urlencode(params)
 
     print(f"[prepare_dataset] GET {url}")
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         body = resp.read().decode("utf-8")
 
@@ -201,6 +229,13 @@ def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str,
     }
 
 
+def build_rows(tasks: list[dict[str, Any]], *, split: str, system_prompt: str) -> list[dict[str, Any]]:
+    rows = [build_row(task, index=i, system_prompt=system_prompt) for i, task in enumerate(tasks)]
+    for row in rows:
+        row["extra_info"]["split"] = split
+    return rows
+
+
 def split_train_test(
     rows: list[dict[str, Any]], train_ratio: float, seed: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -217,6 +252,15 @@ def split_train_test(
         n_train -= 1
 
     return shuffled[:n_train], shuffled[n_train:]
+
+
+def limit_tasks(tasks: list[dict[str, Any]], limit: int, *, label: str) -> list[dict[str, Any]]:
+    if limit and limit < len(tasks):
+        # Stable subset: sort by task_id so repeated runs produce the same slice.
+        limited = sorted(tasks, key=lambda t: t.get("task_id", ""))[:limit]
+        print(f"[prepare_dataset] Truncated {label} to first {len(limited)} tasks (--limit)")
+        return limited
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -251,17 +295,53 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("DESKTOP_API_BASE_URL", "http://10.192.64.238:2354"),
         help="Desktop env service base URL (default: $DESKTOP_API_BASE_URL or http://10.192.64.238:2354).",
     )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("RL_PROXY_AUTH_TOKEN"),
+        help="Optional Bearer token for rl-proxy /tasks (default: $RL_PROXY_AUTH_TOKEN).",
+    )
     parser.add_argument("--domain", default=None, help="Filter tasks by domain (chrome/gimp/...).")
     parser.add_argument(
         "--task-file",
         default=DEFAULT_TASK_FILE,
         help=(
             "Local task subset JSON path or file:// URL passed to the desktop service /tasks API "
-            f"(default: {DEFAULT_TASK_FILE})."
+            f"(default: {DEFAULT_TASK_FILE}). In --from-proxy-splits mode, the default value is ignored; "
+            "an explicitly supplied --task-file is used for both train and test unless overridden."
         ),
     )
+    parser.add_argument(
+        "--from-proxy-splits",
+        action="store_true",
+        help=(
+            "Fetch train and test rows separately from the rl-proxy /tasks split API "
+            "instead of locally splitting one task list."
+        ),
+    )
+    parser.add_argument(
+        "--train-split",
+        default="train",
+        help="Proxy split name for train rows in --from-proxy-splits mode (default: train).",
+    )
+    parser.add_argument(
+        "--test-split",
+        default="test",
+        help="Proxy split name for test rows in --from-proxy-splits mode (default: test; proxy aliases it to eval).",
+    )
+    parser.add_argument(
+        "--train-task-file",
+        default=None,
+        help="Explicit task_file for train rows. Overrides --train-split when set.",
+    )
+    parser.add_argument(
+        "--test-task-file",
+        default=None,
+        help="Explicit task_file for test rows. Overrides --test-split when set.",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Keep only the first N tasks (after filter). 0 = all.")
-    parser.add_argument("--train-ratio", type=float, default=0.95, help="Fraction of tasks for train split (default 0.9).")
+    parser.add_argument("--train-limit", type=int, default=0, help="Train limit in --from-proxy-splits mode. 0 falls back to --limit.")
+    parser.add_argument("--test-limit", type=int, default=0, help="Test limit in --from-proxy-splits mode. 0 falls back to --limit.")
+    parser.add_argument("--train-ratio", type=float, default=0.95, help="Fraction of tasks for train split (default 0.95).")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed.")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
     parser.add_argument(
@@ -285,32 +365,71 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    task_file_was_explicit = any(arg == "--task-file" or arg.startswith("--task-file=") for arg in sys.argv[1:])
 
-    tasks = fetch_tasks(args.api_base_url, args.domain, args.task_file, args.timeout)
-    if not tasks:
-        print("[prepare_dataset] ERROR: /tasks returned zero tasks", file=sys.stderr)
-        return 1
+    if args.from_proxy_splits:
+        train_task_file = args.train_task_file
+        test_task_file = args.test_task_file
+        if args.task_file and task_file_was_explicit:
+            if train_task_file is None:
+                train_task_file = args.task_file
+            if test_task_file is None:
+                test_task_file = args.task_file
+        train_tasks = fetch_tasks(
+            args.api_base_url,
+            args.domain,
+            train_task_file,
+            args.timeout,
+            split=args.train_split,
+            auth_token=args.auth_token,
+        )
+        test_tasks = fetch_tasks(
+            args.api_base_url,
+            args.domain,
+            test_task_file,
+            args.timeout,
+            split=args.test_split,
+            auth_token=args.auth_token,
+        )
+        if not train_tasks:
+            print("[prepare_dataset] ERROR: proxy train split returned zero tasks", file=sys.stderr)
+            return 1
+        if not test_tasks:
+            print("[prepare_dataset] ERROR: proxy test split returned zero tasks", file=sys.stderr)
+            return 1
 
-    if args.limit and args.limit < len(tasks):
-        # Stable subset: sort by task_id so repeated runs produce the same slice.
-        tasks = sorted(tasks, key=lambda t: t.get("task_id", ""))[: args.limit]
-        print(f"[prepare_dataset] Truncated to first {len(tasks)} tasks (--limit)")
+        train_limit = args.train_limit or args.limit
+        test_limit = args.test_limit or args.limit
+        train_tasks = limit_tasks(train_tasks, train_limit, label="train")
+        test_tasks = limit_tasks(test_tasks, test_limit, label="test")
+        train_rows = build_rows(train_tasks, split="train", system_prompt=args.system_prompt)
+        test_rows = build_rows(test_tasks, split="test", system_prompt=args.system_prompt)
+        print(
+            f"[prepare_dataset] Proxy splits: train={len(train_rows)} "
+            f"test={len(test_rows)} (train_split={args.train_split!r}, test_split={args.test_split!r})"
+        )
+    else:
+        tasks = fetch_tasks(args.api_base_url, args.domain, args.task_file, args.timeout, auth_token=args.auth_token)
+        if not tasks:
+            print("[prepare_dataset] ERROR: /tasks returned zero tasks", file=sys.stderr)
+            return 1
 
-    rows = [
-        build_row(task, index=i, system_prompt=args.system_prompt)
-        for i, task in enumerate(tasks)
-    ]
+        tasks = limit_tasks(tasks, args.limit, label="tasks")
+        rows = [
+            build_row(task, index=i, system_prompt=args.system_prompt)
+            for i, task in enumerate(tasks)
+        ]
 
-    train_rows, test_rows = split_train_test(rows, args.train_ratio, args.seed)
-    # Stamp each row's split label now that we know train vs test.
-    for row in train_rows:
-        row["extra_info"]["split"] = "train"
-    for row in test_rows:
-        row["extra_info"]["split"] = "test"
-    print(
-        f"[prepare_dataset] Split: train={len(train_rows)} "
-        f"test={len(test_rows)} (ratio={args.train_ratio})"
-    )
+        train_rows, test_rows = split_train_test(rows, args.train_ratio, args.seed)
+        # Stamp each row's split label now that we know train vs test.
+        for row in train_rows:
+            row["extra_info"]["split"] = "train"
+        for row in test_rows:
+            row["extra_info"]["split"] = "test"
+        print(
+            f"[prepare_dataset] Local split: train={len(train_rows)} "
+            f"test={len(test_rows)} (ratio={args.train_ratio})"
+        )
 
     train_path = os.path.join(args.output_dir, args.train_name)
     test_path = os.path.join(args.output_dir, args.test_name)
