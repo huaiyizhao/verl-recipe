@@ -51,7 +51,6 @@ from verl.experimental.agent_loop.multi_trajectory_agent_loop import (
     MultiTrajectoryAgentLoop,
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
-from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -112,6 +111,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        self.max_env_reruns = int(self.rollout_config.agent.get("max_env_reruns", 1) or 0)
+        self._rerun_released_instances: set[str] = set()
 
         # Tool registration (expects computer_use / DesktopEnvTool).
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -157,6 +158,121 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
     # Main rollout
     # ------------------------------------------------------------------
 
+    async def _rerun_after_env_failure(
+        self,
+        sampling_params: dict[str, Any],
+        kwargs: dict[str, Any],
+        *,
+        reason: str,
+        attempt: int,
+        task_id: str,
+        request_id: str,
+        sample_index: Any,
+        rollout_n: Any,
+        global_step: Any,
+        instance_id: str | None = None,
+        turn: int | None = None,
+        error: BaseException | None = None,
+    ) -> AgentLoopOutput | None:
+        if attempt >= self.max_env_reruns:
+            return None
+
+        if instance_id is not None:
+            try:
+                await asyncio.shield(self.desktop_tool.release(instance_id))
+                self._rerun_released_instances.add(instance_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._rerun_released_instances.add(instance_id)
+                _log(
+                    f"[GUIAgentLoop][ENV_RERUN_RELEASE_FAILED] task_id={task_id} "
+                    f"request_id={request_id} instance_id={instance_id} "
+                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+                    f"reason={reason}\n{traceback.format_exc()}",
+                    level="ERROR",
+                )
+
+        self._intermediate_trajectories.clear()
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["_gui_env_rerun_attempt"] = attempt + 1
+        _log(
+            f"[GUIAgentLoop][ENV_RERUN] task_id={task_id} request_id={request_id} "
+            f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
+            f"attempt={attempt + 1}/{self.max_env_reruns} reason={reason} "
+            f"turn={turn if turn is not None else '?'} err={error!r}",
+            level="ERROR",
+        )
+        return await self.run(sampling_params, **retry_kwargs)
+
+    def _log_return_none(
+        self,
+        *,
+        reason: str,
+        task_id: str,
+        request_id: str,
+        sample_index: Any,
+        rollout_n: Any,
+        global_step: Any,
+        instance_id: str | None = None,
+        turn: int | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        _log(
+            f"[GUIAgentLoop][RETURN_NONE][{reason}] "
+            f"task_id={task_id} request_id={request_id} "
+            f"instance_id={instance_id or '<none>'} sample_index={sample_index} "
+            f"rollout_n={rollout_n} step={global_step} "
+            f"turn={turn if turn is not None else '?'} err={error!r}",
+            level="ERROR",
+        )
+
+    async def _rerun_or_discard(
+        self,
+        sampling_params: dict[str, Any],
+        kwargs: dict[str, Any],
+        *,
+        reason: str,
+        attempt: int,
+        task_id: str,
+        request_id: str,
+        sample_index: Any,
+        rollout_n: Any,
+        global_step: Any,
+        instance_id: str | None = None,
+        turn: int | None = None,
+        error: BaseException | None = None,
+    ) -> AgentLoopOutput | None:
+        rerun_output = await self._rerun_after_env_failure(
+            sampling_params,
+            kwargs,
+            reason=reason,
+            attempt=attempt,
+            task_id=task_id,
+            request_id=request_id,
+            sample_index=sample_index,
+            rollout_n=rollout_n,
+            global_step=global_step,
+            instance_id=instance_id,
+            turn=turn,
+            error=error,
+        )
+        if rerun_output is not None:
+            return rerun_output
+        if attempt >= self.max_env_reruns:
+            self._log_return_none(
+                reason=reason,
+                task_id=task_id,
+                request_id=request_id,
+                sample_index=sample_index,
+                rollout_n=rollout_n,
+                global_step=global_step,
+                instance_id=instance_id,
+                turn=turn,
+                error=error,
+            )
+        return None
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | None:
         """Run the GUI agent multi-turn rollout.
@@ -172,6 +288,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             Returns ``None`` if the rollout must be discarded (env creation
             failed or a fatal error occurred mid-rollout).
         """
+        rerun_attempt = int(kwargs.pop("_gui_env_rerun_attempt", 0) or 0)
+        self._intermediate_trajectories.clear()
+
         messages = list(kwargs["raw_prompt"])
         extra_info = kwargs.get("extra_info", {}) or {}
         task_id = extra_info.get("task_id", "unknown")
@@ -224,16 +343,21 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # logger.error(..., exc_info=True); keep a single summary line
             # here to avoid duplicating the full stack.
             _log(
-                f"[GUIAgentLoop] Failed to create env for {task_id} {base_log_tag}, discarding rollout: {exc!r}",
+                f"[GUIAgentLoop] Failed to create env for {task_id} {base_log_tag}: {exc!r}",
                 level="ERROR",
             )
-            _log(
-                f"[GUIAgentLoop][RETURN_NONE][create_failed] "
-                f"task_id={task_id} request_id={request_id} sample_index={sample_index} "
-                f"rollout_n={rollout_n} step={global_step} err={exc!r}",
-                level="ERROR",
+            return await self._rerun_or_discard(
+                sampling_params,
+                kwargs,
+                reason="create_failed",
+                attempt=rerun_attempt,
+                task_id=task_id,
+                request_id=request_id,
+                sample_index=sample_index,
+                rollout_n=rollout_n,
+                global_step=global_step,
+                error=exc,
             )
-            return None
         log_tag = f"{base_log_tag}[iid={instance_id[:8]}]"
         _log(
             f"{log_tag} Env session created: instance_id={instance_id}, "
@@ -251,20 +375,29 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                         break
 
             if current_screenshot is None:
-                _log(f"[GUIAgentLoop] No initial screenshot for {task_id} {log_tag}, discarding rollout", level="ERROR")
-                return None
+                _log(f"[GUIAgentLoop] No initial screenshot for {task_id} {log_tag}", level="ERROR")
+                return await self._rerun_or_discard(
+                    sampling_params,
+                    kwargs,
+                    reason="missing_initial_screenshot",
+                    attempt=rerun_attempt,
+                    task_id=task_id,
+                    request_id=request_id,
+                    sample_index=sample_index,
+                    rollout_n=rollout_n,
+                    global_step=global_step,
+                    instance_id=instance_id,
+                )
 
             turn = 0
             fatal_error = False
+            fatal_error_exc: BaseException | None = None
             stop_reason = ""
 
             last_turn_ctx: dict[str, Any] | None = None
 
             # Persistent turn records for history strategy.
             turn_records: list[TurnRecord] = []
-
-            consecutive_tool_failures = 0
-            max_consecutive_tool_failures = int(getattr(self, "max_consecutive_tool_failures", 3))
 
             while True:
                 turn += 1
@@ -354,12 +487,24 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
                 # 4. Parse tool calls. A single model response may contain
                 # multiple computer_use calls; execute them sequentially below.
-                tool_schemas_all = [tool.tool_schema for tool in self.tools.values()]
-                _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids, tool_schemas_all)
-
                 tool_args_list: list[dict[str, Any]] = []
                 actions: list[str] = []
                 parse_error_text: str | None = None
+                tool_schemas_all = [tool.tool_schema for tool in self.tools.values()]
+                try:
+                    _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids, tool_schemas_all)
+                except Exception as parse_exc:
+                    _log(
+                        f"{log_tag}[turn={turn}] Failed to extract tool calls "
+                        f"from model output; continuing without environment step "
+                        f"(error: {parse_exc!r})",
+                        level="ERROR",
+                    )
+                    tool_calls = []
+                    parse_error_text = (
+                        "Error: invalid tool call format. "
+                        "Please emit exactly one valid computer_use tool call."
+                    )
                 if tool_calls:
                     for tool_call_idx, tool_call in enumerate(tool_calls, start=1):
                         try:
@@ -417,7 +562,6 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     try:
                         with simple_timer("tool_calls", metrics):
                             tool_response, _, tool_info = await self.desktop_tool.execute(instance_id, tool_args)
-                        consecutive_tool_failures = 0
                         if tool_info.get("invalid_action") and tool_response.text:
                             error_text = tool_response.text
                             break
@@ -435,8 +579,8 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             is_final_turn = True
                             break
                     except Exception as exec_exc:
-                        consecutive_tool_failures += 1
                         if isinstance(exec_exc, DesktopEnvStepError):
+                            fatal_error_exc = exec_exc
                             _log(
                                 f"[GUIAgentLoop][FATAL_ERROR][desktop_step_failed] "
                                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
@@ -446,47 +590,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             )
                             fatal_error = True
                             break
+                        fatal_error_exc = exec_exc
                         _log(
-                            f"[GUIAgentLoop] Tool execution failed for {task_id} {log_tag} "
-                            f"(streak={consecutive_tool_failures}/"
-                            f"{max_consecutive_tool_failures}): "
-                            f"{exec_exc!r}\n{traceback.format_exc()}",
-                            level="ERROR",
-                        )
-                        _log(
-                            f"[GUIAgentLoop][SOFT_ERROR][tool_execute] "
+                            f"[GUIAgentLoop][FATAL_ERROR][tool_execute_failed] "
                             f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                             f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                            f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r} "
-                            f"streak={consecutive_tool_failures}/"
-                            f"{max_consecutive_tool_failures}",
+                            f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r}\n"
+                            f"{traceback.format_exc()}",
                             level="ERROR",
                         )
-
-                        if consecutive_tool_failures >= max_consecutive_tool_failures:
-                            _log(
-                                f"[GUIAgentLoop][FATAL_ERROR][tool_execute_repeated] "
-                                f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
-                                f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                                f"turn={turn} tool_call_index={tool_call_idx} action={action} err={exec_exc!r}",
-                                level="ERROR",
-                            )
-                            fatal_error = True
-                            break
-
-                        error_images = await self.desktop_tool.screenshot(instance_id)
-                        _log(f"{log_tag}[turn={turn}] Error recovery screenshot: got_image={bool(error_images)}")
-
-                        tool_response = ToolResponse(
-                            image=error_images,
-                            text=(
-                                f"Error executing action {action!r}: "
-                                f"{type(exec_exc).__name__}: {exec_exc}. "
-                                f"The screen was not changed. "
-                                f"Please try a different action."
-                            ),
-                        )
-                        error_text = tool_response.text
+                        fatal_error = True
                         break
                     else:
                         _log(
@@ -559,26 +672,35 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             if fatal_error:
                 _log(
                     f"[GUIAgentLoop] Fatal error for {task_id} {log_tag} at turn={turn}, "
-                    f"discarding rollout (env-level failure, not model's fault)",
+                    f"env-level failure, not model's fault",
                     level="ERROR",
                 )
-                _log(
-                    f"[GUIAgentLoop][RETURN_NONE][fatal_error] "
-                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
-                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                    f"turn={turn}",
-                    level="ERROR",
+                return await self._rerun_or_discard(
+                    sampling_params,
+                    kwargs,
+                    reason="fatal_error",
+                    attempt=rerun_attempt,
+                    task_id=task_id,
+                    request_id=request_id,
+                    sample_index=sample_index,
+                    rollout_n=rollout_n,
+                    global_step=global_step,
+                    instance_id=instance_id,
+                    turn=turn,
+                    error=fatal_error_exc,
                 )
-                return None
 
             if last_turn_ctx is None:
                 _log(f"[GUIAgentLoop] No turns produced for {task_id} {log_tag}, discarding rollout", level="ERROR")
-                _log(
-                    f"[GUIAgentLoop][RETURN_NONE][no_turns_produced] "
-                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
-                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                    f"turn={turn}",
-                    level="ERROR",
+                self._log_return_none(
+                    reason="no_turns_produced",
+                    task_id=task_id,
+                    request_id=request_id,
+                    sample_index=sample_index,
+                    rollout_n=rollout_n,
+                    global_step=global_step,
+                    instance_id=instance_id,
+                    turn=turn,
                 )
                 return None
 
@@ -596,12 +718,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     f"discarding rollout (env-level failure, not model's fault)",
                     level="ERROR",
                 )
-                _log(
-                    f"[GUIAgentLoop][RETURN_NONE][calc_reward_failed] "
-                    f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
-                    f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
-                    f"turn={turn} err={reward_exc!r}",
-                    level="ERROR",
+                self._log_return_none(
+                    reason="calc_reward_failed",
+                    task_id=task_id,
+                    request_id=request_id,
+                    sample_index=sample_index,
+                    rollout_n=rollout_n,
+                    global_step=global_step,
+                    instance_id=instance_id,
+                    turn=turn,
+                    error=reward_exc,
                 )
                 return None
             turn_penalty = self.turn_penalty_coef * max(0, turn - 1) / max(1, self.max_turns)
@@ -652,6 +778,31 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
             return final_output
 
+        except Exception as run_exc:
+            _log(
+                f"[GUIAgentLoop][RUN_EXCEPTION] task_id={task_id} request_id={request_id} "
+                f"instance_id={instance_id} sample_index={sample_index} "
+                f"rollout_n={rollout_n} step={global_step} err={run_exc!r}\n"
+                f"{traceback.format_exc()}",
+                level="ERROR",
+            )
+            rerun_output = await self._rerun_or_discard(
+                sampling_params,
+                kwargs,
+                reason="run_exception",
+                attempt=rerun_attempt,
+                task_id=task_id,
+                request_id=request_id,
+                sample_index=sample_index,
+                rollout_n=rollout_n,
+                global_step=global_step,
+                instance_id=instance_id,
+                error=run_exc,
+            )
+            if rerun_output is not None:
+                return rerun_output
+            raise
+
         finally:
             # ``release`` must run to completion even if the surrounding
             # coroutine is being cancelled (e.g. Ray actor restart, parameter
@@ -664,16 +815,19 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
             # ``asyncio.shield`` protects the inner coroutine from outer
             # cancellation. We still re-raise CancelledError after shielding
             # so that the framework can propagate cancellation upstream.
-            try:
-                await asyncio.shield(self.desktop_tool.release(instance_id))
-            except asyncio.CancelledError:
-                _log(f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}", level="ERROR")
-                raise
-            except Exception:
-                _log(
-                    f"[GUIAgentLoop] Failed to release env for {task_id} {log_tag}\n{traceback.format_exc()}",
-                    level="ERROR",
-                )
+            if instance_id in self._rerun_released_instances:
+                self._rerun_released_instances.discard(instance_id)
+            else:
+                try:
+                    await asyncio.shield(self.desktop_tool.release(instance_id))
+                except asyncio.CancelledError:
+                    _log(f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}", level="ERROR")
+                    raise
+                except Exception:
+                    _log(
+                        f"[GUIAgentLoop] Failed to release env for {task_id} {log_tag}\n{traceback.format_exc()}",
+                        level="ERROR",
+                    )
             _log(
                 f"[GUIAgentLoop][RUN_END] task_id={task_id} request_id={request_id} "
                 f"instance_id={instance_id} sample_index={sample_index} "

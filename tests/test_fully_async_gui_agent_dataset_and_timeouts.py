@@ -112,7 +112,53 @@ def test_step_payload_forwards_server_timeout_seconds():
     assert payload["action"] == "WAIT"
     assert payload["timeout_seconds"] == 360
     assert timeout.total == 400
-    assert kwargs["retry_timeout_only"] is True
+    assert "retry_timeout_only" not in kwargs
+
+
+def test_step_failure_is_reported_as_desktop_env_step_error():
+    async def run_step():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+
+        async def fake_post(*args, **kwargs):
+            raise RuntimeError("worker step failed")
+
+        tool._post_with_retries = fake_post
+        try:
+            await tool.execute("instance-1", {"action": "wait"})
+        except desktop_env_tool.DesktopEnvStepError as exc:
+            return exc
+        raise AssertionError("execute should raise DesktopEnvStepError")
+
+    exc = asyncio.run(run_step())
+
+    assert "/step failed for action='wait'" in str(exc)
+
+
+def test_screenshot_failure_returns_empty_images():
+    async def run_screenshot():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+
+        async def fake_post(*args, **kwargs):
+            raise RuntimeError("screenshot step failed")
+
+        tool._post_with_retries = fake_post
+        return await tool.screenshot("instance-1")
+
+    assert asyncio.run(run_screenshot()) == []
 
 
 def test_desktop_tool_reads_proxy_auth_token_env():

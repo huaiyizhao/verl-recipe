@@ -99,6 +99,7 @@ max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-24576}
 max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-1e-6}
+max_env_reruns=${max_env_reruns:-1}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
@@ -109,7 +110,7 @@ loss_scale_factor=${loss_scale_factor:-${max_response_length}}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-8}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-32}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
@@ -118,7 +119,7 @@ test_freq=${test_freq:-30}
 
 # Async stream pipeline with partial rollout (see fully_async README).
 staleness_threshold=${staleness_threshold:-2}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
 partial_rollout=${partial_rollout:-True}
 
 # Rollout correction preset: RolloutCorrectionConfig.bypass_ppo_clip_geo_rs().
@@ -144,10 +145,10 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # Two nodes double rollout capacity relative to run_fully_async_gui_agent_8b_6_2.sh.
-max_concurrent_rollouts=${max_concurrent_rollouts:-160}
+max_concurrent_rollouts=${max_concurrent_rollouts:-200}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
-max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-160}
+max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -168,7 +169,7 @@ fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=48000
 infer_ppo_max_token_len=96000
 
-project_name=${project_name:-fully_async_gui_agent_0605}
+project_name=${project_name:-fully_async_gui_agent_0610}
 experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-${test_freq}}
@@ -245,6 +246,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
+    +actor_rollout_ref.rollout.agent.max_env_reruns=${max_env_reruns} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
