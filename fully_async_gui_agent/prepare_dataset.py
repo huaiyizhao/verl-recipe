@@ -75,6 +75,7 @@ import random
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 from typing import Any
 
 
@@ -129,8 +130,23 @@ def fetch_tasks(
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        body = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        print(
+            f"[prepare_dataset] HTTP error from /tasks: "
+            f"status={exc.code} reason={exc.reason!r} url={url} body={error_body!r}",
+            file=sys.stderr,
+        )
+        raise
+    except urllib.error.URLError as exc:
+        print(
+            f"[prepare_dataset] URL error from /tasks: url={url} reason={exc.reason!r}",
+            file=sys.stderr,
+        )
+        raise
 
     payload = json.loads(body)
     tasks = payload.get("tasks") or []

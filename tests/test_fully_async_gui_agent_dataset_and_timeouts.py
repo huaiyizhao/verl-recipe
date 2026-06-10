@@ -3,8 +3,15 @@ import importlib.util
 import json
 import os
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
+
+from io import BytesIO
+from types import SimpleNamespace
+
+import aiohttp
+from yarl import URL
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +80,30 @@ def test_fetch_tasks_uses_proxy_split_and_auth_header():
     assert captured["url"] == "http://proxy.example:2354/tasks?domain=chrome&split=train"
 
 
+def test_fetch_tasks_prints_http_error_body(capsys):
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "Not Found",
+            hdrs=None,
+            fp=BytesIO(b'{"detail":"no task file configured"}'),
+        )
+
+    with patch.object(prepare_dataset.urllib.request, "urlopen", fake_urlopen):
+        try:
+            prepare_dataset.fetch_tasks("http://proxy.example:2354", None, None, 17, split="eval")
+        except urllib.error.HTTPError:
+            pass
+        else:
+            raise AssertionError("fetch_tasks should re-raise HTTPError")
+
+    captured = capsys.readouterr()
+    assert "HTTP error from /tasks" in captured.err
+    assert "status=404" in captured.err
+    assert "no task file configured" in captured.err
+
+
 def test_build_rows_stamps_proxy_split():
     rows = prepare_dataset.build_rows(
         [{"task_id": "task-1", "domain": "gimp", "instruction": "paint"}],
@@ -139,6 +170,21 @@ def test_step_failure_is_reported_as_desktop_env_step_error():
     exc = asyncio.run(run_step())
 
     assert "/step failed for action='wait'" in str(exc)
+
+
+def test_http_error_detail_includes_proxy_detail():
+    exc = aiohttp.ClientResponseError(
+        request_info=SimpleNamespace(url=URL("http://proxy.example/session/s1/step")),
+        history=(),
+        status=500,
+        message='{"detail":"worker command timed out"}',
+        headers=None,
+    )
+
+    detail = desktop_env_tool.DesktopEnvTool._error_detail(exc)
+
+    assert "status=500" in detail
+    assert "worker command timed out" in detail
 
 
 def test_screenshot_failure_returns_empty_images():

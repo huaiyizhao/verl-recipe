@@ -39,6 +39,7 @@ import asyncio
 import base64
 import io
 import importlib.util
+import json
 import logging
 import math
 import os
@@ -156,6 +157,18 @@ def _request_log_context(request_body: dict) -> str:
     if session_id is None:
         return f"request_id={request_id}"
     return f"request_id={request_id} session_id={session_id}"
+
+
+def _format_http_error_body(body: str) -> str:
+    if not body:
+        return "<empty>"
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return _short_repr(body)
+    if isinstance(payload, dict) and "detail" in payload:
+        return f"proxy_detail={_short_repr(payload['detail'])}"
+    return _short_repr(payload)
 
 
 def _build_tool_schema(screen_width: int, screen_height: int) -> OpenAIFunctionToolSchema:
@@ -738,9 +751,10 @@ class DesktopEnvTool(BaseTool):
     @staticmethod
     def _error_detail(exc: BaseException) -> str:
         if isinstance(exc, aiohttp.ClientResponseError):
+            url = exc.request_info.url if exc.request_info else "<unknown>"
             return (
-                f"status={exc.status} message={exc.message!r} "
-                f"url={exc.request_info.url if exc.request_info else '<unknown>'}"
+                f"status={exc.status} url={url} "
+                f"body={_format_http_error_body(exc.message or '')}"
             )
         return str(exc) or repr(exc)
 
@@ -1083,7 +1097,7 @@ class DesktopEnvTool(BaseTool):
             except Exception as exc:
                 raise DesktopEnvStepError(
                     f"/step failed for action={action!r}, actual_action={code!r}, "
-                    f"timeout={terminate_timeout.total}s"
+                    f"timeout={terminate_timeout.total}s; cause={self._error_detail(exc)}"
                 ) from exc
             observation = resp.get("observation") or {}
             screenshot = _decode_screenshot(observation.get("screenshot"))
@@ -1160,7 +1174,7 @@ class DesktopEnvTool(BaseTool):
         except Exception as exc:
             raise DesktopEnvStepError(
                 f"/step failed for action={action!r}, actual_action={code!r}, "
-                f"timeout={step_timeout.total}s"
+                f"timeout={step_timeout.total}s; cause={self._error_detail(exc)}"
             ) from exc
 
         observation = resp.get("observation") or {}
