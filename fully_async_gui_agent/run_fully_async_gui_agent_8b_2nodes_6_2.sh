@@ -97,7 +97,7 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-24576}
+max_prompt_length=${max_prompt_length:-16384}
 max_response_length=${max_response_length:-2048}
 actor_lr=${actor_lr:-1e-6}
 max_env_reruns=${max_env_reruns:-1}
