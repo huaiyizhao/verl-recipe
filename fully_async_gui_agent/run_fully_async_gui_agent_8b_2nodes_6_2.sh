@@ -110,7 +110,6 @@ max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-16384}
 max_response_length=${max_response_length:-2048}
 actor_lr=${actor_lr:-1e-6}
-max_env_reruns=${max_env_reruns:-1}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
@@ -257,7 +256,6 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
-    +actor_rollout_ref.rollout.agent.max_env_reruns=${max_env_reruns} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
