@@ -74,7 +74,8 @@ trainer_nnodes=${trainer_nnodes:-${NNODES}}
 
 # ================= data / model =================
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0608f-general-osworld-plus-new-agentnet/v0-20260608-205226/checkpoint-1500-merged"}
+# HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0608f-general-osworld-plus-new-agentnet/v0-20260608-205226/checkpoint-1500-merged"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -97,14 +98,14 @@ adv_estimator=grpo
 
 max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-24576}
-max_response_length=${max_response_length:-4096}
+max_response_length=${max_response_length:-2048}
 actor_lr=${actor_lr:-1e-6}
 max_env_reruns=${max_env_reruns:-1}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
 loss_agg_mode=${loss_agg_mode:-seq-mean-token-sum-norm}
-loss_scale_factor=${loss_scale_factor:-${max_response_length}}
+loss_scale_factor=${loss_scale_factor:-128}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
@@ -118,8 +119,8 @@ test_freq=${test_freq:-30}
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-2}
-trigger_parameter_sync_step=${trigger_parameter_sync_step:-4}
+staleness_threshold=${staleness_threshold:-1}
+trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-True}
 
 # Rollout correction preset: RolloutCorrectionConfig.bypass_ppo_clip_geo_rs().
@@ -127,7 +128,7 @@ rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.0075}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.006}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
@@ -148,7 +149,7 @@ calculate_entropy=${calculate_entropy:-True}
 max_concurrent_rollouts=${max_concurrent_rollouts:-200}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
-max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
+max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-180}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -166,10 +167,10 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=48000
-infer_ppo_max_token_len=96000
+actor_ppo_max_token_len=54000
+infer_ppo_max_token_len=108000
 
-project_name=${project_name:-fully_async_gui_agent_0610}
+project_name=${project_name:-fully_async_gui_agent_0611}
 experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-${test_freq}}
