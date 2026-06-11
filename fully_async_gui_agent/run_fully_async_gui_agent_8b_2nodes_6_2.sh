@@ -53,12 +53,22 @@ export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 # Reduce memory fragmentation (helps with the 27GB reserved-but-unallocated).
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 # ================= paths =================
-# RECIPE_DIR is the directory containing this script (portable, no matter where
-# the script is invoked from). VERL_ROOT must point at the verl source tree so
-# that Hydra's ``hydra.searchpath: file://verl/trainer/config`` (relative to
-# CWD) can resolve. Override VERL_ROOT if you use a different verl checkout.
+# RECIPE_DIR is the directory containing this script. VERL_ROOT must point at
+# the verl source tree so Hydra's ``hydra.searchpath: file://verl/trainer/config``
+# can resolve. In Ray jobs, infer it from the packaged working_dir instead of a
+# node-local /root/verl checkout.
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERL_ROOT=${VERL_ROOT:-/root/verl}
+if [[ -z "${VERL_ROOT:-}" ]]; then
+    if [[ -d "verl/trainer/config" ]]; then
+        VERL_ROOT="$(pwd)"
+    elif [[ -d "${RECIPE_DIR}/../../verl/trainer/config" ]]; then
+        VERL_ROOT="$(cd "${RECIPE_DIR}/../.." && pwd)"
+    else
+        echo "ERROR: cannot find a complete verl source tree in Ray working_dir." >&2
+        echo "Submit from the repo root that contains both verl/ and recipe/." >&2
+        exit 1
+    fi
+fi
 
 # ================= cluster topology =================
 NNODES=${NNODES:-2}
