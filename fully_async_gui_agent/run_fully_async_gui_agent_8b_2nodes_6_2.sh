@@ -158,7 +158,7 @@ calculate_entropy=${calculate_entropy:-True}
 max_concurrent_rollouts=${max_concurrent_rollouts:-240}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
-max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-160}
+max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
