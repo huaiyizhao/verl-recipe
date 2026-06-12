@@ -6,44 +6,44 @@ from typing import Any
 _COMPUTER_USE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
+        "name_for_human": "computer_use",
         "name": "computer_use",
         "description": (
             "Use a mouse and keyboard to interact with a computer, and take screenshots.\n"
             "* This is an interface to a desktop GUI. You do not have access to a terminal or "
             "applications menu. You must click on desktop icons to start applications.\n"
             "* Some applications may take time to start or process actions, so you may need to wait "
-            "and take successive screenshots to see the results of your actions.\n"
+            "and take successive screenshots to see the results of your actions. E.g. if you click "
+            "on Firefox and a window doesn't open, try wait and taking another screenshot.\n"
             "* The screen's resolution is {screen_width}x{screen_height}.\n"
             "* Whenever you intend to move the cursor to click on an element like an icon, you should "
             "consult a screenshot to determine the coordinates of the element before moving the cursor.\n"
+            "* If you tried clicking on a program or link but it failed to load even after waiting, "
+            "try adjusting your cursor position so that the tip of the cursor visually falls on the "
+            "element that you want to click.\n"
             "* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of "
-            "the element. Don't click boxes on their edges."
+            "the element. Don't click boxes on their edges unless asked."
         ),
         "parameters": {
-            "type": "object",
             "properties": {
                 "action": {
                     "description": (
-                        "The action to perform. Available actions:\n"
-                        "* `key`: Key down presses on the arguments passed in order, then key releases in reverse.\n"
+                        "\n"
+                        "* `key`: Performs key down presses on the arguments passed in order, then performs key releases in reverse order.\n"
                         "* `type`: Type a string of text on the keyboard.\n"
-                        "* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate.\n"
-                        "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate. "
-                        "Optional `keys` are held during the click.\n"
-                        "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate.\n"
-                        "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate. "
-                        "Optional `keys` are held during the click.\n"
-                        "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate. "
-                        "Optional `keys` are held during the click.\n"
-                        "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate. "
-                        "Optional `keys` are held during the click.\n"
-                        "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate. "
-                        "Optional `keys` are held during the click.\n"
-                        "* `scroll`: Scroll the mouse wheel. Optional `keys` are held during the scroll.\n"
-                        "* `hscroll`: Horizontal scroll. Optional `keys` are held during the scroll.\n"
+                        "* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                        "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate on the screen (simulated as double-click since it's the closest action).\n"
+                        "* `scroll`: Performs a scroll of the mouse scroll wheel. If `coordinate` is provided, first move the mouse to that coordinate, then scroll.\n"
+                        "* `hscroll`: Performs a horizontal scroll (mapped to regular scroll).\n"
                         "* `wait`: Wait specified seconds for the change to happen.\n"
                         "* `terminate`: Terminate the current task and report its completion status.\n"
-                        "* `answer`: Answer a question."
+                        "* `answer`: Answer a question.\n"
+                        "        "
                     ),
                     "enum": [
                         "key",
@@ -54,40 +54,33 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                         "right_click",
                         "middle_click",
                         "double_click",
-                        "triple_click",
                         "scroll",
-                        "hscroll",
                         "wait",
                         "terminate",
-                        "answer",
                     ],
                     "type": "string",
                 },
-                "keys": {
-                    "description": (
-                        "Required by `action=key`. Optional modifier keys for click and scroll actions; "
-                        "these keys are held down during the click or scroll, then released."
-                    ),
-                    "type": "array",
-                },
-                "text": {"description": "Required only by `action=type` and `action=answer`.", "type": "string"},
+                "keys": {"description": "Required only by `action=key`.", "type": "array"},
+                "text": {"description": "Required only by `action=type`.", "type": "string"},
                 "coordinate": {
-                    "description": "(x, y): pixel coordinates.",
+                    "description": "The x,y coordinates for mouse actions.",
                     "type": "array",
                 },
                 "pixels": {
-                    "description": "Scrolling amount; positive scrolls up, negative scrolls down.",
+                    "description": "The amount of scrolling.",
                     "type": "number",
                 },
-                "time": {"description": "Seconds to wait. Required only by `action=wait`.", "type": "number"},
+                "time": {"description": "The seconds to wait.", "type": "number"},
                 "status": {
-                    "description": "Status of the task. Required only by `action=terminate`.",
+                    "description": "The status of the task.",
                     "type": "string",
                     "enum": ["success", "failure"],
                 },
             },
             "required": ["action"],
+            "type": "object",
         },
+        "args_format": "Format the arguments as a JSON object.",
     },
 }
 
@@ -128,6 +121,5 @@ Response format for every step:
 Rules:
 - Output exactly in the order: Action, <tool_call>.
 - Be brief: one sentence for Action.
-- Do not solve tasks by generating large blocks of code, scripts, or commands. Prefer direct GUI operations and only type the minimal text needed for the current UI field.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""

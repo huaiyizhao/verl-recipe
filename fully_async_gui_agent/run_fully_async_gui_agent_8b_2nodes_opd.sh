@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Fully-Async GUI Agent (Computer-Use Agent) PPO training.
-# 8B model, two-node topology: each node uses 2 rollout GPUs and 6 training GPUs.
+# Fully-Async GUI Agent (Computer-Use Agent) OPD training.
+# 8B model, two-node topology: each node uses 1 rollout GPU, 1 teacher GPU,
+# and 6 training GPUs.
 #
 # Prerequisites:
 #   1. A running desktop environment service accessible via HTTP (endpoints:
@@ -74,18 +75,28 @@ fi
 NNODES=${NNODES:-2}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-# Fully-async resource split: rollout vs training GPUs.
-# Each node contributes 2 GPUs for rollout + 6 GPUs for training, so the
-# cluster has 4 rollout GPUs and 12 training GPUs in total.
-n_gpus_rollout=${n_gpus_rollout:-2}
-n_gpus_training=${n_gpus_training:-6}
+# Fully-async OPD resource split: rollout, teacher, and training GPUs.
+# Each node contributes 1 rollout GPU + 1 teacher GPU + 6 training GPUs, so the
+# cluster has 2 rollout GPUs, 2 teacher GPUs, and 12 training GPUs in total.
+n_gpus_rollout=${n_gpus_rollout:-1}
 rollout_nnodes=${rollout_nnodes:-${NNODES}}
+teacher_nnodes=${teacher_nnodes:-${NNODES}}
+teacher_n_gpus_per_node=${teacher_n_gpus_per_node:-${TEACHER_WORLD_SIZE:-1}}
 trainer_nnodes=${trainer_nnodes:-${NNODES}}
+if [[ -z "${n_gpus_training:-}" ]]; then
+    n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout - teacher_n_gpus_per_node))
+fi
+if (( n_gpus_rollout + teacher_n_gpus_per_node + n_gpus_training > NGPUS_PER_NODE )); then
+    echo "ERROR: per-node GPU split exceeds NGPUS_PER_NODE=${NGPUS_PER_NODE}: " >&2
+    echo "rollout=${n_gpus_rollout}, teacher=${teacher_n_gpus_per_node}, training=${n_gpus_training}" >&2
+    exit 1
+fi
 
 # ================= data / model =================
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0608f-general-osworld-plus-new-agentnet/v0-20260608-205226/checkpoint-1500-merged"}
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+TEACHER_MODEL=${TEACHER_MODEL:-"mPLUG/GUI-Owl-1.5-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
@@ -109,12 +120,12 @@ adv_estimator=grpo
 max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-16384}
 max_response_length=${max_response_length:-2048}
-actor_lr=${actor_lr:-3e-6}
+actor_lr=${actor_lr:-1e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
 loss_agg_mode=${loss_agg_mode:-seq-mean-token-sum-norm}
-loss_scale_factor=${loss_scale_factor:-55}
+loss_scale_factor=${loss_scale_factor:-128}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
@@ -128,7 +139,7 @@ test_freq=${test_freq:-30}
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-2}
+staleness_threshold=${staleness_threshold:-1}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-True}
 
@@ -137,7 +148,7 @@ rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.006}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
@@ -154,11 +165,27 @@ calculate_entropy=${calculate_entropy:-True}
 # Sample-level in-flight capacity is derived from max_required_samples; do not
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
-# Two nodes double rollout capacity relative to run_fully_async_gui_agent_8b_6_2.sh.
-max_concurrent_rollouts=${max_concurrent_rollouts:-240}
+# Keep the same env-session cap as the 2-node PPO config; lower via
+# max_concurrent_rollouts if the OPD teacher path becomes the throughput limit.
+max_concurrent_rollouts=${max_concurrent_rollouts:-200}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
-max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-160}
+max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-180}
+
+# ================= OPD distillation =================
+teacher_tp=${teacher_tp:-${teacher_n_gpus_per_node}}
+teacher_gpu_mem_util=${teacher_gpu_mem_util:-0.8}
+teacher_max_model_len=${teacher_max_model_len:-32768}
+
+# Use k1/k3 estimator modes for sampled-token OPD. forward_kl_topk is supported
+# by the same code path but is top-k forward-KL distillation, not OPD estimator.
+distillation_loss_mode=${distillation_loss_mode:-k3}
+distillation_use_policy_gradient=${distillation_use_policy_gradient:-True}
+distillation_use_task_rewards=${distillation_use_task_rewards:-True}
+distillation_loss_coef=${distillation_loss_coef:-0.1}
+distillation_loss_max_clamp=${distillation_loss_max_clamp:-5.0}
+distillation_log_prob_min_clamp=${distillation_log_prob_min_clamp:-null}
+distillation_topk=${distillation_topk:-32}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -179,8 +206,8 @@ fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=54000
 infer_ppo_max_token_len=108000
 
-project_name=${project_name:-fully_async_gui_agent_0611}
-experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
+project_name=${project_name:-fully_async_gui_agent_opd_0612}
+experiment_name=${experiment_name:-qwen3vl_8b_2nodes_2rollout_2teacher_12train_async_opd}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-${test_freq}}
 
@@ -217,8 +244,8 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.loss_scale_factor=${loss_scale_factor} \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
@@ -269,6 +296,21 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     +async_training.max_concurrent_rollouts="${max_concurrent_rollouts}" \
     +async_training.max_concurrent_eval_rollouts="${max_concurrent_eval_rollouts}" \
     ++async_training.image_refs.enabled=True \
+    distillation.enabled=True \
+    distillation.n_gpus_per_node="${teacher_n_gpus_per_node}" \
+    distillation.nnodes="${teacher_nnodes}" \
+    distillation.teacher_models.teacher_model.model_path="${TEACHER_MODEL}" \
+    distillation.teacher_models.teacher_model.inference.name=vllm \
+    distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size="${teacher_tp}" \
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="${teacher_gpu_mem_util}" \
+    distillation.teacher_models.teacher_model.inference.max_model_len="${teacher_max_model_len}" \
+    distillation.distillation_loss.loss_mode="${distillation_loss_mode}" \
+    distillation.distillation_loss.topk="${distillation_topk}" \
+    distillation.distillation_loss.use_policy_gradient="${distillation_use_policy_gradient}" \
+    distillation.distillation_loss.use_task_rewards="${distillation_use_task_rewards}" \
+    distillation.distillation_loss.distillation_loss_coef="${distillation_loss_coef}" \
+    distillation.distillation_loss.loss_max_clamp="${distillation_loss_max_clamp}" \
+    distillation.distillation_loss.log_prob_min_clamp="${distillation_log_prob_min_clamp}" \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
