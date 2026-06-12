@@ -230,6 +230,19 @@ def _with_held_keys(code: str, keys: list[str]) -> str:
     return "\n".join(lines)
 
 
+_ACTION_ALIASES: dict[str, str] = {
+    "click": "left_click",
+    "drag": "left_click_drag",
+}
+
+
+def _normalize_action_alias(action: Any) -> Any:
+    """Rewrite known OWL-style aliases; leave all other actions unchanged."""
+    if not isinstance(action, str):
+        return action
+    return _ACTION_ALIASES.get(action, action)
+
+
 def _translate_action_to_pyautogui(
     parameters: dict[str, Any],
     source_screen_width: int,
@@ -247,7 +260,7 @@ def _translate_action_to_pyautogui(
     Returns ``None`` for virtual actions that are handled by the agent loop
     directly (``terminate``, ``answer``) and do not map to a backend step.
     """
-    action = parameters.get("action", "")
+    action = _normalize_action_alias(parameters.get("action", ""))
     coord = parameters.get("coordinate")
     keys = _clean_keys(parameters.get("keys", []))
 
@@ -396,7 +409,7 @@ def _validate_coordinate(coord: Any) -> str | None:
 
 
 def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
-    action = parameters.get("action")
+    action = _normalize_action_alias(parameters.get("action"))
     if not isinstance(action, str) or not action:
         return "action must be a non-empty string"
 
@@ -428,8 +441,12 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
         if wait_time is not None and (not _is_finite_number(wait_time) or float(wait_time) < 0):
             return "action 'wait' time must be a non-negative finite number when provided"
     elif action == "answer":
-        if "text" not in parameters or not isinstance(parameters.get("text"), str):
-            return "action 'answer' requires text as a string"
+        has_text = "text" in parameters
+        has_status = "status" in parameters
+        if has_text and not isinstance(parameters.get("text"), str):
+            return "action 'answer' requires text as a string when provided"
+        if has_status and parameters.get("status") not in {"success", "failure"}:
+            return "action 'answer' requires status to be either 'success' or 'failure' when provided"
     elif action == "terminate":
         if parameters.get("status") is not None and parameters.get("status") not in {"success", "failure"}:
             return "action 'terminate' requires status to be either 'success' or 'failure'"
@@ -1044,7 +1061,14 @@ class DesktopEnvTool(BaseTool):
             raise ValueError(f"Unknown instance_id: {instance_id}")
         session_id = info["session_id"]
 
-        action = parameters.get("action", "")
+        raw_action = parameters.get("action", "")
+        action = _normalize_action_alias(raw_action)
+        if action != raw_action:
+            parameters = {**parameters, "action": action}
+            _log(
+                f"[DesktopEnvTool] normalized action alias raw_action={raw_action!r} "
+                f"action={action!r} session_id={session_id}"
+            )
 
         # Reject schema/format-invalid actions with a structured tool response
         # instead of raising. No backend call is needed because the screen state
@@ -1116,16 +1140,19 @@ class DesktopEnvTool(BaseTool):
             )
         if action == "answer":
             answer_text = parameters.get("text", "")
+            status = parameters.get("status", "success")
+            code = "FAIL" if status == "failure" else "DONE"
             _log(f"[DesktopEnvTool] virtual action=answer session_id={session_id}")
+            response_text = f"Answer: {answer_text}" if answer_text else f"Answer status: {status}; code: {code}"
             return (
-                ToolResponse(text=f"Answer: {answer_text}"),
+                ToolResponse(text=response_text),
                 0.0,
                 {
                     "action": action,
                     "answer": answer_text,
-                    "code": "DONE",
+                    "code": code,
                     "done": True,
-                    "status": "success",
+                    "status": status,
                 },
             )
 

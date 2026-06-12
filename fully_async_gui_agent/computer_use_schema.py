@@ -43,7 +43,6 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                         "* `wait`: Wait specified seconds for the change to happen.\n"
                         "* `terminate`: Terminate the current task and report its completion status.\n"
                         "* `answer`: Answer a question.\n"
-                        "        "
                     ),
                     "enum": [
                         "key",
@@ -54,9 +53,11 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                         "right_click",
                         "middle_click",
                         "double_click",
+                        "triple_click",
                         "scroll",
                         "wait",
                         "terminate",
+                        "answer",
                     ],
                     "type": "string",
                 },
@@ -72,7 +73,7 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                 },
                 "time": {"description": "The seconds to wait.", "type": "number"},
                 "status": {
-                    "description": "The status of the task.",
+                    "description": "The status of the task. Required by `action=terminate` or `action=answer`.",
                     "type": "string",
                     "enum": ["success", "failure"],
                 },

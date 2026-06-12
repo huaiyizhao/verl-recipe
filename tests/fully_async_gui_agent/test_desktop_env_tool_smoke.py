@@ -92,6 +92,32 @@ def test_hscroll_executes_pyautogui_hscroll():
     )
 
 
+def test_owl_action_aliases_are_accepted():
+    click_params = {"action": "click", "coordinate": [500, 500]}
+    drag_params = {"action": "drag", "coordinate": [250, 250]}
+
+    assert desktop_env_tool._validate_action_parameters(click_params) is None
+    assert desktop_env_tool._validate_action_parameters(drag_params) is None
+
+    click_code = desktop_env_tool._translate_action_to_pyautogui(
+        click_params,
+        1000,
+        1000,
+        1920,
+        1080,
+    )
+    drag_code = desktop_env_tool._translate_action_to_pyautogui(
+        drag_params,
+        1000,
+        1000,
+        1920,
+        1080,
+    )
+
+    assert click_code == "pyautogui.click(960, 540)"
+    assert drag_code == "pyautogui.dragTo(480, 270, duration=0.5)"
+
+
 def test_keys_must_be_an_array_for_modifier_actions():
     error = desktop_env_tool._validate_action_parameters(
         {"action": "left_click", "keys": "ctrl"}
@@ -114,6 +140,49 @@ def test_answer_action_marks_rollout_done_without_backend_step():
     assert reward == 0.0
     assert info["action"] == "answer"
     assert info["answer"] == "42"
+    assert info["code"] == "DONE"
+    assert info["done"] is True
+    assert info["status"] == "success"
+
+
+def test_answer_action_accepts_status_without_text():
+    async def run_answer_status_only():
+        tool = desktop_env_tool.DesktopEnvTool({"api_base_url": "http://desktop.invalid"})
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+        return await tool.execute(
+            "instance-1",
+            {"action": "answer", "status": "failure"},
+        )
+
+    async def run_answer_without_args():
+        tool = desktop_env_tool.DesktopEnvTool({"api_base_url": "http://desktop.invalid"})
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+        return await tool.execute("instance-1", {"action": "answer"})
+
+    assert desktop_env_tool._validate_action_parameters({"action": "answer", "status": "success"}) is None
+    assert desktop_env_tool._validate_action_parameters({"action": "answer", "status": "failure"}) is None
+    assert (
+        desktop_env_tool._validate_action_parameters({"action": "answer", "status": "unknown"})
+        == "action 'answer' requires status to be either 'success' or 'failure' when provided"
+    )
+    assert desktop_env_tool._validate_action_parameters({"action": "answer"}) is None
+
+    response, reward, info = asyncio.run(run_answer_status_only())
+
+    assert response.text == "Answer status: failure; code: FAIL"
+    assert reward == 0.0
+    assert info["action"] == "answer"
+    assert info["answer"] == ""
+    assert info["code"] == "FAIL"
+    assert info["done"] is True
+    assert info["status"] == "failure"
+
+    response, reward, info = asyncio.run(run_answer_without_args())
+
+    assert response.text == "Answer status: success; code: DONE"
+    assert reward == 0.0
+    assert info["action"] == "answer"
+    assert info["answer"] == ""
     assert info["code"] == "DONE"
     assert info["done"] is True
     assert info["status"] == "success"
