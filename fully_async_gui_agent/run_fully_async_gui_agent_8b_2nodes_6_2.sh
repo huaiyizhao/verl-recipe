@@ -107,8 +107,8 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-16384}
-max_response_length=${max_response_length:-2048}
+max_prompt_length=${max_prompt_length:-20000}
+max_response_length=${max_response_length:-2000}
 actor_lr=${actor_lr:-5e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
@@ -155,7 +155,7 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # Two nodes double rollout capacity relative to run_fully_async_gui_agent_8b_6_2.sh.
-max_concurrent_rollouts=${max_concurrent_rollouts:-300}
+max_concurrent_rollouts=${max_concurrent_rollouts:-320}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
@@ -176,10 +176,10 @@ fsdp_size=${n_gpus_training}
 # param/optimizer offload, because the (seq_len^2) attention activations plus
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
-actor_ppo_max_token_len=36000
-infer_ppo_max_token_len=72000
+actor_ppo_max_token_len=40000
+infer_ppo_max_token_len=80000
 
-project_name=${project_name:-fully_async_gui_agent_0611}
+project_name=${project_name:-fully_async_gui_agent_0615}
 experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=30
@@ -244,7 +244,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.max_model_len=32768 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
