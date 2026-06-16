@@ -28,8 +28,13 @@ tools:
       create_status_max_retries: 1
       create_status_retry_interval: 30
       create_retry_statuses: [429, 500, 502, 503, 504]
+      # B2 routes step/evaluate directly to each session's own worker port, so
+      # connections spread across workers (each serving ~1 at a time) — per-request
+      # short connections are not a bottleneck, so reuse stays off (also avoids
+      # long-lived keep-alive conns going half-open through NAT). create/close
+      # still go to the central service.
       http_reuse_session: false
-      http_force_close: true      # close TCP connections after every request to avoid stale keep-alive reuse
+      http_force_close: true
       pause: 2.0
       evaluate_settle_seconds: 3
       step_reward: 0.0

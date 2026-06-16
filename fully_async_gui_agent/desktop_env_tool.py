@@ -45,9 +45,11 @@ import math
 import os
 import random
 import re
+import socket
 import sys
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
@@ -580,6 +582,14 @@ class DesktopEnvTool(BaseTool):
 
         # HTTP connection config. By default, each request gets a fresh
         # ClientSession/TCP connection. Session reuse is opt-in.
+        # B2 routes the hot-path step/evaluate directly to each session's own
+        # worker process/port, so connections are spread across workers (each
+        # serving ~1 at a time) instead of funneled through one central event
+        # loop. Per-request short connections are therefore not a bottleneck and
+        # connection reuse is unnecessary; keeping it off also avoids long-lived
+        # keep-alive connections going half-open through NAT. SO_KEEPALIVE
+        # (socket_factory) still guards the single long /evaluate or /step
+        # request held open while the worker runs.
         self.http_reuse_session = bool(config.get("http_reuse_session", False))
         self.http_keepalive_timeout = float(config.get("http_keepalive_timeout", 30.0))
         self.http_session_max_age = float(config.get("http_session_max_age", 0.0))
@@ -643,19 +653,8 @@ class DesktopEnvTool(BaseTool):
             await self._close_http_session()
         if self._http_session is None or self._http_session.closed or self._http_session_loop is not loop:
             await self._close_http_session()
-            connector_kwargs: dict[str, Any] = {
-                "limit": 128,
-                "limit_per_host": 128,
-                "enable_cleanup_closed": True,
-                "ttl_dns_cache": 300,
-            }
-            if self.http_force_close:
-                connector_kwargs["force_close"] = True
-            else:
-                connector_kwargs["keepalive_timeout"] = self.http_keepalive_timeout
-            connector = aiohttp.TCPConnector(**connector_kwargs)
             self._http_session = aiohttp.ClientSession(
-                connector=connector,
+                connector=self._make_http_connector(),
             )
             self._http_session_loop = loop
             self._http_session_created_at = now
@@ -667,12 +666,37 @@ class DesktopEnvTool(BaseTool):
             )
         return self._http_session
 
+    @staticmethod
+    def _make_keepalive_socket(addr_info):
+        """Socket factory enabling OS-level TCP keepalive.
+
+        Keeps the NAT/firewall mapping alive during long quiet requests
+        (e.g. /evaluate, slow /step) where aiohttp's pool keepalive_timeout
+        does not apply because the connection is checked out, not idle.
+        Must only create the socket and set options (aiohappyeyeballs handles
+        setblocking/connect).
+        """
+        family, type_, proto = addr_info[0], addr_info[1], addr_info[2]
+        sock = socket.socket(family=family, type=type_, proto=proto)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+        except OSError:
+            pass
+        return sock
+
     def _make_http_connector(self) -> aiohttp.TCPConnector:
         connector_kwargs: dict[str, Any] = {
             "limit": 128,
             "limit_per_host": 128,
             "enable_cleanup_closed": True,
             "ttl_dns_cache": 300,
+            "socket_factory": self._make_keepalive_socket,
         }
         if self.http_force_close:
             connector_kwargs["force_close"] = True
@@ -780,13 +804,16 @@ class DesktopEnvTool(BaseTool):
         path: str,
         payload: dict | None = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
+        base_url: str | None = None,
     ) -> dict:
         """POST JSON once and return the JSON response.
 
         This method does not catch/retry errors. Callers choose endpoint-specific
-        retry policy based on whether the operation is idempotent.
+        retry policy based on whether the operation is idempotent. ``base_url``
+        overrides the central service URL — used to route hot-path step/evaluate
+        directly to the per-session worker (B2).
         """
-        url = f"{self.api_base_url}{path}"
+        url = f"{base_url or self.api_base_url}{path}"
         request_body = payload or {}
         request_context = _request_log_context(request_body)
         if timeout is None:
@@ -853,6 +880,7 @@ class DesktopEnvTool(BaseTool):
         payload: dict | None = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
         *,
+        base_url: str | None = None,
         max_retries: int | None = None,
         retry_transport: bool = True,
         retry_statuses: tuple[int, ...] | None = None,
@@ -871,7 +899,7 @@ class DesktopEnvTool(BaseTool):
         while True:
             attempt += 1
             try:
-                return await self._post(path, request_body, timeout=timeout)
+                return await self._post(path, request_body, timeout=timeout, base_url=base_url)
             except Exception as exc:
                 error_kind, retryable, max_failures, retry_interval = self._retry_plan_for_http_failure(
                     exc,
@@ -884,8 +912,10 @@ class DesktopEnvTool(BaseTool):
                 )
                 failures_by_kind[error_kind] = failures_by_kind.get(error_kind, 0) + 1
                 current_failures = failures_by_kind[error_kind]
-                if retryable:
-                    await self._reset_http_session()
+                # Do NOT tear down the whole keep-alive session on a transient
+                # failure: aiohttp already evicts the single failed connection
+                # and the retry transparently acquires a healthy one. Resetting
+                # the session would drop every warm connection in the pool.
                 if (not retryable) or current_failures >= max_failures:
                     context = f" | {error_context}" if error_context else ""
                     _log(
@@ -980,10 +1010,43 @@ class DesktopEnvTool(BaseTool):
             # assignment (incl. CancelledError) must close the server-side
             # session, else we leak. Catch BaseException to cover
             # CancelledError too.
-            self._instances[instance_id] = {
+            instance_info = {
                 "session_id": session_id,
                 "task_id": task_id,
             }
+            # B2: if the server returned a per-session worker HTTP port, route the
+            # hot-path step/evaluate calls directly to that worker (same host as
+            # the central service, different port). Falls back to the central
+            # service when absent.
+            worker_port = resp.get("worker_port")
+            if worker_port:
+                split = urlsplit(self.api_base_url)
+                instance_info["worker_base"] = f"{split.scheme}://{split.hostname}:{int(worker_port)}"
+                _log(
+                    f"[DesktopEnvTool] session_id={session_id} routing step/evaluate "
+                    f"to worker {instance_info['worker_base']}"
+                )
+                self._instances[instance_id] = instance_info
+            elif resp.get("worker_http_enabled", True):
+                # Server runs per-session worker HTTP (the expected, guaranteed-on
+                # case) but this session got no port — worker bind failure or port
+                # exhaustion. Abort the create so the outer rerun re-creates the
+                # session; the ``except BaseException`` below closes this orphan
+                # server session. Default True so a missing flag also aborts rather
+                # than silently degrading to the slow central path.
+                raise RuntimeError(
+                    f"create returned no worker_port for session_id={session_id} "
+                    f"(worker_http_error={resp.get('worker_http_error')!r}); aborting for env rerun"
+                )
+            else:
+                # Worker HTTP explicitly disabled server-side (rollback switch):
+                # the central /step + /evaluate path is intended here.
+                _log(
+                    f"[DesktopEnvTool] session_id={session_id} worker HTTP disabled "
+                    f"server-side; using central step/evaluate at {self.api_base_url}",
+                    debug=True,
+                )
+                self._instances[instance_id] = instance_info
         except BaseException:
             # Best-effort cleanup. If we already have a server session_id,
             # try to close it on the server.
@@ -1040,6 +1103,7 @@ class DesktopEnvTool(BaseTool):
                     "timeout_seconds": self.step_server_timeout_seconds,
                 },
                 timeout=self.step_timeout,
+                base_url=info.get("worker_base"),
             )
             observation = resp.get("observation") or {}
             screenshot = _decode_screenshot(observation.get("screenshot"))
@@ -1117,6 +1181,7 @@ class DesktopEnvTool(BaseTool):
                     },
                     timeout=terminate_timeout,
                     error_context=error_context,
+                    base_url=info.get("worker_base"),
                 )
             except Exception as exc:
                 raise DesktopEnvStepError(
@@ -1197,6 +1262,7 @@ class DesktopEnvTool(BaseTool):
                 },
                 timeout=step_timeout,
                 error_context=error_context,
+                base_url=info.get("worker_base"),
             )
         except Exception as exc:
             raise DesktopEnvStepError(
@@ -1258,6 +1324,7 @@ class DesktopEnvTool(BaseTool):
                 {"timeout_seconds": evaluate_server_timeout},
                 timeout=self.evaluate_timeout,
                 error_context=f"timeout={self.evaluate_timeout.total}s server_timeout={evaluate_server_timeout}s",
+                base_url=info.get("worker_base"),
             )
         except Exception:
             _log(
