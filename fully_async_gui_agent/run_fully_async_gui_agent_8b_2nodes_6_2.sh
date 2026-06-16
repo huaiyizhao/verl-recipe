@@ -107,8 +107,8 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-23000}
-max_response_length=${max_response_length:-2000}
+max_prompt_length=${max_prompt_length:-20480}
+max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-5e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
@@ -177,9 +177,11 @@ fsdp_size=${n_gpus_training}
 # FSDP all-gather of the 8B params/grads exceed what fits. Keeping this at
 # ~(max_prompt+max_response) is safer; scale up only if backward fits.
 actor_ppo_max_token_len=50000
-infer_ppo_max_token_len=80000
+infer_ppo_max_token_len=100000
 
-project_name=${project_name:-fully_async_gui_agent_0615}
+# Timestamp in UTC+8 (Asia/Shanghai), independent of the host timezone.
+run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
+project_name=${project_name:-fully_async_gui_agent_${run_timestamp}}
 experiment_name=${experiment_name:-qwen3vl_8b_2nodes_4rollout_12train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=30
