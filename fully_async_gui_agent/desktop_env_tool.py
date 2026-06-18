@@ -506,6 +506,9 @@ class DesktopEnvTool(BaseTool):
             computing the terminal reward (default 3).
         step_reward (float): Per-step reward returned by ``execute()``
             (default 0.0).
+        slow_step_log_threshold (float): Log successful ``/step`` calls whose
+            wall time is at least this many seconds. ``0`` disables the log
+            (default 30, or ``$DESKTOP_STEP_SLOW_LOG_THRESHOLD``).
         http_reuse_session (bool): If true, keep one aiohttp ClientSession
             alive for the tool lifetime. Defaults to false, so every request
             gets a fresh ClientSession/TCP connection.
@@ -560,6 +563,11 @@ class DesktopEnvTool(BaseTool):
         self.pause = float(config.get("pause", 2.0))
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))
+        self.slow_step_log_threshold_seconds = float(
+            config.get("slow_step_log_threshold", os.getenv("DESKTOP_STEP_SLOW_LOG_THRESHOLD", 30.0))
+        )
+        if self.slow_step_log_threshold_seconds < 0:
+            raise ValueError("slow_step_log_threshold must be non-negative")
 
         # HTTP retry config. _post itself does not catch/retry; callers decide
         # whether an endpoint is safe to retry.
@@ -703,6 +711,33 @@ class DesktopEnvTool(BaseTool):
         else:
             connector_kwargs["keepalive_timeout"] = self.http_keepalive_timeout
         return aiohttp.TCPConnector(**connector_kwargs)
+
+    def _log_slow_step(
+        self,
+        *,
+        elapsed_s: float,
+        request_id: str,
+        session_id: str,
+        action: str,
+        actual_action: str | None,
+        timeout_s: float,
+        server_timeout_s: float,
+        pause_s: float,
+        meta: dict[str, Any],
+        worker_base: str | None = None,
+    ) -> None:
+        threshold = self.slow_step_log_threshold_seconds
+        if threshold <= 0 or elapsed_s < threshold:
+            return
+        _log(
+            f"[DesktopEnvTool][SLOW_STEP] elapsed={elapsed_s:.3f}s "
+            f"threshold={threshold:.3f}s request_id={request_id} session_id={session_id} "
+            f"action={action!r} actual_action={actual_action!r} "
+            f"timeout={timeout_s}s server_timeout={server_timeout_s}s pause={pause_s} "
+            f"done={meta.get('done')} step_count={meta.get('step_count')} "
+            f"worker_base={worker_base or '<central>'}",
+            level="ERROR",
+        )
 
     async def _close_http_session(self) -> None:
         self._http_reset_pending = False
@@ -1171,6 +1206,7 @@ class DesktopEnvTool(BaseTool):
                 f"timeout={terminate_timeout.total} server_timeout={self.step_server_timeout_seconds}"
             )
             try:
+                step_started_at = time.monotonic()
                 resp = await self._post_with_retries(
                     f"/session/{session_id}/step",
                     {
@@ -1183,6 +1219,7 @@ class DesktopEnvTool(BaseTool):
                     error_context=error_context,
                     base_url=info.get("worker_base"),
                 )
+                step_elapsed_s = time.monotonic() - step_started_at
             except Exception as exc:
                 raise DesktopEnvStepError(
                     f"/step failed for action={action!r}, actual_action={code!r}, "
@@ -1193,6 +1230,18 @@ class DesktopEnvTool(BaseTool):
             images = [screenshot] if screenshot is not None else []
             meta = {k: v for k, v in resp.items() if k != "observation"}
             meta["code"] = code
+            self._log_slow_step(
+                elapsed_s=step_elapsed_s,
+                request_id=request_id,
+                session_id=session_id,
+                action=action,
+                actual_action=code,
+                timeout_s=terminate_timeout.total,
+                server_timeout_s=self.step_server_timeout_seconds,
+                pause_s=self.pause,
+                meta=meta,
+                worker_base=info.get("worker_base"),
+            )
             _log(
                 f"[DesktopEnvTool] terminate step done request_id={request_id} "
                 f"session_id={session_id} status={status} done={meta.get('done')} "
@@ -1252,6 +1301,7 @@ class DesktopEnvTool(BaseTool):
             f"timeout={step_timeout.total}s server_timeout={self.step_server_timeout_seconds}s pause={pause}"
         )
         try:
+            step_started_at = time.monotonic()
             resp = await self._post_with_retries(
                 f"/session/{session_id}/step",
                 {
@@ -1264,6 +1314,7 @@ class DesktopEnvTool(BaseTool):
                 error_context=error_context,
                 base_url=info.get("worker_base"),
             )
+            step_elapsed_s = time.monotonic() - step_started_at
         except Exception as exc:
             raise DesktopEnvStepError(
                 f"/step failed for action={action!r}, actual_action={code!r}, "
@@ -1290,6 +1341,18 @@ class DesktopEnvTool(BaseTool):
             meta["actual_coordinate"] = list(actual_coordinate)
             meta["source_screen_size"] = [self.screen_width, self.screen_height]
             meta["real_screen_size"] = [self.real_screen_width, self.real_screen_height]
+        self._log_slow_step(
+            elapsed_s=step_elapsed_s,
+            request_id=request_id,
+            session_id=session_id,
+            action=action,
+            actual_action=code,
+            timeout_s=step_timeout.total,
+            server_timeout_s=self.step_server_timeout_seconds,
+            pause_s=pause,
+            meta=meta,
+            worker_base=info.get("worker_base"),
+        )
         _log(
             f"[DesktopEnvTool] step done request_id={request_id} "
             f"session_id={session_id} action={action} "

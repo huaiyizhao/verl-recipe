@@ -256,7 +256,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
-    actor_rollout_ref.rollout.agent.num_workers=32 \
+    actor_rollout_ref.rollout.agent.num_workers=64 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \

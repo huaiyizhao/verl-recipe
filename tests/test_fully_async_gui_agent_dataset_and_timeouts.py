@@ -146,6 +146,45 @@ def test_step_payload_forwards_server_timeout_seconds():
     assert "retry_timeout_only" not in kwargs
 
 
+def test_slow_step_logs_successful_step_over_threshold():
+    async def run_step():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+                "slow_step_log_threshold": 30,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+
+        async def fake_post(*args, **kwargs):
+            return {"observation": {}, "done": False, "step_count": 7}
+
+        logs = []
+
+        def fake_log(msg, *, level="DEBUG", debug=None):
+            logs.append((msg, level, debug))
+
+        tool._post_with_retries = fake_post
+        with (
+            patch.object(desktop_env_tool.time, "monotonic", side_effect=[100.0, 131.25]),
+            patch.object(desktop_env_tool, "_log", fake_log),
+        ):
+            await tool.execute("instance-1", {"action": "wait"})
+        return logs
+
+    logs = asyncio.run(run_step())
+    slow_logs = [entry for entry in logs if "[DesktopEnvTool][SLOW_STEP]" in entry[0]]
+
+    assert len(slow_logs) == 1
+    assert slow_logs[0][1] == "ERROR"
+    assert "elapsed=31.250s" in slow_logs[0][0]
+    assert "action='wait'" in slow_logs[0][0]
+    assert "actual_action='WAIT'" in slow_logs[0][0]
+    assert "step_count=7" in slow_logs[0][0]
+
+
 def test_step_failure_is_reported_as_desktop_env_step_error():
     async def run_step():
         tool = desktop_env_tool.DesktopEnvTool(
