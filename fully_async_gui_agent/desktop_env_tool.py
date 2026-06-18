@@ -449,9 +449,9 @@ def _validate_action_parameters(parameters: dict[str, Any]) -> str | None:
             return "action 'answer' requires text as a string when provided"
         if has_status and parameters.get("status") not in {"success", "failure"}:
             return "action 'answer' requires status to be either 'success' or 'failure' when provided"
-    elif action == "terminate":
-        if parameters.get("status") is not None and parameters.get("status") not in {"success", "failure"}:
-            return "action 'terminate' requires status to be either 'success' or 'failure'"
+    # NOTE: `terminate` intentionally performs no status validation. Matching the
+    # qwen3vl agent, any status other than "failure" (including an invalid or
+    # missing value) is treated as a successful completion ("DONE") downstream.
 
     return None
 
