@@ -13,6 +13,7 @@ env_vars:
   NCCL_IB_HCA: ^mlx5_bond_0,lo
   NCCL_DEBUG: INFO
   PYTHONPATH: .
+  RAY_LOG_DIR: /efs/data/rl/logs
   # Needed by Ray workers on all nodes
   DESKTOP_API_BASE_URL: "http://172.31.13.38:2354"
   # Ray enables uvloop by default when the package is installed. Disable it to
