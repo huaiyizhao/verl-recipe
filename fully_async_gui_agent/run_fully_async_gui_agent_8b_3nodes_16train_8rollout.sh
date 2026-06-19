@@ -14,23 +14,22 @@
 # limitations under the License.
 #
 # Fully-Async GUI Agent (Computer-Use Agent) PPO training.
-# 8B model, DISAGGREGATED two-node topology:
-#   - 1 node dedicated to rollout (8 GPUs: vLLM + agent loops)
-#   - 1 node dedicated to training (8 GPUs: FSDP2 actor/ref)
+# 8B model, DISAGGREGATED three-node topology:
+#   - 1 node  dedicated to rollout  (8 GPUs: vLLM + agent loops)
+#   - 2 nodes dedicated to training (2 x 8 = 16 GPUs: FSDP2 actor/ref, HSDP:
+#     shard within each node over NVLink, replicate across the 2 nodes)
 # This separates rollout-side memory (image banks / object store / agent-loop
 # CPU preprocessing) from training-side memory (weights/optimizer/activations),
-# which the colocated 6+2 layout could not, and gives rollout a whole node's
-# GPUs+CPUs (the throughput bottleneck). See the 6_2 script for the colocated
-# variant.
+# and gives rollout a whole node's GPUs+CPUs. See the 8_8 script for the 1+1
+# variant and the 6_2 script for the colocated variant.
 #
 # IMPORTANT (placement): only GPU-bound actors are auto-pinned by their
-# placement groups (vLLM -> rollout node, training WorkerDict -> train node).
-# The CPU-bound FullyAsyncRollouter and the 40 AgentLoopWorkers are NOT
-# GPU-pinned and Ray may spread them across both nodes (AgentLoopWorker even
-# round-robins over all alive nodes by design). To keep the rollout-side
-# memory/CPU off the train node you must constrain placement at the cluster
-# level (custom resources / node labels at `ray start`). See the notes the
-# accompanying review left for details.
+# placement groups. The CPU-bound FullyAsyncRollouter, the 40 AgentLoopWorkers
+# and the GlobalRequestLoadBalancer are NOT GPU-pinned and Ray would spread them
+# across all nodes by default. Placement is constrained at the cluster level via
+# custom Ray resources: tag the rollout node `rollout_node` and the 2 train
+# nodes `train_node` at `ray start`, and export VERL_ROLLOUT_NODE_RESOURCE /
+# VERL_TRAIN_NODE_RESOURCE so verl pins each role to the right node(s).
 #
 # Prerequisites:
 #   1. A running desktop environment service accessible via HTTP (endpoints:
@@ -87,18 +86,18 @@ if [[ -z "${VERL_ROOT:-}" ]]; then
 fi
 
 # ================= cluster topology =================
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-3}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-# Disaggregated resource split: one whole node for rollout, one for training.
-# rollout_nnodes=1 x n_gpus_rollout=8  -> all 8 GPUs of one node serve vLLM.
-# trainer_nnodes=1 x n_gpus_training=8 -> all 8 GPUs of the other node train.
-# (Ray's two 8-GPU placement groups land on separate nodes since each needs a
-# full node.)
+# Disaggregated resource split: 1 node rollout, 2 nodes training.
+# rollout_nnodes=1 x n_gpus_rollout=8   -> all 8 GPUs of one node serve vLLM.
+# trainer_nnodes=2 x n_gpus_training=8  -> 16 training GPUs across 2 nodes.
+# The trainer pool spec [8, 8] is two 8-GPU STRICT_PACK placement groups -> one
+# per train node; the rollout pool is one 8-GPU group on the rollout node.
 n_gpus_rollout=${n_gpus_rollout:-8}
 n_gpus_training=${n_gpus_training:-8}
 rollout_nnodes=${rollout_nnodes:-1}
-trainer_nnodes=${trainer_nnodes:-1}
+trainer_nnodes=${trainer_nnodes:-2}
 
 # ================= data / model =================
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
@@ -137,8 +136,8 @@ loss_scale_factor=${loss_scale_factor:-55}
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=${n_resp_per_prompt:-8}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
+n_resp_per_prompt=${n_resp_per_prompt:-16}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
@@ -173,7 +172,7 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # One full rollout node (8 GPUs) backs these trajectories.
-max_concurrent_rollouts=${max_concurrent_rollouts:-240}
+max_concurrent_rollouts=${max_concurrent_rollouts:-256}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
@@ -184,9 +183,10 @@ actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-False}
-# FSDP shards across the single training node's GPUs.
-# With trainer_nnodes=1 / n_gpus_training=8, fsdp_size=8 keeps all-gather
-# within the node (NVLink) and avoids cross-node FSDP traffic.
+# FSDP shard-group size = GPUs per node. With 2 train nodes x 8 GPUs this gives
+# HSDP: shard the 8B params/grads within each node over NVLink, and replicate
+# (data-parallel + grad all-reduce) across the 2 nodes. Keeps the per-layer
+# all-gather node-local instead of sharding across the slow inter-node link.
 fsdp_size=${n_gpus_training}
 
 # Max packed-sequence length per GPU per micro-batch (dynamic_bsz on).
@@ -200,7 +200,7 @@ infer_ppo_max_token_len=100000
 # Timestamp in UTC+8 (Asia/Shanghai), independent of the host timezone.
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-fully_async_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen3vl_8b_2nodes_8rollout_8train_async}
+experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=30
 
@@ -275,7 +275,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
-    actor_rollout_ref.rollout.agent.num_workers=40 \
+    actor_rollout_ref.rollout.agent.num_workers=64 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
