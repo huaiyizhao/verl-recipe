@@ -20,6 +20,8 @@ env_vars:
   RAY_USE_UVLOOP: "0"
   VLLM_USE_V1: "1"
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
+  VERL_TRAIN_TIMING_LOG: "1"
+  VERL_TRAIN_TIMING_RANKS: "0,4,8,12"
   WANDB_API_KEY: "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"
   VERL_LOGGING_LEVEL: "DEBUG"
   MLFLOW_TRACKING_URI: "http://172.20.70.149:29004"  # MLflow server 地址

@@ -172,7 +172,7 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # One full rollout node (8 GPUs) backs these trajectories.
-max_concurrent_rollouts=${max_concurrent_rollouts:-256}
+max_concurrent_rollouts=${max_concurrent_rollouts:-192}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
