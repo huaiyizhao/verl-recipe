@@ -33,6 +33,14 @@ def _load_module(name: str, path: Path):
 prepare_dataset = _load_module("prepare_dataset_under_test", RECIPE_ROOT / "prepare_dataset.py")
 desktop_env_tool = _load_module("desktop_env_tool_under_test", RECIPE_ROOT / "desktop_env_tool.py")
 
+_ONE_PIXEL_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
+
+
+def _observation_with_screenshot() -> dict:
+    return {"observation": {"screenshot": _ONE_PIXEL_PNG_B64}}
+
 
 class _FakeResponse:
     def __init__(self, payload: dict):
@@ -130,7 +138,7 @@ def test_step_payload_forwards_server_timeout_seconds():
 
         async def fake_post(path, payload=None, timeout=None, **kwargs):
             calls.append((path, payload, timeout, kwargs))
-            return {"observation": {}, "done": False, "step_count": 1}
+            return {**_observation_with_screenshot(), "done": False, "step_count": 1}
 
         tool._post_with_retries = fake_post
         await tool.execute("instance-1", {"action": "wait"})
@@ -159,7 +167,7 @@ def test_slow_step_logs_successful_step_over_threshold():
         tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
 
         async def fake_post(*args, **kwargs):
-            return {"observation": {}, "done": False, "step_count": 7}
+            return {**_observation_with_screenshot(), "done": False, "step_count": 7}
 
         logs = []
 
@@ -209,6 +217,126 @@ def test_step_failure_is_reported_as_desktop_env_step_error():
     exc = asyncio.run(run_step())
 
     assert "/step failed for action='wait'" in str(exc)
+
+
+def test_step_without_screenshot_recovers_with_wait_step():
+    async def run_step():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+        calls = []
+
+        async def fake_post(path, payload=None, timeout=None, **kwargs):
+            calls.append((path, payload, timeout, kwargs))
+            if len(calls) == 1:
+                return {"observation": {}, "done": False, "step_count": 1}
+            return {**_observation_with_screenshot(), "done": False, "step_count": 2}
+
+        tool._post_with_retries = fake_post
+        response, reward, meta = await tool.execute("instance-1", {"action": "wait"})
+        return response, reward, meta, calls
+
+    response, reward, meta, calls = asyncio.run(run_step())
+
+    assert len(response.image) == 1
+    assert reward == 0.0
+    assert meta["step_count"] == 1
+    assert len(calls) == 2
+    assert calls[0][1]["action"] == "WAIT"
+    assert calls[1][1]["action"] == "WAIT"
+    assert calls[1][1]["pause"] == 2.0
+
+
+def test_create_without_screenshot_recovers_with_wait_step():
+    async def run_create():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid:2354",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        calls = []
+
+        async def fake_post(path, payload=None, timeout=None, **kwargs):
+            calls.append((path, payload, timeout, kwargs))
+            if path == "/session/create":
+                return {
+                    "session_id": "instance-1",
+                    "worker_port": 12345,
+                    "observation": {},
+                }
+            return {**_observation_with_screenshot(), "done": False, "step_count": 1}
+
+        tool._post_with_retries = fake_post
+        instance_id, response = await tool.create("instance-1", {"task_id": "task-1"})
+        return instance_id, response, calls
+
+    instance_id, response, calls = asyncio.run(run_create())
+
+    assert instance_id == "instance-1"
+    assert len(response.image) == 1
+    assert len(calls) == 2
+    assert calls[0][0] == "/session/create"
+    assert calls[1][0] == "/session/instance-1/step"
+    assert calls[1][1]["action"] == "WAIT"
+    assert calls[1][1]["pause"] == 2.0
+
+
+def test_step_without_screenshot_after_recovery_is_reported_as_desktop_env_step_error():
+    async def run_step():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+
+        async def fake_post(*args, **kwargs):
+            return {"observation": {}, "done": False, "step_count": 1}
+
+        tool._post_with_retries = fake_post
+        try:
+            await tool.execute("instance-1", {"action": "wait"})
+        except desktop_env_tool.DesktopEnvStepError as exc:
+            return exc
+        raise AssertionError("execute should raise DesktopEnvStepError")
+
+    exc = asyncio.run(run_step())
+
+    assert "recovery WAIT returned no valid screenshot" in str(exc)
+
+
+def test_terminate_without_screenshot_does_not_fail():
+    async def run_step():
+        tool = desktop_env_tool.DesktopEnvTool(
+            {
+                "api_base_url": "http://desktop.invalid",
+                "step_timeout": 400,
+                "step_server_timeout": 360,
+            }
+        )
+        tool._instances["instance-1"] = {"session_id": "session-1", "task_id": "task-1"}
+
+        async def fake_post(*args, **kwargs):
+            return {"observation": {}, "done": True, "step_count": 1}
+
+        tool._post_with_retries = fake_post
+        return await tool.execute("instance-1", {"action": "terminate", "status": "success"})
+
+    response, reward, meta = asyncio.run(run_step())
+
+    assert response.image == []
+    assert reward == 0.0
+    assert meta["action"] == "terminate"
+    assert meta["done"] is True
 
 
 def test_http_error_detail_includes_proxy_detail():

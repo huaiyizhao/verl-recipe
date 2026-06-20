@@ -29,10 +29,11 @@ those structured actions into ``pyautogui`` code snippets that the remote
 service executes in its sandboxed desktop. This keeps prompt/action formats
 stable even if the backend protocol evolves.
 
-The service is expected to return an optional ``screenshot`` field (base64
+The service is expected to return a ``screenshot`` field (base64
 encoded PNG) from ``/session/create`` and ``/session/{id}/step`` so that the
-agent can feed the observation back to the LLM. The tool tolerates missing
-screenshots gracefully.
+agent can feed the observation back to the LLM. Missing screenshots are retried
+once with a short WAIT observation step, then treated as environment failures if
+the retry also fails.
 """
 
 import asyncio
@@ -468,6 +469,14 @@ def _decode_screenshot(b64_png: Optional[str]) -> Optional[Image.Image]:
         return None
 
 
+def _require_screenshot(observation: dict[str, Any] | None, *, context: str) -> Image.Image:
+    """Return the decoded screenshot or fail the env step/create."""
+    screenshot = _decode_screenshot((observation or {}).get("screenshot"))
+    if screenshot is None:
+        raise DesktopEnvStepError(f"{context} returned no valid screenshot")
+    return screenshot
+
+
 # ---------------------------------------------------------------------------
 # DesktopEnvTool
 # ---------------------------------------------------------------------------
@@ -561,6 +570,9 @@ class DesktopEnvTool(BaseTool):
         self.real_screen_height = int(config.get("real_screen_height", screen_height))
         self.close_timeout_seconds = float(config.get("close_timeout", 60))
         self.pause = float(config.get("pause", 2.0))
+        self.missing_screenshot_recovery_wait_seconds = float(config.get("missing_screenshot_recovery_wait", 2.0))
+        if self.missing_screenshot_recovery_wait_seconds < 0:
+            raise ValueError("missing_screenshot_recovery_wait must be non-negative")
         self.evaluate_settle_seconds = int(config.get("evaluate_settle_seconds", 3))
         self.step_reward = float(config.get("step_reward", 0.0))
         self.slow_step_log_threshold_seconds = float(
@@ -1085,6 +1097,7 @@ class DesktopEnvTool(BaseTool):
         except BaseException:
             # Best-effort cleanup. If we already have a server session_id,
             # try to close it on the server.
+            self._instances.pop(instance_id, None)
             server_session_id = locals().get("session_id", instance_id)
             if server_session_id:
                 try:
@@ -1103,10 +1116,88 @@ class DesktopEnvTool(BaseTool):
         _log(f"[DesktopEnvTool] create session OK task_id={task_id} instance_id={instance_id} session_id={session_id}")
 
         observation = resp.get("observation") or {}
-        screenshot = _decode_screenshot(observation.get("screenshot"))
-        images = [screenshot] if screenshot is not None else []
-        _log(f"[DesktopEnvTool] created session_id={session_id} has_screenshot={bool(screenshot)}")
+        try:
+            screenshot = await self._decode_or_recover_screenshot(
+                observation,
+                session_id=session_id,
+                worker_base=instance_info.get("worker_base"),
+                context=f"/session/create session_id={session_id}",
+            )
+        except BaseException:
+            self._instances.pop(instance_id, None)
+            try:
+                await self._post_with_retries(
+                    f"/session/{session_id}/close",
+                    timeout=self.close_timeout,
+                )
+            except Exception:
+                _log(
+                    f"[DesktopEnvTool] create cleanup: failed to close no-screenshot "
+                    f"server session_id={session_id}",
+                    level="ERROR",
+                )
+            raise
+        images = [screenshot]
+        _log(f"[DesktopEnvTool] created session_id={session_id} has_screenshot=True")
         return instance_id, ToolResponse(image=images)
+
+    async def _recover_missing_screenshot_with_wait(
+        self,
+        *,
+        session_id: str,
+        worker_base: str | None,
+        context: str,
+    ) -> Image.Image:
+        wait_seconds = self.missing_screenshot_recovery_wait_seconds
+        request_id = str(uuid4())
+        _log(
+            f"[DesktopEnvTool] missing screenshot recovery request_id={request_id} "
+            f"session_id={session_id} context={context} action=WAIT pause={wait_seconds} "
+            f"timeout={self.step_timeout.total} server_timeout={self.step_server_timeout_seconds}",
+            level="ERROR",
+        )
+        try:
+            resp = await self._post_with_retries(
+                f"/session/{session_id}/step",
+                {
+                    "request_id": request_id,
+                    "action": "WAIT",
+                    "pause": wait_seconds,
+                    "timeout_seconds": self.step_server_timeout_seconds,
+                },
+                timeout=self.step_timeout,
+                error_context=f"missing_screenshot_recovery context={context}",
+                base_url=worker_base,
+            )
+        except Exception as exc:
+            raise DesktopEnvStepError(
+                f"{context} returned no valid screenshot and recovery WAIT failed; "
+                f"cause={self._error_detail(exc)}"
+            ) from exc
+        observation = resp.get("observation") or {}
+        screenshot = _require_screenshot(observation, context=f"{context} recovery WAIT")
+        _log(
+            f"[DesktopEnvTool] missing screenshot recovery OK request_id={request_id} "
+            f"session_id={session_id} context={context}"
+        )
+        return screenshot
+
+    async def _decode_or_recover_screenshot(
+        self,
+        observation: dict[str, Any] | None,
+        *,
+        session_id: str,
+        worker_base: str | None,
+        context: str,
+    ) -> Image.Image:
+        screenshot = _decode_screenshot((observation or {}).get("screenshot"))
+        if screenshot is not None:
+            return screenshot
+        return await self._recover_missing_screenshot_with_wait(
+            session_id=session_id,
+            worker_base=worker_base,
+            context=context,
+        )
 
     async def screenshot(self, instance_id: str) -> list:
         """Take a screenshot of the current desktop without executing any action.
@@ -1245,7 +1336,7 @@ class DesktopEnvTool(BaseTool):
             _log(
                 f"[DesktopEnvTool] terminate step done request_id={request_id} "
                 f"session_id={session_id} status={status} done={meta.get('done')} "
-                f"step_count={meta.get('step_count')}"
+                f"step_count={meta.get('step_count')} has_screenshot={bool(images)}"
             )
             return (
                 ToolResponse(image=images, text=f"Task terminated with status: {status}; code: {code}"),
@@ -1322,8 +1413,13 @@ class DesktopEnvTool(BaseTool):
             ) from exc
 
         observation = resp.get("observation") or {}
-        screenshot = _decode_screenshot(observation.get("screenshot"))
-        images = [screenshot] if screenshot is not None else []
+        screenshot = await self._decode_or_recover_screenshot(
+            observation,
+            session_id=session_id,
+            worker_base=info.get("worker_base"),
+            context=f"/step action={action!r} actual_action={code!r} session_id={session_id}",
+        )
+        images = [screenshot]
 
         action_summary = f"Executed action: {action}"
         if "coordinate" in parameters:
@@ -1356,7 +1452,7 @@ class DesktopEnvTool(BaseTool):
         _log(
             f"[DesktopEnvTool] step done request_id={request_id} "
             f"session_id={session_id} action={action} "
-            f"has_screenshot={bool(screenshot)} done={meta.get('done')} "
+            f"has_screenshot=True done={meta.get('done')} "
             f"step_count={meta.get('step_count')}"
         )
         return (
