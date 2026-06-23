@@ -126,7 +126,7 @@ adv_estimator=grpo
 max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-20480}
 max_response_length=${max_response_length:-4096}
-actor_lr=${actor_lr:-5e-6}
+actor_lr=${actor_lr:-1e-5}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
@@ -137,7 +137,7 @@ loss_scale_factor=${loss_scale_factor:-55}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-8}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:16}
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
@@ -212,7 +212,7 @@ cd "${VERL_ROOT}"
 
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.norm_adv_by_std_in_grpo=True \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \
