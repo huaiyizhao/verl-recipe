@@ -92,6 +92,45 @@ def test_hscroll_executes_pyautogui_hscroll():
     )
 
 
+def test_type_action_uses_unicode_input_for_non_ascii_text():
+    ascii_code = desktop_env_tool._translate_action_to_pyautogui(
+        {"action": "type", "text": "hello\nworld"},
+        1000,
+        1000,
+        1920,
+        1080,
+    )
+    assert ascii_code == "\n".join(
+        [
+            "pyautogui.typewrite('hello', interval=0.01)",
+            "pyautogui.press('enter')",
+            "pyautogui.typewrite('world', interval=0.01)",
+        ]
+    )
+
+    mixed_code = desktop_env_tool._translate_action_to_pyautogui(
+        {"action": "type", "text": "abc\u4e2d\u6587def\n\u03a9"},
+        1000,
+        1000,
+        1920,
+        1080,
+    )
+    assert mixed_code == "\n".join(
+        [
+            "pyautogui.typewrite('abc', interval=0.01)",
+            "for _unicode_hex in ['4e2d', '6587']:",
+            "    pyautogui.hotkey('ctrl', 'shift', 'u')",
+            "    pyautogui.typewrite(_unicode_hex, interval=0.01)",
+            "    pyautogui.press('enter')",
+            "pyautogui.typewrite('def', interval=0.01)",
+            "pyautogui.press('enter')",
+            "pyautogui.hotkey('ctrl', 'shift', 'u')",
+            "pyautogui.typewrite('3a9', interval=0.01)",
+            "pyautogui.press('enter')",
+        ]
+    )
+
+
 def test_owl_action_aliases_are_accepted():
     click_params = {"action": "click", "coordinate": [500, 500]}
     drag_params = {"action": "drag", "coordinate": [250, 250]}

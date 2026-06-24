@@ -233,6 +233,49 @@ def _with_held_keys(code: str, keys: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _append_unicode_input_code(code_lines: list[str], hex_codepoints: list[str]) -> None:
+    if not hex_codepoints:
+        return
+    if len(hex_codepoints) == 1:
+        code_lines.append("pyautogui.hotkey('ctrl', 'shift', 'u')")
+        code_lines.append(f"pyautogui.typewrite({hex_codepoints[0]!r}, interval=0.01)")
+        code_lines.append("pyautogui.press('enter')")
+        return
+
+    code_lines.append(f"for _unicode_hex in {hex_codepoints!r}:")
+    code_lines.append("    pyautogui.hotkey('ctrl', 'shift', 'u')")
+    code_lines.append("    pyautogui.typewrite(_unicode_hex, interval=0.01)")
+    code_lines.append("    pyautogui.press('enter')")
+
+
+def _type_text_code_lines(text: str) -> list[str]:
+    code_lines: list[str] = []
+    ascii_buffer: list[str] = []
+    unicode_buffer: list[str] = []
+
+    def flush_ascii() -> None:
+        if ascii_buffer:
+            code_lines.append(f"pyautogui.typewrite({''.join(ascii_buffer)!r}, interval=0.01)")
+            ascii_buffer.clear()
+
+    def flush_unicode() -> None:
+        if unicode_buffer:
+            _append_unicode_input_code(code_lines, unicode_buffer)
+            unicode_buffer.clear()
+
+    for ch in text:
+        if ord(ch) < 128:
+            flush_unicode()
+            ascii_buffer.append(ch)
+        else:
+            flush_ascii()
+            unicode_buffer.append(f"{ord(ch):x}")
+
+    flush_ascii()
+    flush_unicode()
+    return code_lines
+
+
 _ACTION_ALIASES: dict[str, str] = {
     "click": "left_click",
     "drag": "left_click_drag",
@@ -326,7 +369,7 @@ def _translate_action_to_pyautogui(
         lines = text.split("\n")
         for idx, line in enumerate(lines):
             if line:
-                code_lines.append(f"pyautogui.typewrite({line!r}, interval=0.03)")
+                code_lines.extend(_type_text_code_lines(line))
             if idx < len(lines) - 1:
                 code_lines.append("pyautogui.press('enter')")
         return "\n".join(code_lines)
