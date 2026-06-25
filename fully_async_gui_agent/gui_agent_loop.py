@@ -11,22 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GUI Agent Loop for Computer-Use Agent (CUA) training under fully-async PPO.
+"""GUI Agent Loop for Computer-Use Agent (CUA) training under the V1 trainer.
 
 Multi-turn VLM + remote-desktop interaction. Each turn yields an independent
 trajectory because screenshot pruning makes each turn's prompt unique. The
 terminal binary reward is shared across all trajectories.
 
-The loop packs intermediate trajectories using
-:class:`MultiTrajectoryAgentLoop` so that:
+``run()`` returns a **list** of ``AgentLoopOutput`` — one equivalent trajectory
+per turn, differing only by metadata (``trajectory_role`` / ``turn_number``).
+The V1 ``AgentLoopWorkerTQ._agent_loop_postprocess`` accepts a list natively,
+writes each turn as its own TransferQueue row keyed ``{uid}_{session_id}_{index}``,
+and broadcasts the final-turn reward to the earlier turns. No intermediate
+packing, no trainer-side expansion: every turn is first-class from the start.
 
-* ``AgentLoopWorker``, ``MessageQueue`` and ``FullyAsyncRollouter`` are all
-  unmodified (each rollout still returns a single ``AgentLoopOutput``).
-* The Trainer-side ``expand_intermediate_trajectories`` utility expands the
-  packed trajectories into independent DataProto rows during batch assembly,
-  keeping the GRPO grouping invariant (n × turns rows per prompt).
-* Fully-async ``FullyAsyncLLMServerManager`` supplies partial-rollout resume
-  transparently via ``self.server_manager.generate()``.
+Each output carries per-turn ``multi_modal_data`` (the raw screenshots visible
+in that turn's prompt window); the V1 worker recomputes the processor tensors
+(``multi_modal_inputs``) from it. ``FullyAsyncLLMServerManager`` supplies
+partial-rollout resume transparently via ``self.server_manager.generate()``.
 """
 
 import asyncio
@@ -43,12 +44,10 @@ from recipe.fully_async_gui_agent.data_flow_logger import log_message
 from recipe.fully_async_gui_agent.desktop_env_tool import DesktopEnvStepError
 
 from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
     AgentLoopMetrics,
     AgentLoopOutput,
     register,
-)
-from verl.experimental.agent_loop.multi_trajectory_agent_loop import (
-    MultiTrajectoryAgentLoop,
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.tools.utils.tool_registry import initialize_tools_from_config
@@ -91,16 +90,22 @@ def _log(msg: str, *, level: str = "DEBUG", debug: bool | None = None) -> None:
 
 
 @register("gui_agent")
-class GUIAgentLoop(MultiTrajectoryAgentLoop):
+class GUIAgentLoop(AgentLoopBase):
     """Multi-turn GUI agent loop for desktop computer-use tasks.
 
     Each LLM turn becomes an independent trajectory (because the prompt
     changes due to screenshot pruning). All trajectories share the final
-    reward assigned at the end of the rollout.
+    reward assigned at the end of the rollout. ``run()`` returns the full
+    per-turn trajectory list; the V1 worker postprocesses each into its own
+    TransferQueue row.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Per-instance buffer of intermediate-turn trajectories, flushed at the
+        # end of ``run()`` together with the final turn.
+        self._trajectories: list[AgentLoopOutput] = []
 
         # Multi-turn config.
         self.max_turns = self.rollout_config.multi_turn.max_assistant_turns or 20
@@ -135,6 +140,40 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
     def _build_metrics(self, metrics: dict[str, Any]) -> AgentLoopMetrics:
         """Build AgentLoopMetrics, keeping only known fields."""
         return AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
+
+    def _make_turn_output(
+        self,
+        ctx: dict[str, Any],
+        *,
+        role: str,
+        metrics: AgentLoopMetrics | None = None,
+    ) -> AgentLoopOutput:
+        """Build one per-turn ``AgentLoopOutput`` from a turn snapshot.
+
+        Intermediate and final turns are identical in schema; they differ only
+        by ``extra_fields["trajectory_role"]`` and (for the final turn) the
+        carried rollout-level ``metrics``. ``multi_modal_data`` (the raw
+        screenshots for this turn) is carried so the V1 worker can recompute
+        the processor tensors; ``reward_score`` is stamped later by ``run()``.
+        """
+        extra = dict(ctx["extra_fields"])
+        extra["trajectory_role"] = role
+        # The V1 worker broadcasts ``extra_fields["reward_extra_info"]`` from the
+        # final turn to the earlier turns. Because our reward is computed in-loop
+        # (``reward_score`` is pre-set), the worker's reward path is skipped and
+        # would never populate this key — so provide it here to avoid a KeyError.
+        extra.setdefault("reward_extra_info", {})
+        return AgentLoopOutput(
+            prompt_ids=ctx["prompt_ids"],
+            response_ids=ctx["response_ids"],
+            response_mask=ctx["response_mask"],
+            response_logprobs=ctx["response_logprobs"],
+            routed_experts=ctx["routed_experts"],
+            multi_modal_data=ctx["multi_modal_data"],
+            num_turns=ctx["num_turns"],
+            metrics=metrics if metrics is not None else AgentLoopMetrics(),
+            extra_fields=extra,
+        )
 
     @staticmethod
     def _extract_low_level_instruction(response: str, fallback_action: str | None = None) -> str:
@@ -193,7 +232,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     level="ERROR",
                 )
 
-        self._intermediate_trajectories.clear()
+        self._trajectories.clear()
         retry_kwargs = dict(kwargs)
         retry_kwargs["_gui_env_rerun_attempt"] = attempt + 1
         _log(
@@ -274,7 +313,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         return None
 
     @rollout_trace_op
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | None:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput] | None:
         """Run the GUI agent multi-turn rollout.
 
         Args:
@@ -283,13 +322,14 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 ``extra_info`` with ``task_id`` / ``question``.
 
         Returns:
-            A single ``AgentLoopOutput`` for the final turn, with intermediate
-            turns packed into ``extra_fields["intermediate_trajectories"]``.
-            Returns ``None`` if the rollout must be discarded (env creation
-            failed or a fatal error occurred mid-rollout).
+            A ``list[AgentLoopOutput]`` — one equivalent trajectory per turn
+            (intermediate turns first, final turn last), each carrying the
+            shared episode reward. Returns ``None`` if the rollout must be
+            discarded (env creation failed or a fatal error occurred
+            mid-rollout).
         """
         rerun_attempt = int(kwargs.pop("_gui_env_rerun_attempt", 0) or 0)
-        self._intermediate_trajectories.clear()
+        self._trajectories.clear()
 
         messages = list(kwargs["raw_prompt"])
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -623,18 +663,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     _log(f"{log_tag}[turn={turn}] Rollout ends: reason={stop_reason}")
                     break
 
-                # 8. Not final: register this turn as intermediate and
-                #    record it for history.
-                self.append_intermediate_trajectory(
-                    prompt_ids=last_turn_ctx["prompt_ids"],
-                    response_ids=last_turn_ctx["response_ids"],
-                    response_mask=last_turn_ctx["response_mask"],
-                    response_logprobs=last_turn_ctx["response_logprobs"],
-                    routed_experts=last_turn_ctx["routed_experts"],
-                    multi_modal_data=last_turn_ctx["multi_modal_data"],
-                    num_turns=last_turn_ctx["num_turns"],
-                    **last_turn_ctx["extra_fields"],
-                )
+                # 8. Not final: buffer this turn as an intermediate trajectory
+                #    and record it for history.
+                self._trajectories.append(self._make_turn_output(last_turn_ctx, role="intermediate"))
                 last_turn_ctx = None  # consumed as intermediate
 
                 # Record this turn for the history strategy.
@@ -738,33 +769,32 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"turns={turn}, stop_reason={stop_reason})"
             )
 
-            # Build the final AgentLoopOutput from the last turn's snapshot.
-            final_extra_fields = dict(last_turn_ctx["extra_fields"])
-            final_extra_fields["trajectory_role"] = "final"
-
-            final_output = AgentLoopOutput(
-                prompt_ids=last_turn_ctx["prompt_ids"],
-                response_ids=last_turn_ctx["response_ids"],
-                response_mask=last_turn_ctx["response_mask"],
-                response_logprobs=last_turn_ctx["response_logprobs"],
-                routed_experts=last_turn_ctx["routed_experts"],
-                multi_modal_data=last_turn_ctx["multi_modal_data"],
-                num_turns=last_turn_ctx["num_turns"],
-                metrics=self._build_metrics(metrics),
-                extra_fields=final_extra_fields,
+            # Build the final-turn output and assemble the full trajectory list.
+            # Every turn shares the episode reward; the worker writes each as its
+            # own row, differing only by ``trajectory_role`` / ``turn_number``.
+            final_output = self._make_turn_output(
+                last_turn_ctx, role="final", metrics=self._build_metrics(metrics)
             )
+            final_output.reward_score = shared_reward
+            final_output.extra_fields["reward_extra_info"] = {
+                "base_reward": base_reward,
+                "turn_penalty": turn_penalty,
+            }
+            for traj in self._trajectories:
+                traj.reward_score = shared_reward
+            # Chronological order: intermediate turns first, final turn last.
+            trajectories = [*self._trajectories, final_output]
+            self._trajectories = []
 
-            final_output = self.build_final_output(final_output, shared_reward)
-
-            num_intermediate = len(final_output.extra_fields.get("intermediate_trajectories", []))
+            num_intermediate = len(trajectories) - 1
             _log(
-                f"{log_tag} Done: {num_intermediate + 1} trajectories "
+                f"{log_tag} Done: {len(trajectories)} trajectories "
                 f"(1 final + {num_intermediate} intermediate), reward={shared_reward:.4f}"
             )
 
             # --- Data flow log: agent loop output ---
             log_message(
-                "gui_agent_loop.build_final_output",
+                "gui_agent_loop.run",
                 f"task_id={task_id} request_id={request_id} instance_id={instance_id} "
                 f"sample_index={sample_index} rollout_n={rollout_n} step={global_step} "
                 f"turns={turn} stop_reason={stop_reason} "
@@ -772,11 +802,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"turn_penalty={turn_penalty:.4f} "
                 f"num_intermediate={num_intermediate} "
                 f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
-                f"final_response_len={len(last_turn_ctx['response_ids'])} "
-                f"extra_fields_keys={list(final_output.extra_fields.keys())}",
+                f"final_response_len={len(last_turn_ctx['response_ids'])}",
             )
 
-            return final_output
+            return trajectories
 
         except Exception as run_exc:
             _log(
