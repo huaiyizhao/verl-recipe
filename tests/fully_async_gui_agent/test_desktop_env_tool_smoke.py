@@ -2,7 +2,10 @@ import asyncio
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
+
+import pytest
 
 
 RECIPE_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +32,26 @@ prepare_dataset = _load_module(
 )
 
 
+def _load_gui_agent_loop_module():
+    recipe_pkg = types.ModuleType("recipe")
+    recipe_pkg.__path__ = [str(RECIPE_ROOT)]
+    gui_pkg = types.ModuleType("recipe.fully_async_gui_agent")
+    gui_pkg.__path__ = [str(RECIPE_ROOT / "fully_async_gui_agent")]
+    sys.modules["recipe"] = recipe_pkg
+    sys.modules["recipe.fully_async_gui_agent"] = gui_pkg
+
+    for module_name in ("context_manager", "data_flow_logger", "desktop_env_tool"):
+        _load_module(
+            f"recipe.fully_async_gui_agent.{module_name}",
+            RECIPE_ROOT / "fully_async_gui_agent" / f"{module_name}.py",
+        )
+
+    return _load_module(
+        "recipe.fully_async_gui_agent.gui_agent_loop",
+        RECIPE_ROOT / "fully_async_gui_agent" / "gui_agent_loop.py",
+    )
+
+
 def _tool_json_from_prompt(prompt: str) -> dict:
     tool_text = prompt.rsplit("<tools>", 1)[1].split("</tools>", 1)[0]
     return json.loads(tool_text)
@@ -38,6 +61,20 @@ def test_prepare_dataset_prompt_uses_runtime_tool_schema():
     assert _tool_json_from_prompt(
         prepare_dataset.DEFAULT_SYSTEM_PROMPT
     ) == desktop_env_tool.build_computer_use_tool_dict()
+
+
+def test_turn_penalty_scales_with_base_reward():
+    gui_agent_loop = _load_gui_agent_loop_module()
+
+    assert gui_agent_loop.GUIAgentLoop._apply_turn_penalty(
+        0.0, turn=50, max_turns=50, turn_penalty_coef=0.1
+    ) == pytest.approx((0.0, 0.098, 0.0))
+    assert gui_agent_loop.GUIAgentLoop._apply_turn_penalty(
+        0.5, turn=26, max_turns=50, turn_penalty_coef=0.1
+    ) == pytest.approx((0.475, 0.05, 0.025))
+    assert gui_agent_loop.GUIAgentLoop._apply_turn_penalty(
+        1.0, turn=26, max_turns=50, turn_penalty_coef=0.1
+    ) == pytest.approx((0.95, 0.05, 0.05))
 
 
 def test_click_and_scroll_modifier_keys_are_held_during_action():

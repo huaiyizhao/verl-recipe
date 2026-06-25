@@ -212,7 +212,7 @@ cd "${VERL_ROOT}"
 
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
-    algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.norm_adv_by_std_in_grpo=False \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \

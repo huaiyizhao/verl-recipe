@@ -137,6 +137,20 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         return AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
 
     @staticmethod
+    def _apply_turn_penalty(
+        base_reward: float,
+        *,
+        turn: int,
+        max_turns: int,
+        turn_penalty_coef: float,
+    ) -> tuple[float, float, float]:
+        """Apply an efficiency penalty scaled by base reward in [0, 1]."""
+        raw_turn_penalty = turn_penalty_coef * max(0, turn - 1) / max(1, max_turns)
+        effective_turn_penalty = raw_turn_penalty * max(0.0, min(1.0, base_reward))
+        adjusted_reward = base_reward - effective_turn_penalty
+        return adjusted_reward, raw_turn_penalty, effective_turn_penalty
+
+    @staticmethod
     def _extract_low_level_instruction(response: str, fallback_action: str | None = None) -> str:
         """Extract the Action: line from a model response (qwen3vl_agent style).
 
@@ -730,17 +744,31 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     error=reward_exc,
                 )
                 return None
-            turn_penalty = self.turn_penalty_coef * max(0, turn - 1) / max(1, self.max_turns)
-            shared_reward = base_reward - turn_penalty
+            shared_reward, turn_penalty, effective_turn_penalty = self._apply_turn_penalty(
+                base_reward,
+                turn=turn,
+                max_turns=self.max_turns,
+                turn_penalty_coef=self.turn_penalty_coef,
+            )
             _log(
                 f"{log_tag} Final reward = {shared_reward:.4f} "
                 f"(base={base_reward:.4f}, turn_penalty={turn_penalty:.4f}, "
+                f"effective_turn_penalty={effective_turn_penalty:.4f}, "
                 f"turns={turn}, stop_reason={stop_reason})"
             )
 
             # Build the final AgentLoopOutput from the last turn's snapshot.
+            reward_extra_info = {
+                "base_reward": base_reward,
+                "turn_penalty": turn_penalty,
+                "effective_turn_penalty": effective_turn_penalty,
+            }
+            for trajectory in self._intermediate_trajectories:
+                trajectory.extra_fields["reward_extra_info"] = reward_extra_info
+
             final_extra_fields = dict(last_turn_ctx["extra_fields"])
             final_extra_fields["trajectory_role"] = "final"
+            final_extra_fields["reward_extra_info"] = reward_extra_info
 
             final_output = AgentLoopOutput(
                 prompt_ids=last_turn_ctx["prompt_ids"],
@@ -770,6 +798,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 f"turns={turn} stop_reason={stop_reason} "
                 f"reward={shared_reward:.4f} base_reward={base_reward:.4f} "
                 f"turn_penalty={turn_penalty:.4f} "
+                f"effective_turn_penalty={effective_turn_penalty:.4f} "
                 f"num_intermediate={num_intermediate} "
                 f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
                 f"final_response_len={len(last_turn_ctx['response_ids'])} "
