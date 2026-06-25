@@ -141,6 +141,20 @@ class GUIAgentLoop(AgentLoopBase):
         """Build AgentLoopMetrics, keeping only known fields."""
         return AgentLoopMetrics(**{k: v for k, v in metrics.items() if k in AgentLoopMetrics.model_fields})
 
+    @staticmethod
+    def _apply_turn_penalty(
+        base_reward: float,
+        *,
+        turn: int,
+        max_turns: int,
+        turn_penalty_coef: float,
+    ) -> tuple[float, float, float]:
+        """Apply an efficiency penalty scaled by base reward in [0, 1]."""
+        raw_turn_penalty = turn_penalty_coef * max(0, turn - 1) / max(1, max_turns)
+        effective_turn_penalty = raw_turn_penalty * max(0.0, min(1.0, base_reward))
+        adjusted_reward = base_reward - effective_turn_penalty
+        return adjusted_reward, raw_turn_penalty, effective_turn_penalty
+
     def _make_turn_output(
         self,
         ctx: dict[str, Any],
@@ -761,11 +775,16 @@ class GUIAgentLoop(AgentLoopBase):
                     error=reward_exc,
                 )
                 return None
-            turn_penalty = self.turn_penalty_coef * max(0, turn - 1) / max(1, self.max_turns)
-            shared_reward = base_reward - turn_penalty
+            shared_reward, turn_penalty, effective_turn_penalty = self._apply_turn_penalty(
+                base_reward,
+                turn=turn,
+                max_turns=self.max_turns,
+                turn_penalty_coef=self.turn_penalty_coef,
+            )
             _log(
                 f"{log_tag} Final reward = {shared_reward:.4f} "
                 f"(base={base_reward:.4f}, turn_penalty={turn_penalty:.4f}, "
+                f"effective_turn_penalty={effective_turn_penalty:.4f}, "
                 f"turns={turn}, stop_reason={stop_reason})"
             )
 
@@ -776,12 +795,15 @@ class GUIAgentLoop(AgentLoopBase):
                 last_turn_ctx, role="final", metrics=self._build_metrics(metrics)
             )
             final_output.reward_score = shared_reward
-            final_output.extra_fields["reward_extra_info"] = {
+            reward_extra_info = {
                 "base_reward": base_reward,
                 "turn_penalty": turn_penalty,
+                "effective_turn_penalty": effective_turn_penalty,
             }
+            final_output.extra_fields["reward_extra_info"] = reward_extra_info
             for traj in self._trajectories:
                 traj.reward_score = shared_reward
+                traj.extra_fields["reward_extra_info"] = reward_extra_info
             # Chronological order: intermediate turns first, final turn last.
             trajectories = [*self._trajectories, final_output]
             self._trajectories = []
@@ -800,6 +822,7 @@ class GUIAgentLoop(AgentLoopBase):
                 f"turns={turn} stop_reason={stop_reason} "
                 f"reward={shared_reward:.4f} base_reward={base_reward:.4f} "
                 f"turn_penalty={turn_penalty:.4f} "
+                f"effective_turn_penalty={effective_turn_penalty:.4f} "
                 f"num_intermediate={num_intermediate} "
                 f"final_prompt_len={len(last_turn_ctx['prompt_ids'])} "
                 f"final_response_len={len(last_turn_ctx['response_ids'])}",

@@ -91,6 +91,53 @@ class DesktopEnvStepError(RuntimeError):
     """Raised when a backend /step failure should discard the trajectory."""
 
 
+class DesktopEnvConcurrencyLimiter:
+    """Async Ray actor implementation for cluster-wide desktop session slots."""
+
+    def __init__(self, max_sessions: int):
+        self.max_sessions = max(1, int(max_sessions))
+        self._owners: set[str] = set()
+        self._condition = asyncio.Condition()
+
+    async def set_limit(self, max_sessions: int) -> dict[str, int]:
+        async with self._condition:
+            self.max_sessions = max(1, int(max_sessions))
+            self._condition.notify_all()
+            return {"max_sessions": self.max_sessions, "in_use": len(self._owners)}
+
+    async def acquire(self, owner_id: str) -> dict[str, int]:
+        async with self._condition:
+            while owner_id not in self._owners and len(self._owners) >= self.max_sessions:
+                await self._condition.wait()
+            self._owners.add(owner_id)
+            return {"max_sessions": self.max_sessions, "in_use": len(self._owners)}
+
+    async def try_acquire(self, owner_id: str) -> dict[str, int | bool]:
+        async with self._condition:
+            if owner_id not in self._owners and len(self._owners) >= self.max_sessions:
+                return {
+                    "acquired": False,
+                    "max_sessions": self.max_sessions,
+                    "in_use": len(self._owners),
+                }
+            self._owners.add(owner_id)
+            return {
+                "acquired": True,
+                "max_sessions": self.max_sessions,
+                "in_use": len(self._owners),
+            }
+
+    async def release(self, owner_id: str) -> dict[str, int]:
+        async with self._condition:
+            self._owners.discard(owner_id)
+            self._condition.notify_all()
+            return {"max_sessions": self.max_sessions, "in_use": len(self._owners)}
+
+    async def stats(self) -> dict[str, int]:
+        async with self._condition:
+            return {"max_sessions": self.max_sessions, "in_use": len(self._owners)}
+
+
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 _LOG_LEVEL = os.getenv("GUI_AGENT_LOGGING_LEVEL", "ERROR").upper()
 _LOG_THRESHOLD = _LOG_LEVELS.get(_LOG_LEVEL, _LOG_LEVELS["ERROR"])
@@ -585,6 +632,10 @@ class DesktopEnvTool(BaseTool):
             status errors from ``/session/create`` (default 0).
         create_retry_statuses (list[int]): HTTP statuses treated as retryable
             for ``/session/create`` (default [429, 500, 502, 503, 504]).
+        max_concurrent_sessions (int): Cluster-wide maximum number of active
+            desktop sessions. ``0`` disables the limiter (default 0).
+        concurrency_limiter_name (str): Ray named actor used for the limiter.
+            Tools with the same name share the same session budget.
         auth_token (str): Optional Bearer token for the desktop service.
             Defaults to ``$DESKTOP_API_AUTH_TOKEN`` or ``$RL_PROXY_AUTH_TOKEN``.
     """
@@ -642,6 +693,13 @@ class DesktopEnvTool(BaseTool):
             raise ValueError("create_status_max_retries must be non-negative")
         self.create_retry_statuses = tuple(int(status) for status in config.get("create_retry_statuses", [429, 500, 502, 503, 504]))
         self.create_status_retry_interval = float(config.get("create_status_retry_interval", 30.0))
+        self.max_concurrent_sessions = int(config.get("max_concurrent_sessions", 0) or 0)
+        if self.max_concurrent_sessions < 0:
+            raise ValueError("max_concurrent_sessions must be non-negative")
+        self.concurrency_limiter_name = str(
+            config.get("concurrency_limiter_name", "gui_agent_desktop_env_limiter")
+        )
+        self._concurrency_limiter = None
 
         # HTTP connection config. By default, each request gets a fresh
         # ClientSession/TCP connection. Session reuse is opt-in.
@@ -1032,6 +1090,72 @@ class DesktopEnvTool(BaseTool):
                 )
                 await asyncio.sleep(retry_interval)
 
+    def _get_concurrency_limiter(self):
+        if self.max_concurrent_sessions <= 0:
+            return None
+        if self._concurrency_limiter is not None:
+            return self._concurrency_limiter
+
+        import ray
+
+        try:
+            limiter = ray.get_actor(self.concurrency_limiter_name)
+        except Exception:
+            try:
+                limiter = ray.remote(DesktopEnvConcurrencyLimiter).options(
+                    name=self.concurrency_limiter_name,
+                    lifetime="detached",
+                    max_concurrency=max(self.max_concurrent_sessions * 2, 128),
+                ).remote(self.max_concurrent_sessions)
+            except Exception:
+                # Another worker may have won the named-actor creation race.
+                limiter = ray.get_actor(self.concurrency_limiter_name)
+
+        self._concurrency_limiter = limiter
+        return limiter
+
+    async def _acquire_session_slot(self, instance_id: str, task_id: str) -> str | None:
+        limiter = self._get_concurrency_limiter()
+        if limiter is None:
+            return None
+
+        owner_id = f"{socket.gethostname()}:{os.getpid()}:{id(self)}:{instance_id}"
+        await limiter.set_limit.remote(self.max_concurrent_sessions)
+        while True:
+            stats = await limiter.try_acquire.remote(owner_id)
+            if stats.get("acquired"):
+                _log(
+                    f"[DesktopEnvTool] acquired session slot {stats['in_use']}/{stats['max_sessions']} "
+                    f"task_id={task_id} instance_id={instance_id}",
+                    debug=True,
+                )
+                return owner_id
+            _log(
+                f"[DesktopEnvTool] waiting for session slot {stats['in_use']}/{stats['max_sessions']} "
+                f"task_id={task_id} instance_id={instance_id}",
+                debug=True,
+            )
+            await asyncio.sleep(1.0)
+
+    async def _release_session_slot(self, owner_id: str | None, instance_id: str) -> None:
+        if not owner_id:
+            return
+        limiter = self._get_concurrency_limiter()
+        if limiter is None:
+            return
+        try:
+            stats = await limiter.release.remote(owner_id)
+            _log(
+                f"[DesktopEnvTool] released session slot {stats['in_use']}/{stats['max_sessions']} "
+                f"instance_id={instance_id}",
+                debug=True,
+            )
+        except Exception:
+            _log(
+                f"[DesktopEnvTool] failed to release session slot instance_id={instance_id}",
+                level="ERROR",
+            )
+
     # ------------------------------------------------------------------
     # BaseTool interface
     # ------------------------------------------------------------------
@@ -1072,6 +1196,7 @@ class DesktopEnvTool(BaseTool):
             )
             await asyncio.sleep(jitter_seconds)
 
+        slot_owner_id = await self._acquire_session_slot(instance_id, task_id)
         try:
             payload = {
                 "session_id": instance_id,
@@ -1103,6 +1228,7 @@ class DesktopEnvTool(BaseTool):
             instance_info = {
                 "session_id": session_id,
                 "task_id": task_id,
+                "session_slot_owner_id": slot_owner_id,
             }
             # B2: if the server returned a per-session worker HTTP port, route the
             # hot-path step/evaluate calls directly to that worker (same host as
@@ -1154,6 +1280,7 @@ class DesktopEnvTool(BaseTool):
                         f"server session_id={server_session_id}",
                         level="ERROR",
                     )
+            await self._release_session_slot(slot_owner_id, instance_id)
             raise
 
         _log(f"[DesktopEnvTool] create session OK task_id={task_id} instance_id={instance_id} session_id={session_id}")
@@ -1179,6 +1306,7 @@ class DesktopEnvTool(BaseTool):
                     f"server session_id={session_id}",
                     level="ERROR",
                 )
+            await self._release_session_slot(slot_owner_id, instance_id)
             raise
         images = [screenshot]
         _log(f"[DesktopEnvTool] created session_id={session_id} has_screenshot=True")
@@ -1559,6 +1687,7 @@ class DesktopEnvTool(BaseTool):
             )
             return
         session_id = info["session_id"]
+        slot_owner_id = info.get("session_slot_owner_id")
         _log(
             f"[DesktopEnvTool] release session_id={session_id} task_id={info.get('task_id')} instance_id={instance_id}"
         )
@@ -1573,5 +1702,6 @@ class DesktopEnvTool(BaseTool):
             logger.warning("Failed to close session %s", session_id, exc_info=True)
         finally:
             self._instances.pop(instance_id, None)
+            await self._release_session_slot(slot_owner_id, instance_id)
             if not self._instances:
                 await self._close_http_session()

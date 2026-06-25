@@ -16,11 +16,12 @@
 # GUI Agent (Computer-Use Agent) PPO training on the **V1 trainer**
 # (separate_async mode, TransferQueue-native).
 #
-# This is the V1 port of run_fully_async_gui_agent_8_8.sh. The agent loop,
-# tools, data, model and desktop-env settings are unchanged; only the async
-# data-link is different: instead of the experimental fully_async_policy
-# (Rollouter + Ray MessageQueue + Trainer actors), this uses the upstream V1
-# `separate_async` trainer with a TransferQueue data plane + replay buffer.
+# This is the V1 port of run_fully_async_gui_agent_8b_3nodes_16train_8rollout.sh.
+# The agent loop, tools, data, model and desktop-env settings are unchanged;
+# only the async data-link is different: instead of the experimental
+# fully_async_policy (Rollouter + Ray MessageQueue + Trainer actors), this uses
+# the upstream V1 `separate_async` trainer with a TransferQueue data plane +
+# replay buffer.
 #
 # Config mapping from the old fully_async_policy knobs:
 #   entry            verl.experimental.fully_async_policy.fully_async_main
@@ -57,7 +58,19 @@ export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 
 # ================= paths =================
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERL_ROOT=${VERL_ROOT:-/root/verl}
+if [[ -z "${VERL_ROOT:-}" ]]; then
+    if [[ -d "verl/trainer/config" ]]; then
+        VERL_ROOT="$(pwd)"
+    elif [[ -d "${RECIPE_DIR}/../../verl-v1/verl/trainer/config" ]]; then
+        VERL_ROOT="$(cd "${RECIPE_DIR}/../../verl-v1" && pwd)"
+    elif [[ -d "${RECIPE_DIR}/../../verl/trainer/config" ]]; then
+        VERL_ROOT="$(cd "${RECIPE_DIR}/../.." && pwd)"
+    else
+        echo "ERROR: cannot find a complete verl source tree in Ray working_dir." >&2
+        echo "Submit from the repo root that contains both verl/ and recipe/." >&2
+        exit 1
+    fi
+fi
 
 # ================= cluster topology =================
 # V1 separate_async splits GPUs into a TRAINER pool (which also flips to rollout
@@ -66,9 +79,9 @@ VERL_ROOT=${VERL_ROOT:-/root/verl}
 #   standalone pool-> actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
 # Both must be > 0 in separate_async. Tune the split for your cluster.
 trainer_nnodes=${trainer_nnodes:-2}
-n_gpus_training=${n_gpus_training:-4}
-rollout_nnodes=${rollout_nnodes:-2}
-n_gpus_rollout=${n_gpus_rollout:-4}
+n_gpus_training=${n_gpus_training:-8}
+rollout_nnodes=${rollout_nnodes:-1}
+n_gpus_rollout=${n_gpus_rollout:-8}
 
 # ================= data / model =================
 HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
@@ -76,11 +89,12 @@ train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
 # ================= desktop env service =================
-export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://10.192.64.238:2354}
+export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://172.31.13.38:2354}
 
 # ================= rollout / agent loop =================
 rollout_mode="async"
 rollout_name=${rollout_name:-vllm}
+rollout_logprobs_mode=${rollout_logprobs_mode:-raw_logprobs}
 if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
 fi
@@ -92,25 +106,32 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-20000}
-max_response_length=${max_response_length:-8192}
-actor_lr=${actor_lr:-1e-6}
+max_prompt_length=${max_prompt_length:-20480}
+max_response_length=${max_response_length:-4096}
+actor_lr=${actor_lr:-5e-6}
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
-loss_agg_mode=${loss_agg_mode:-seq-mean-token-sum-norm}
-loss_scale_factor=${loss_scale_factor:-${max_response_length}}
+norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
+grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
+loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
+loss_scale_factor=${loss_scale_factor:-55}
 
-# V1 separate_async asserts data.train_batch_size == actor.ppo_mini_batch_size
-# (one mini-batch consumed per step, streamed from the replay buffer).
-train_prompt_bsz=${train_prompt_bsz:-6}
+# V1 separate_async asserts data.train_batch_size == actor.ppo_mini_batch_size.
+# In V1 this is the number of prompt groups sampled per trainer step. The
+# rollout-session batch size is train_prompt_bsz * n_resp_per_prompt, plus any
+# intermediate per-turn rows emitted by GUIAgentLoop.
+train_prompt_bsz=${train_prompt_bsz:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
-n_resp_per_prompt=${n_resp_per_prompt:-8}
-total_training_steps=${total_training_steps:-1000}
-total_epochs=200
+n_resp_per_prompt=${n_resp_per_prompt:-16}
+total_training_steps=${total_training_steps:-100000}
+total_epochs=100000
 test_freq=-1  # disabled: validation competes for desktop-env containers
 
 # ---- V1 async / staleness controls ----
-# Warmup batches primed before the training loop (keeps the replay buffer fed).
-num_warmup_batches=${num_warmup_batches:-4}
+# Warmup batches primed before the training loop. Keep this at 0 when you want
+# env pressure controlled mainly by train_prompt_bsz * n_resp_per_prompt.
+num_warmup_batches=${num_warmup_batches:-0}
 # Every N steps the trainer pushes new weights to the standalone rollout pool.
 parameter_sync_step=${parameter_sync_step:-2}
 # Max model-versions a trajectory may span before it is dropped/waited.
@@ -120,6 +141,23 @@ max_off_policy_strategy=${max_off_policy_strategy:-drop}
 # Standalone rollout replicas must use a real weight-transfer checkpoint engine
 # (separate_async forbids the "naive" backend).
 checkpoint_engine_backend=${checkpoint_engine_backend:-nccl}
+
+# Rollout correction preset used by the old fully-async GUI recipe.
+rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
+rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
+rollout_correction_is=${rollout_correction_is:-null}
+rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
+case "${rollout_correction_bypass_mode}" in
+    True|true|TRUE|1)
+        actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
+        ;;
+    *)
+        actor_policy_loss_mode=${actor_policy_loss_mode:-vanilla}
+        ;;
+esac
+
+calculate_entropy=${calculate_entropy:-True}
 
 # ---- Per-image dedup (opt-in; ppo/v1 untouched, enabled via subclass selection) ----
 # Off (default): screenshots stored inline per row (correct, memory-heavy).
@@ -139,14 +177,20 @@ fi
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
-actor_offload=${actor_offload:-False}
+actor_param_offload=${actor_param_offload:-False}
+actor_optimizer_offload=${actor_optimizer_offload:-False}
+actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
-actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3 / 2))
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-50000}
+infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
-project_name=${project_name:-v1_gui_agent}
-experiment_name=${experiment_name:-qwen3vl_8b_separate_async}
+run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
+project_name=${project_name:-v1_gui_agent_${run_timestamp}}
+experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_separate_async}
+default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
+save_freq=${save_freq:-30}
+resume_mode=${resume_mode:-auto}
 
 # ================= launch =================
 # Hydra config uses `hydra.searchpath: file://verl/trainer/config` (relative to
@@ -165,8 +209,14 @@ python3 -m verl.trainer.main_ppo \
     transfer_queue.backend.storage_backend=SimpleStorage \
     "${dedup_args[@]}" \
     algorithm.adv_estimator=${adv_estimator} \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    algorithm.grpo_adv_std_floor=${grpo_adv_std_floor} \
     algorithm.use_kl_in_reward=False \
+    algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
+    algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
+    algorithm.rollout_correction.rollout_is=${rollout_correction_is} \
+    algorithm.rollout_correction.rollout_rs=${rollout_correction_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \
@@ -177,25 +227,39 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
+    'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
-    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
+    actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.loss_scale_factor=${loss_scale_factor} \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.grad_clip=1.0 \
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
+    actor_rollout_ref.actor.grad_clip=2.0 \
     actor_rollout_ref.actor.use_rollout_log_probs=True \
+    actor_rollout_ref.actor.policy_loss.loss_mode=${actor_policy_loss_mode} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type=${rollout_correction_loss_type} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=${rollout_correction_is} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_correction_rs} \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -203,13 +267,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n_gpus_per_node=${n_gpus_rollout} \
     actor_rollout_ref.rollout.checkpoint_engine.backend=${checkpoint_engine_backend} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.logprobs_mode=${rollout_logprobs_mode} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.max_model_len=32768 \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.rollout.disable_log_stats=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
@@ -219,7 +285,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
-    actor_rollout_ref.rollout.agent.num_workers=4 \
+    actor_rollout_ref.rollout.agent.num_workers=16 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
@@ -231,8 +297,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps="${total_training_steps}" \
     trainer.val_before_train=False \
     trainer.test_freq="${test_freq}" \
-    trainer.save_freq=-1 \
-    trainer.resume_mode=disable \
+    trainer.save_freq="${save_freq}" \
+    trainer.default_local_dir="${default_local_dir}" \
+    trainer.resume_mode="${resume_mode}" \
     trainer.nnodes="${trainer_nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     "$@"
