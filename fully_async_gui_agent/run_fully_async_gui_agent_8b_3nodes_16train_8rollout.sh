@@ -130,7 +130,9 @@ actor_lr=${actor_lr:-5e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
-loss_agg_mode=${loss_agg_mode:-seq-mean-token-sum-norm}
+norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
+grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
+loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
 loss_scale_factor=${loss_scale_factor:-55}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
@@ -212,7 +214,8 @@ cd "${VERL_ROOT}"
 
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    algorithm.grpo_adv_std_floor=${grpo_adv_std_floor} \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \
