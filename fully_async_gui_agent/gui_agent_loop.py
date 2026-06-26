@@ -38,6 +38,8 @@ import traceback
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
+from PIL import Image
 from recipe.fully_async_gui_agent.context_manager import Qwen3VLHistoryStrategy, TurnRecord
 from recipe.fully_async_gui_agent.data_flow_logger import log_message
 from recipe.fully_async_gui_agent.desktop_env_tool import DesktopEnvStepError
@@ -108,6 +110,14 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         self.turn_penalty_coef = float(self.rollout_config.agent.get("turn_penalty_coef", 0.0) or 0.0)
         self.keep_last_k = 3  # default; can be overridden per-task via create_kwargs
         self.history_n = 4  # default; can be overridden per-task via create_kwargs
+        self.loop_no_change_repeat_min = max(
+            2,
+            int(self.rollout_config.agent.get("loop_no_change_repeat_min", 5) or 5),
+        )
+        self.loop_no_change_diff_threshold = max(
+            0.0,
+            float(self.rollout_config.agent.get("loop_no_change_diff_threshold", 2.0) or 2.0),
+        )
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -167,6 +177,134 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
         if fallback_action:
             return f"Performing {fallback_action} action"
         return ""
+
+    @staticmethod
+    def _coord_bin(coord: Any, *, bin_size: int = 20) -> tuple[int, int] | None:
+        if not isinstance(coord, list | tuple) or len(coord) != 2:
+            return None
+        try:
+            x = float(coord[0])
+            y = float(coord[1])
+        except (TypeError, ValueError):
+            return None
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        return round(x / bin_size), round(y / bin_size)
+
+    @staticmethod
+    def _action_signature(tool_args: dict[str, Any], tool_info: dict[str, Any] | None = None) -> tuple[Any, ...] | None:
+        """Coarse action signature for conservative repeated-action detection."""
+        tool_info = tool_info or {}
+        action = str(tool_info.get("action") or tool_args.get("action") or "")
+        if action in {"", "terminate", "answer"}:
+            return None
+
+        keys = tuple(str(key).lower() for key in (tool_args.get("keys") or []))
+        coord = tool_info.get("actual_coordinate") or tool_info.get("raw_coordinate") or tool_args.get("coordinate")
+        coord_bin = GUIAgentLoop._coord_bin(coord)
+
+        if action in {
+            "mouse_move",
+            "left_click",
+            "right_click",
+            "middle_click",
+            "double_click",
+            "triple_click",
+            "left_click_drag",
+        }:
+            return action, coord_bin, keys
+        if action == "type":
+            text = str(tool_args.get("text", ""))
+            return action, len(text), text[:64]
+        if action == "key":
+            return action, keys
+        if action in {"scroll", "hscroll"}:
+            pixels = tool_args.get("pixels", 0) or 0
+            direction = 0
+            try:
+                direction = 1 if float(pixels) > 0 else -1 if float(pixels) < 0 else 0
+            except (TypeError, ValueError):
+                pass
+            return action, direction, coord_bin, keys
+        if action == "wait":
+            return (action,)
+        return action, coord_bin, keys
+
+    @staticmethod
+    def _screenshot_fingerprint(image: Image.Image | None) -> np.ndarray | None:
+        if image is None:
+            return None
+        try:
+            resample = getattr(Image, "Resampling", Image).BILINEAR
+            small = image.convert("L").resize((32, 18), resample=resample)
+            return np.asarray(small, dtype=np.float32)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _screenshot_diff(before: Image.Image | None, after: Image.Image | None) -> float | None:
+        before_fp = GUIAgentLoop._screenshot_fingerprint(before)
+        after_fp = GUIAgentLoop._screenshot_fingerprint(after)
+        if before_fp is None or after_fp is None:
+            return None
+        return float(np.mean(np.abs(before_fp - after_fp)))
+
+    def _new_loop_no_change_stats(self) -> dict[str, Any]:
+        return {
+            "checked_actions": 0,
+            "count": 0,
+            "max_streak": 0,
+            "current_streak": 0,
+            "last_signature": None,
+            "diff_sum": 0.0,
+            "diff_count": 0,
+        }
+
+    def _record_loop_no_change_action(
+        self,
+        stats: dict[str, Any],
+        *,
+        tool_args: dict[str, Any],
+        tool_info: dict[str, Any] | None,
+        before_screenshot: Image.Image | None,
+        after_screenshot: Image.Image | None,
+    ) -> None:
+        signature = self._action_signature(tool_args, tool_info)
+        if signature is None:
+            return
+        diff = self._screenshot_diff(before_screenshot, after_screenshot)
+        if diff is None:
+            return
+
+        stats["checked_actions"] += 1
+        stats["diff_sum"] += diff
+        stats["diff_count"] += 1
+
+        same_action = signature == stats["last_signature"]
+        no_change = diff <= self.loop_no_change_diff_threshold
+        if same_action and no_change:
+            stats["current_streak"] += 1
+        else:
+            stats["current_streak"] = 1
+        stats["last_signature"] = signature
+        stats["max_streak"] = max(int(stats["max_streak"]), int(stats["current_streak"]))
+
+        if same_action and no_change and stats["current_streak"] >= self.loop_no_change_repeat_min:
+            stats["count"] += 1
+
+    @staticmethod
+    def _loop_no_change_reward_info(stats: dict[str, Any]) -> dict[str, float | int]:
+        checked_actions = int(stats["checked_actions"])
+        count = int(stats["count"])
+        diff_count = int(stats["diff_count"])
+        mean_diff = float(stats["diff_sum"] / diff_count) if diff_count > 0 else 0.0
+        return {
+            "loop_no_change_score": float(count / max(checked_actions, 1)),
+            "loop_no_change_count": count,
+            "loop_no_change_checked_actions": checked_actions,
+            "loop_no_change_max_streak": int(stats["max_streak"]),
+            "loop_no_change_mean_diff": mean_diff,
+        }
 
     # ------------------------------------------------------------------
     # Main rollout
@@ -412,6 +550,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
             # Persistent turn records for history strategy.
             turn_records: list[TurnRecord] = []
+            loop_no_change_stats = self._new_loop_no_change_stats()
 
             while True:
                 turn += 1
@@ -516,8 +655,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     )
                     tool_calls = []
                     parse_error_text = (
-                        "Error: invalid tool call format. "
-                        "Please emit exactly one valid computer_use tool call."
+                        "Error: invalid tool call format. Please emit exactly one valid computer_use tool call."
                     )
                 if tool_calls:
                     for tool_call_idx, tool_call in enumerate(tool_calls, start=1):
@@ -540,16 +678,16 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                             )
                 if not tool_args_list:
                     _log(
-                        f"{log_tag}[turn={turn}] No valid tool call parsed; "
-                        "continuing without environment step",
+                        f"{log_tag}[turn={turn}] No valid tool call parsed; continuing without environment step",
                         debug=True,
                     )
 
                 if tool_args_list:
-                    _log(
-                        f"{log_tag}[turn={turn}] Tool calls: "
-                        f"{[(args.get('action', ''), {k: v for k, v in args.items() if k != 'action'}) for args in tool_args_list]}"
-                    )
+                    tool_call_summary = [
+                        (args.get("action", ""), {k: v for k, v in args.items() if k != "action"})
+                        for args in tool_args_list
+                    ]
+                    _log(f"{log_tag}[turn={turn}] Tool calls: {tool_call_summary}")
 
                 # Decode assistant text and extract low_level_instruction.
                 assistant_text = await self.loop.run_in_executor(
@@ -570,12 +708,29 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 # 6. Execute parsed tool calls sequentially.
                 error_text: str | None = parse_error_text
                 tool_response = None
+                latest_tool_screenshot = None
                 for tool_call_idx, tool_args in enumerate(tool_args_list, start=1):
                     action = tool_args.get("action", "")
+                    before_tool_screenshot = latest_tool_screenshot or current_screenshot
 
                     try:
                         with simple_timer("tool_calls", metrics):
                             tool_response, _, tool_info = await self.desktop_tool.execute(instance_id, tool_args)
+                        after_tool_screenshot = None
+                        if tool_response and tool_response.image:
+                            for img in tool_response.image:
+                                if img is not None:
+                                    after_tool_screenshot = img
+                                    break
+                        if after_tool_screenshot is not None:
+                            self._record_loop_no_change_action(
+                                loop_no_change_stats,
+                                tool_args=tool_args,
+                                tool_info=tool_info,
+                                before_screenshot=before_tool_screenshot,
+                                after_screenshot=after_tool_screenshot,
+                            )
+                            latest_tool_screenshot = after_tool_screenshot
                         if tool_info.get("invalid_action") and tool_response.text:
                             error_text = tool_response.text
                             break
@@ -662,13 +817,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 )
 
                 # Update current_screenshot for the next turn.
-                next_screenshot = None
-                if tool_response and tool_response.image:
-                    for img in tool_response.image:
-                        if img is not None:
-                            next_screenshot = img
-                            break
-                current_screenshot = next_screenshot if next_screenshot else current_screenshot
+                current_screenshot = latest_tool_screenshot if latest_tool_screenshot else current_screenshot
 
             _log(
                 f"[GUIAgentLoop][LOOP_EXIT] task_id={task_id} request_id={request_id} "
@@ -762,6 +911,7 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 "base_reward": base_reward,
                 "turn_penalty": turn_penalty,
                 "effective_turn_penalty": effective_turn_penalty,
+                **self._loop_no_change_reward_info(loop_no_change_stats),
             }
             for trajectory in self._intermediate_trajectories:
                 trajectory.extra_fields["reward_extra_info"] = reward_extra_info
@@ -850,7 +1000,10 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                 try:
                     await asyncio.shield(self.desktop_tool.release(instance_id))
                 except asyncio.CancelledError:
-                    _log(f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}", level="ERROR")
+                    _log(
+                        f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}",
+                        level="ERROR",
+                    )
                     raise
                 except Exception:
                     _log(

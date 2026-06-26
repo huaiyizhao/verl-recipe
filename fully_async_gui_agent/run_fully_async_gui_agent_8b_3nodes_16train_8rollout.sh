@@ -132,6 +132,7 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
 norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
 grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
+fail_loop_no_change_adv_coef=${fail_loop_no_change_adv_coef:-0.02}
 loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
 loss_scale_factor=${loss_scale_factor:-null}
 
@@ -178,6 +179,8 @@ max_concurrent_rollouts=${max_concurrent_rollouts:-144}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
+loop_no_change_repeat_min=${loop_no_change_repeat_min:-5}
+loop_no_change_diff_threshold=${loop_no_change_diff_threshold:-2.0}
 
 # ================= performance =================
 infer_tp=${infer_tp:-1}
@@ -216,6 +219,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     algorithm.grpo_adv_std_floor=${grpo_adv_std_floor} \
+    algorithm.fail_loop_no_change_adv_coef=${fail_loop_no_change_adv_coef} \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.train_batch_size=${train_prompt_bsz} \
@@ -282,6 +286,8 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.num_workers=32 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
+    actor_rollout_ref.rollout.agent.loop_no_change_repeat_min=${loop_no_change_repeat_min} \
+    actor_rollout_ref.rollout.agent.loop_no_change_diff_threshold=${loop_no_change_diff_threshold} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
