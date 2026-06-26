@@ -102,7 +102,7 @@ trainer_nnodes=${trainer_nnodes:-2}
 # ================= data / model =================
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0525e-8b-osworld-plus-new/v0-20260525-160300/checkpoint-810-merged"}
 # HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/cua/runs/0608f-general-osworld-plus-new-agentnet/v0-20260608-205226/checkpoint-1500-merged"}
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/train/hf_models/qwen3-vl-8b-instruct/"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/train/hf_models/qwen3-vl-8b-instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
