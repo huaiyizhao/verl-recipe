@@ -133,7 +133,7 @@ turn_penalty_coef=${turn_penalty_coef:-0.1}
 norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
 grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
 loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
-loss_scale_factor=${loss_scale_factor:-55}
+loss_scale_factor=${loss_scale_factor:-null}
 
 # Fully-async uses gen_batch_size=1 (streaming single-sample generation).
 train_prompt_bsz=0
@@ -174,7 +174,7 @@ calculate_entropy=${calculate_entropy:-True}
 # add an extra sample cap here, otherwise long-tail samples can block later
 # samples from filling newly available env slots.
 # One full rollout node (8 GPUs) backs these trajectories.
-max_concurrent_rollouts=${max_concurrent_rollouts:-160}
+max_concurrent_rollouts=${max_concurrent_rollouts:-144}
 # Validation can launch the whole test set (~300 tasks) at once; keep its env
 # session pressure separate from training throughput.
 max_concurrent_eval_rollouts=${max_concurrent_eval_rollouts:-150}
@@ -280,7 +280,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
-    actor_rollout_ref.rollout.agent.num_workers=48 \
+    actor_rollout_ref.rollout.agent.num_workers=32 \
     actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     algorithm.use_kl_in_reward=False \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
