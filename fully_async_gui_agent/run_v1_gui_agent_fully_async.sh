@@ -236,6 +236,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.v1.sampler.max_off_policy_strategy=${max_off_policy_strategy} \
     transfer_queue.enable=True \
     transfer_queue.backend.storage_backend=SimpleStorage \
+    transfer_queue.backend.SimpleStorage.num_data_storage_units=$((trainer_nnodes + rollout_nnodes)) \
     "${dedup_args[@]}" \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
