@@ -120,6 +120,10 @@ max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-5e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
+# turn_penalty_coef is NOT passed yet: it is not a field on verl AgentLoopConfig, so the
+# override would crash at AgentLoopConfig instantiation. To enable: add `turn_penalty_coef: float = 0.0`
+# to verl/workers/config/rollout.py AgentLoopConfig (+ rollout.yaml), then add this override to the
+# agent block below:  +actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
 norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
 grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
@@ -302,7 +306,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
     actor_rollout_ref.rollout.agent.num_workers=16 \
-    +actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef} \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
     trainer.logger='["console", "mlflow"]' \
