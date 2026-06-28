@@ -152,6 +152,13 @@ parameter_sync_step=${parameter_sync_step:-2}
 staleness_threshold=${staleness_threshold:-2}
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
+# Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
+# Rollouts are dispatched one session at a time across the worker pool; total concurrency
+# is num_workers * this. Keep it modest so a single AgentLoopWorker process isn't GIL-bound.
+max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-4}
+# Store multimodal pixel tensors as bf16 in TransferQueue (~halves their RAM footprint in the
+# storage-unit actors; the model consumes bf16 anyway). Set False to keep float32.
+multimodal_storage_bf16=${multimodal_storage_bf16:-True}
 # none: no trainer-side staleness gate — sample the oldest ready prompts and rely
 # on the feeder budget + rollout correction (vs separate_async's default `drop`).
 max_off_policy_strategy=${max_off_policy_strategy:-none}
@@ -183,7 +190,7 @@ calculate_entropy=${calculate_entropy:-True}
 #   buffer; each unique screenshot is stored once in rollout_images (keyed by SHA1),
 #   rows carry only image_ids, refcount-GC'd as rows leave the replay buffer.
 # `agent_loop_manager_class` is read dynamically (not a struct field) -> append with +.
-image_dedup_enabled=${image_dedup_enabled:-False}
+image_dedup_enabled=${image_dedup_enabled:-True}
 dedup_args=()
 if [ "${image_dedup_enabled}" = "True" ]; then
     dedup_args=(
@@ -223,6 +230,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.v1.fully_async.parameter_sync_step=${parameter_sync_step} \
     trainer.v1.fully_async.staleness_threshold=${staleness_threshold} \
     trainer.v1.fully_async.feeder_poll_interval=${feeder_poll_interval} \
+    trainer.v1.fully_async.max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker} \
+    trainer.v1.fully_async.multimodal_storage_bf16=${multimodal_storage_bf16} \
     trainer.v1.sampler.max_off_policy_threshold=${max_off_policy_threshold} \
     trainer.v1.sampler.max_off_policy_strategy=${max_off_policy_strategy} \
     transfer_queue.enable=True \
@@ -305,7 +314,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
-    actor_rollout_ref.rollout.agent.num_workers=16 \
+    actor_rollout_ref.rollout.agent.num_workers=32 \
     trainer.logger='["console"]' \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
