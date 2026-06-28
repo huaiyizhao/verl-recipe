@@ -13,36 +13,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# GUI Agent (Computer-Use Agent) PPO training on the **V1 trainer**
-# (separate_async mode, TransferQueue-native).
+# GUI Agent (Computer-Use Agent) PPO training on the **V1 trainer**,
+# `fully_async` (streaming) mode — TransferQueue-native.
 #
-# This is the V1 port of run_fully_async_gui_agent_8b_3nodes_16train_8rollout.sh.
-# The agent loop, tools, data, model and desktop-env settings are unchanged;
-# only the async data-link is different: instead of the experimental
-# fully_async_policy (Rollouter + Ray MessageQueue + Trainer actors), this uses
-# the upstream V1 `separate_async` trainer with a TransferQueue data plane +
-# replay buffer.
+# This is the streaming sibling of `run_v1_gui_agent_separate_async.sh`: same
+# agent loop, tools, data, model, desktop-env and rollout-correction settings;
+# the ONLY difference is how prompts are produced.
 #
-# Config mapping from the old fully_async_policy knobs:
-#   entry            verl.experimental.fully_async_policy.fully_async_main
-#                  → verl.trainer.main_ppo  (trainer.use_v1=True)
-#   async_training.trigger_parameter_sync_step
-#                  → trainer.v1.separate_async.parameter_sync_step
-#   async_training.staleness_threshold
-#                  → trainer.v1.sampler.max_off_policy_threshold
-#   async_training.partial_rollout / require_batches / max_concurrent_rollouts
-#                  → (no direct V1 knob; replay buffer + warmup batches instead)
-#   rollout.{nnodes,n_gpus_per_node}   (top-level standalone rollout pool)
-#                  → actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
-#   rollout.total_rollout_steps
-#                  → trainer.total_training_steps
+#   separate_async : step() feeds exactly one batch per training step
+#                    (+ num_warmup_batches up front) — production is locked to
+#                    consumption.
+#   fully_async    : an autonomous background StreamingFeeder thread continuously
+#                    streams prompts into TransferQueue, bounded by a staleness /
+#                    in-flight budget
+#                      max_inflight = (1 + staleness_threshold)
+#                                     * parameter_sync_step * train_batch_size
+#                    while step() only samples + trains. Generation overlaps
+#                    training; the feeder is paused around each weight sync.
+#
+# Off-policy handling: streaming BOUNDS staleness via the feeder budget and
+# CORRECTS residual off-policyness via rollout correction (bypass mode + RS/TIS),
+# rather than hard-dropping in the replay buffer (which can empty a batch). So the
+# trainer-side staleness gate is OFF by default (max_off_policy_strategy=none),
+# unlike separate_async which defaults to `drop`.
+#
+# Config mapping vs run_v1_gui_agent_separate_async.sh:
+#   trainer.v1.trainer_mode                       separate_async -> fully_async
+#   trainer.v1.separate_async.num_warmup_batches  -> trainer.v1.fully_async.num_warmup_batches (0)
+#   trainer.v1.separate_async.parameter_sync_step -> trainer.v1.fully_async.parameter_sync_step
+#   (new)                                         -> trainer.v1.fully_async.staleness_threshold
+#   (new)                                         -> trainer.v1.fully_async.feeder_poll_interval
+#   trainer.v1.sampler.max_off_policy_strategy     drop -> none
 #
 # Prerequisites (unchanged):
 #   1. A running desktop-env service (DESKTOP_API_BASE_URL).
 #   2. A VLM checkpoint (e.g. Qwen3-VL-8B-Instruct).
 #   3. A parquet dataset with prompt / extra_info.task_id / extra_info.question.
-#   4. A verl install at upstream/main level (the V1 trainer must exist) plus
-#      `transfer_queue` (TransferQueue==0.1.8) on EVERY Ray node.
+#   4. A verl-v1 checkout (V1 trainer with the `fully_async` mode) plus
+#      `transfer_queue` (TransferQueue) on EVERY Ray node, and this recipe
+#      importable as `recipe.fully_async_gui_agent` (use the v1-gui-agent branch).
 
 set -xeuo pipefail
 export HYDRA_FULL_ERROR=1
@@ -73,11 +82,11 @@ if [[ -z "${VERL_ROOT:-}" ]]; then
 fi
 
 # ================= cluster topology =================
-# V1 separate_async splits GPUs into a TRAINER pool (which also flips to rollout
-# when idle = "hybrid engine") and a STANDALONE ROLLOUT pool (always generating).
+# fully_async (like separate_async) splits GPUs into a TRAINER pool (also flips
+# to rollout when idle = "hybrid engine") and a STANDALONE ROLLOUT pool (always
+# generating). Both must be > 0.
 #   trainer pool   -> trainer.{nnodes,n_gpus_per_node}
 #   standalone pool-> actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
-# Both must be > 0 in separate_async. Tune the split for your cluster.
 trainer_nnodes=${trainer_nnodes:-2}
 n_gpus_training=${n_gpus_training:-8}
 rollout_nnodes=${rollout_nnodes:-1}
@@ -117,10 +126,9 @@ grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
 loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
 loss_scale_factor=${loss_scale_factor:-55}
 
-# V1 separate_async asserts data.train_batch_size == actor.ppo_mini_batch_size.
-# In V1 this is the number of prompt groups sampled per trainer step. The
-# rollout-session batch size is train_prompt_bsz * n_resp_per_prompt, plus any
-# intermediate per-turn rows emitted by GUIAgentLoop.
+# V1 separate_async/fully_async assert data.train_batch_size == actor.ppo_mini_batch_size.
+# This is the consumption batch (prompt groups per trainer step) AND the unit the
+# streaming feeder dispatches into TransferQueue.
 train_prompt_bsz=${train_prompt_bsz:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
 n_resp_per_prompt=${n_resp_per_prompt:-16}
@@ -128,21 +136,28 @@ total_training_steps=${total_training_steps:-100000}
 total_epochs=100000
 test_freq=-1  # disabled: validation competes for desktop-env containers
 
-# ---- V1 async / staleness controls ----
-# Warmup batches primed before the training loop. Keep this at 0 when you want
-# env pressure controlled mainly by train_prompt_bsz * n_resp_per_prompt.
+# ---- V1 fully_async streaming / staleness controls ----
+# Streaming: the feeder is the sole producer and fills the pipeline itself, so no
+# warmup backlog (warmup only injects stale gs~0 prompts that age past budget).
 num_warmup_batches=${num_warmup_batches:-0}
-# Every N steps the trainer pushes new weights to the standalone rollout pool.
+# Every N steps the trainer pushes new weights to the standalone rollout pool
+# (feeder is paused around the sync).
 parameter_sync_step=${parameter_sync_step:-2}
-# Max model-versions a trajectory may span before it is dropped/waited.
-max_off_policy_threshold=${max_off_policy_threshold:-1}
-max_off_policy_strategy=${max_off_policy_strategy:-drop}
+# Off-policy staleness budget (in parameter-sync units) that sizes the in-flight
+# prompt budget: max_inflight = (1 + staleness_threshold) * parameter_sync_step * train_batch_size.
+staleness_threshold=${staleness_threshold:-2}
+# Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
+feeder_poll_interval=${feeder_poll_interval:-1.0}
+# none: no trainer-side staleness gate — sample the oldest ready prompts and rely
+# on the feeder budget + rollout correction (vs separate_async's default `drop`).
+max_off_policy_strategy=${max_off_policy_strategy:-none}
+max_off_policy_threshold=${max_off_policy_threshold:-$((staleness_threshold + 1))}
 
 # Standalone rollout replicas must use a real weight-transfer checkpoint engine
-# (separate_async forbids the "naive" backend).
+# (separate_async/fully_async forbid the "naive" backend).
 checkpoint_engine_backend=${checkpoint_engine_backend:-nccl}
 
-# Rollout correction preset used by the old fully-async GUI recipe.
+# Rollout correction preset (same as the separate_async GUI recipe).
 rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
@@ -160,11 +175,10 @@ esac
 calculate_entropy=${calculate_entropy:-True}
 
 # ---- Per-image dedup (opt-in; ppo/v1 untouched, enabled via subclass selection) ----
-# Off (default): screenshots stored inline per row (correct, memory-heavy).
 # On (image_dedup_enabled=True): selects a dedup-aware agent-loop manager + replay
-#   buffer (subclasses outside ppo/v1). Each unique screenshot is stored once in
-#   rollout_images (keyed by SHA1); rows carry only image_ids, resolved inside the
-#   worker on consume and refcount-GC'd as rows leave the replay buffer.
+#   buffer; each unique screenshot is stored once in rollout_images (keyed by SHA1),
+#   rows carry only image_ids, refcount-GC'd as rows leave the replay buffer.
+# `agent_loop_manager_class` is read dynamically (not a struct field) -> append with +.
 image_dedup_enabled=${image_dedup_enabled:-False}
 dedup_args=()
 if [ "${image_dedup_enabled}" = "True" ]; then
@@ -187,7 +201,7 @@ infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_separate_async}
+experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_fully_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
@@ -195,14 +209,16 @@ resume_mode=${resume_mode:-auto}
 # ================= launch =================
 # Hydra config uses `hydra.searchpath: file://verl/trainer/config` (relative to
 # CWD), and the `recipe.*` agent-loop target must be importable; both rely on
-# launching from the verl source root (same as the fully_async scripts).
+# launching from the verl source root.
 cd "${VERL_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
-    trainer.v1.trainer_mode=separate_async \
-    trainer.v1.separate_async.num_warmup_batches=${num_warmup_batches} \
-    trainer.v1.separate_async.parameter_sync_step=${parameter_sync_step} \
+    trainer.v1.trainer_mode=fully_async \
+    trainer.v1.fully_async.num_warmup_batches=${num_warmup_batches} \
+    trainer.v1.fully_async.parameter_sync_step=${parameter_sync_step} \
+    trainer.v1.fully_async.staleness_threshold=${staleness_threshold} \
+    trainer.v1.fully_async.feeder_poll_interval=${feeder_poll_interval} \
     trainer.v1.sampler.max_off_policy_threshold=${max_off_policy_threshold} \
     trainer.v1.sampler.max_off_policy_strategy=${max_off_policy_strategy} \
     transfer_queue.enable=True \
