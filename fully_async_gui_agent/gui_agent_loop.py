@@ -50,7 +50,7 @@ from verl.experimental.agent_loop.agent_loop import (
     register,
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
-from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.tools.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
