@@ -93,7 +93,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 n_gpus_rollout=${n_gpus_rollout:-8}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3-VL-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
 
