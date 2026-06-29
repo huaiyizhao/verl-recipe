@@ -22,6 +22,10 @@ env_vars:
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
   VERL_TRAIN_TIMING_LOG: "1"
   VERL_TRAIN_TIMING_RANKS: "0,4,8,12"
+  # Master switch: turn on all custom processing-time profiling — rollout-worker postprocess
+  # ([POSTPROC_PROFILE]), trainer-side materialization ([MATERIALIZE_PROFILE]) and dedup image
+  # resolve ([RESOLVE_PROFILE]).
+  VERL_PROFILE: "1"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
   VERL_LOGGING_LEVEL: "DEBUG"
