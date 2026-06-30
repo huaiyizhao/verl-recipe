@@ -207,7 +207,7 @@ actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-50000}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-60000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
