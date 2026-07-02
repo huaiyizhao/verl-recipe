@@ -149,7 +149,7 @@ num_warmup_batches=${num_warmup_batches:-0}
 parameter_sync_step=${parameter_sync_step:-2}
 # Off-policy staleness budget (in parameter-sync units) that sizes the in-flight
 # prompt budget: max_inflight = (1 + staleness_threshold) * parameter_sync_step * train_batch_size.
-staleness_threshold=${staleness_threshold:-1}
+staleness_threshold=${staleness_threshold:-1.5}
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
 # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
@@ -162,7 +162,12 @@ multimodal_storage_bf16=${multimodal_storage_bf16:-True}
 # none: no trainer-side staleness gate — sample the oldest ready prompts and rely
 # on the feeder budget + rollout correction (vs separate_async's default `drop`).
 max_off_policy_strategy=${max_off_policy_strategy:-none}
-max_off_policy_threshold=${max_off_policy_threshold:-$((staleness_threshold + 1))}
+# NOTE: must be a positive INT (replay_buffer asserts isinstance int AND > 0, so 0 is NOT allowed).
+# Only used as a gate when max_off_policy_strategy != none; with `none` (our default) it is asserted
+# but never read, so any positive int is fine. Kept a fixed int (decoupled from staleness_threshold)
+# so a FLOAT staleness (e.g. 1.5) can't break this line via bash's integer-only $(()). If you switch
+# to wait/drop, set it ~= ceil(staleness_threshold)+1.
+max_off_policy_threshold=${max_off_policy_threshold:-1}
 
 # Standalone rollout replicas must use a real weight-transfer checkpoint engine
 # (separate_async/fully_async forbid the "naive" backend).
