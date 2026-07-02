@@ -149,7 +149,7 @@ num_warmup_batches=${num_warmup_batches:-0}
 parameter_sync_step=${parameter_sync_step:-2}
 # Off-policy staleness budget (in parameter-sync units) that sizes the in-flight
 # prompt budget: max_inflight = (1 + staleness_threshold) * parameter_sync_step * train_batch_size.
-staleness_threshold=${staleness_threshold:-1.5}
+staleness_threshold=${staleness_threshold:-1}
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
 # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
