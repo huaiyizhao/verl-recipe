@@ -159,6 +159,13 @@ max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-4}
 # Store multimodal pixel tensors as bf16 in TransferQueue (~halves their RAM footprint in the
 # storage-unit actors; the model consumes bf16 anyway). Set False to keep float32.
 multimodal_storage_bf16=${multimodal_storage_bf16:-True}
+# TransferQueue total capacity in ENTRIES (rows + unique images), across all partitions/units.
+# The default (100000) is too small here and causes ring-buffer EVICTION of still-referenced images
+# -> "key ... not found in field 'image_grid_thw'" crashes. Size for the worst-case in-flight volume:
+#   overshoot_budget(~96 prompts) * n(16) * max_turns(50) * 2 (train rows + rollout_images) ~= 154k.
+# It's a count cap, not a preallocation, so headroom is cheap (actual RAM is bounded by the feeder
+# staleness budget, not by this number).
+tq_storage_size=${tq_storage_size:-500000}
 # none: no trainer-side staleness gate — sample the oldest ready prompts and rely
 # on the feeder budget + rollout correction (vs separate_async's default `drop`).
 max_off_policy_strategy=${max_off_policy_strategy:-none}
@@ -242,6 +249,7 @@ python3 -m verl.trainer.main_ppo \
     transfer_queue.enable=True \
     transfer_queue.backend.storage_backend=SimpleStorage \
     transfer_queue.backend.SimpleStorage.num_data_storage_units=$((trainer_nnodes + rollout_nnodes)) \
+    transfer_queue.backend.SimpleStorage.total_storage_size=${tq_storage_size} \
     "${dedup_args[@]}" \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
