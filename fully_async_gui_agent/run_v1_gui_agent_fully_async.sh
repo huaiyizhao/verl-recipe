@@ -125,7 +125,9 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 # to verl/workers/config/rollout.py AgentLoopConfig (+ rollout.yaml), then add this override to the
 # agent block below:  +actor_rollout_ref.rollout.agent.turn_penalty_coef=${turn_penalty_coef}
 turn_penalty_coef=${turn_penalty_coef:-0.1}
-norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-True}
+# Dr.GRPO advantage: reward - group_mean, WITHOUT dividing by std (norm_adv_by_std_in_grpo=False).
+# grpo_adv_std_floor is inert when std-normalization is off.
+norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo:-False}
 grpo_adv_std_floor=${grpo_adv_std_floor:-0.1}
 loss_agg_mode=${loss_agg_mode:-rollout-mean-token-sum-sqrt-norm}
 loss_scale_factor=${loss_scale_factor:-55}
@@ -133,9 +135,9 @@ loss_scale_factor=${loss_scale_factor:-55}
 # V1 separate_async/fully_async assert data.train_batch_size == actor.ppo_mini_batch_size.
 # This is the consumption batch (prompt groups per trainer step) AND the unit the
 # streaming feeder dispatches into TransferQueue.
-train_prompt_bsz=${train_prompt_bsz:-16}
+train_prompt_bsz=${train_prompt_bsz:-32}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
-n_resp_per_prompt=${n_resp_per_prompt:-16}
+n_resp_per_prompt=${n_resp_per_prompt:-8}
 total_training_steps=${total_training_steps:-100000}
 total_epochs=100000
 test_freq=-1  # disabled: validation competes for desktop-env containers
