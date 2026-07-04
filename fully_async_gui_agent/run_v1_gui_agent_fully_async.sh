@@ -330,7 +330,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
     actor_rollout_ref.rollout.agent.num_workers=32 \
-    trainer.logger='["console"]' \
+    trainer.logger='["console", "mlflow"]' \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
