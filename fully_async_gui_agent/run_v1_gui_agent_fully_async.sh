@@ -333,6 +333,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=null \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
