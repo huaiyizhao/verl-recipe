@@ -47,9 +47,9 @@ def main():
     ap.add_argument("--worst-k", type=int, default=8, help="worst-divergence tokens to print per sequence")
     ap.add_argument(
         "--attn",
-        default="sdpa",
-        help="HF attn_implementation: sdpa/flash_attention_2 (match training's flash) or eager. "
-        "If HF-vs-FSDP shrinks vs eager, the gap was an attention-kernel artifact, not a training bug.",
+        default="flash_attention_2",
+        help="HF attn_implementation. Default flash_attention_2 to MATCH verl's flash_attn_varlen "
+        "(fp32 accumulation). Falls back sdpa->eager if unavailable.",
     )
     args = ap.parse_args()
 
@@ -92,16 +92,24 @@ def main():
         _log(f"[warn] could not import verl get_rope_index ({e!r}); mrope check will be skipped")
         get_rope_index = None
 
-    _log(f"=== loading model {model_path} (attn={args.attn}) ===")
-    try:
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, attn_implementation=args.attn, trust_remote_code=True
-        ).eval()
-    except Exception as e:  # noqa: BLE001
-        _log(f"[warn] attn_implementation={args.attn} failed ({e!r}); falling back to eager")
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, attn_implementation="eager", trust_remote_code=True
-        ).eval()
+    model = None
+    used_attn = None
+    for attn_try in [args.attn, "sdpa", "eager"]:
+        if attn_try == used_attn:
+            continue
+        try:
+            _log(f"=== loading model {model_path} (attn={attn_try}) ===")
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16, attn_implementation=attn_try, trust_remote_code=True
+            ).eval()
+            used_attn = attn_try
+            break
+        except Exception as e:  # noqa: BLE001
+            _log(f"[warn] attn={attn_try} failed ({e!r})")
+    if model is None:
+        _log("could not load model with any attn impl")
+        sys.exit(1)
+    _log(f"=== USING attn_implementation={used_attn} (verl trains with flash_attn_varlen) ===")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
@@ -253,16 +261,54 @@ def main():
                 return dv[msk].mean().item() if bool(msk.any()) else float("nan")
 
             _log(
-                f"[REGION] PRE-image-text(pure text): FSDP-vs-HFfp32={_rm(is_pre, d_all):.4f} "
-                f"FSDP-vs-HFbf16={_rm(is_pre, d_bf):.4f} (n={int(is_pre.sum())}) "
-                f"-- if bf16<<fp32, the gap is bf16 precision, not a bug"
+                f"[REGION] mean|Δ| FSDP-vs-HF(fp32/bf16): "
+                f"pre_text={_rm(is_pre, d_all):.4f}/{_rm(is_pre, d_bf):.4f}(n={int(is_pre.sum())}) "
+                f"post_text={_rm(is_post, d_all):.4f}/{_rm(is_post, d_bf):.4f}(n={int(is_post.sum())}) "
+                f"response={_rm(is_resp & ~is_img, d_all):.4f}/{_rm(is_resp & ~is_img, d_bf):.4f}"
             )
-            _log(
-                f"[REGION] post-image-text: FSDP-vs-HFfp32={_rm(is_post, d_all):.4f} "
-                f"FSDP-vs-HFbf16={_rm(is_post, d_bf):.4f} (n={int(is_post.sum())}) | "
-                f"response FSDP-vs-HFfp32={_rm(is_resp & ~is_img, d_all):.4f} "
-                f"FSDP-vs-HFbf16={_rm(is_resp & ~is_img, d_bf):.4f}"
-            )
+
+            # Comprehensive characterization of the PURE-TEXT (pre-image) FSDP-vs-HFfp32 gap: signed
+            # stats (constant offset?), OLS FSDP~a*HF+b (scaling?), split by token confidence, and raw
+            # token dumps (first-in-order + worst). Only seq0 to avoid spam.
+            if si == 0 and bool(is_pre.any()):
+                pi = is_pre.nonzero().flatten()
+                fs = f_full[:n2][pi].float()
+                hf = hf_fp32[:n2][pi].float()
+                sd = fs - hf  # signed FSDP - HF
+                # OLS FSDP ~ a*HF + b
+                hm, fm = hf.mean(), fs.mean()
+                a = ((hf - hm) * (fs - fm)).sum() / ((hf - hm) ** 2).sum().clamp(min=1e-9)
+                b = fm - a * hm
+                resid = fs - (a * hf + b)
+                r2 = 1 - (resid.var() / fs.var().clamp(min=1e-9))
+                conf = hf.abs() < 0.1  # near-certain tokens
+                unc = hf.abs() > 1.0  # uncertain tokens
+                _log(
+                    f"[PRETEXT-STATS] n={pi.numel()} signed_mean={sd.mean().item():+.4f} std={sd.std().item():.4f} "
+                    f"median={sd.median().item():+.4f} |max|={sd.abs().max().item():.3f} | "
+                    f"OLS FSDP~{a.item():.4f}*HF+{b.item():+.4f} R2={r2.item():.4f} | "
+                    f"|Δ|@confident={d_all[:n2][pi][conf].mean().item() if bool(conf.any()) else float('nan'):.4f} "
+                    f"|Δ|@uncertain={d_all[:n2][pi][unc].mean().item() if bool(unc.any()) else float('nan'):.4f}"
+                )
+                # first 12 pre-text tokens IN ORDER (sanity: is pos0 broken? constant offset?)
+                _log("[PRETEXT first-12] pos | FSDP    HFfp32   HFbf16   Δ(F-Hf32) | prev->pred")
+                for p in pi[:12].tolist():
+                    _log(
+                        f"   {p:4d} | {f_full[p].item():+.4f} {hf_fp32[p].item():+.4f} {hf_bf16[p].item():+.4f} "
+                        f"{(f_full[p] - hf_fp32[p]).item():+.4f} | "
+                        f"{processor.tokenizer.decode([int(ids_i[p].item())])!r}->"
+                        f"{processor.tokenizer.decode([int(nxt[p])])!r}"
+                    )
+                # worst 12 pre-text tokens
+                worst = pi[torch.argsort(d_all[:n2][pi], descending=True)[:12]]
+                _log("[PRETEXT worst-12] pos | FSDP    HFfp32   HFbf16   Δ(F-Hf32) | prev->pred")
+                for p in worst.tolist():
+                    _log(
+                        f"   {p:4d} | {f_full[p].item():+.4f} {hf_fp32[p].item():+.4f} {hf_bf16[p].item():+.4f} "
+                        f"{(f_full[p] - hf_fp32[p]).item():+.4f} | "
+                        f"{processor.tokenizer.decode([int(ids_i[p].item())])!r}->"
+                        f"{processor.tokenizer.decode([int(nxt[p])])!r}"
+                    )
 
         # keep only assistant tokens (mask==1); tool tokens within the response region are not trained.
         if rm is not None and rm.numel() == resp_len:
