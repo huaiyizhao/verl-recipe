@@ -135,7 +135,7 @@ loss_scale_factor=${loss_scale_factor:-55}
 # V1 separate_async/fully_async assert data.train_batch_size == actor.ppo_mini_batch_size.
 # This is the consumption batch (prompt groups per trainer step) AND the unit the
 # streaming feeder dispatches into TransferQueue.
-train_prompt_bsz=${train_prompt_bsz:-32}
+train_prompt_bsz=${train_prompt_bsz:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
 n_resp_per_prompt=${n_resp_per_prompt:-8}
 total_training_steps=${total_training_steps:-100000}
