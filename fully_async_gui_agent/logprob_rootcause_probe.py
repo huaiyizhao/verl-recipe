@@ -236,7 +236,8 @@ def main():
         # seq). If only image-adjacent/response diverge -> multimodal-data specific.
         if f_full is not None and f_full.numel() >= L - 1:
             n2 = L - 1
-            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()
+            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()  # fp32-HF  vs bf16-FSDP
+            d_bf = (hf_bf16[:n2].float() - f_full[:n2].float()).abs()  # bf16-HF  vs bf16-FSDP
             nxt = ids_i[1 : n2 + 1].cpu()  # token predicted at each position p (= ids[p+1])
             is_img = (nxt == image_token_id) if image_token_id is not None else torch.zeros(n2, dtype=torch.bool)
             posn = torch.arange(n2)
@@ -251,16 +252,16 @@ def main():
             def _rm(msk, dv=d_all):
                 return dv[msk].mean().item() if bool(msk.any()) else float("nan")
 
-            mp = int(d_all.argmax())
-            ctx = processor.tokenizer.decode([int(x) for x in ids_i[max(0, mp - 2) : mp + 4].cpu().tolist()])
             _log(
-                f"[REGION] HF-vs-FSDP mean|Δ|: PRE-image-text={_rm(is_pre):.4f}(n={int(is_pre.sum())}) "
-                f"post-image-text={_rm(is_post):.4f}(n={int(is_post.sum())}) "
-                f"response={_rm(is_resp & ~is_img):.4f} image_tok={_rm(is_img):.2f}(ignore)"
+                f"[REGION] PRE-image-text(pure text): FSDP-vs-HFfp32={_rm(is_pre, d_all):.4f} "
+                f"FSDP-vs-HFbf16={_rm(is_pre, d_bf):.4f} (n={int(is_pre.sum())}) "
+                f"-- if bf16<<fp32, the gap is bf16 precision, not a bug"
             )
             _log(
-                f"[REGION] max|Δ|={d_all.max().item():.2f} @pos={mp}/{n2} "
-                f"pred={processor.tokenizer.decode([int(nxt[mp])])!r} is_img={bool(is_img[mp])} ctx={ctx!r}"
+                f"[REGION] post-image-text: FSDP-vs-HFfp32={_rm(is_post, d_all):.4f} "
+                f"FSDP-vs-HFbf16={_rm(is_post, d_bf):.4f} (n={int(is_post.sum())}) | "
+                f"response FSDP-vs-HFfp32={_rm(is_resp & ~is_img, d_all):.4f} "
+                f"FSDP-vs-HFbf16={_rm(is_resp & ~is_img, d_bf):.4f}"
             )
 
         # keep only assistant tokens (mask==1); tool tokens within the response region are not trained.
