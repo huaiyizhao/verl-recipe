@@ -43,7 +43,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bundle", nargs="?", default="/tmp/logprob_probe/probe_rank0_0.pt")
     ap.add_argument("--model", default=None, help="HF model dir (defaults to model_path stored in the bundle)")
-    ap.add_argument("--max-seq", type=int, default=4, help="how many sequences to analyze")
+    ap.add_argument("--max-seq", type=int, default=8, help="how many sequences to analyze")
     ap.add_argument("--worst-k", type=int, default=8, help="worst-divergence tokens to print per sequence")
     args = ap.parse_args()
 
@@ -235,23 +235,31 @@ def main():
 
         _log("[FORK] mean |Δ| over RESPONSE (assistant) tokens vs HF-fp32 (clean reference):")
         _log(f"   HF-bf16   vs HF-fp32 : {_mad(hf16_m, hf32_m):.4f}   (>0 => bf16 precision)")
-        _log(f"   FSDP-train vs HF-fp32: {_mad(fsdp_m, hf32_m):.4f}   (>0 => train-path: remove_padding/FA/FSDP)")
-        _log(f"   vLLM      vs HF-fp32 : {_mad(v_m, hf32_m):.4f}   (>0 => vLLM engine vs clean HF)")
-        _log(f"   vLLM      vs FSDP    : {_mad(v_m, fsdp_m):.4f}   (the gap that drives the mask)")
+        _log(f"   FSDP-train vs HF-fp32: {_mad(fsdp_m, hf32_m):.4f}   (HF unreliable at image tokens)")
+        _log(f"   vLLM      vs HF-fp32 : {_mad(v_m, hf32_m):.4f}   (HF unreliable at image tokens)")
 
-        # worst RESPONSE tokens by |vLLM - HF-fp32|
-        if v_m is not None and hf32_m is not None:
-            n = min(v_m.numel(), hf32_m.numel())
-            d = (v_m[:n].float() - hf32_m[:n].float()).abs()
-            order = torch.argsort(d, descending=True)[: args.worst_k]
+        # THE REAL QUESTION: where do vLLM(gen) and FSDP(recompute) — both REAL — diverge? That per-token
+        # k3 is exactly what the RS mask thresholds on (seq-mean k3 > 0.005 -> whole sequence masked).
+        if v_m is not None and fsdp_m is not None:
+            n = min(v_m.numel(), fsdp_m.numel())
+            vf = v_m[:n].float() - fsdp_m[:n].float()
+            k3 = (torch.exp(vf.clamp(-20, 20)) - 1.0 - vf).abs()
+            _log(
+                f"[VF] vLLM-vs-FSDP over {n} resp tok: mean|Δ|={vf.abs().mean():.4f} max|Δ|={vf.abs().max():.4f} "
+                f"seq_mean_k3={k3.mean():.5f} (mask@0.005 -> {'MASKED' if k3.mean() > 0.005 else 'kept'}) "
+                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())}"
+            )
+            order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
-            _log("[WORST resp] token | vLLM  HF-fp32  HF-bf16  FSDP | decoded")
+            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP     Δ    k3   HF-fp32 | decoded")
             for j in order.tolist():
                 tid = int(ids_m[j].item()) if (ids_m is not None and j < ids_m.numel()) else -1
                 txt = processor.tokenizer.decode([tid]) if tid >= 0 else "?"
-                fv = fsdp_m[j].item() if (fsdp_m is not None and j < fsdp_m.numel()) else float("nan")
-                hb = hf16_m[j].item() if (hf16_m is not None and j < hf16_m.numel()) else float("nan")
-                _log(f"   id={tid:6d} | {v_m[j].item():+.3f}  {hf32_m[j].item():+.3f}  {hb:+.3f}  {fv:+.3f} | {txt!r}")
+                hf = hf32_m[j].item() if (hf32_m is not None and j < hf32_m.numel()) else float("nan")
+                _log(
+                    f"   id={tid:6d} | {v_m[j].item():+.3f}  {fsdp_m[j].item():+.3f}  "
+                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  {hf:+.3f} | {txt!r}"
+                )
 
     _log(
         "\n=== VERDICT GUIDE ===\n"
