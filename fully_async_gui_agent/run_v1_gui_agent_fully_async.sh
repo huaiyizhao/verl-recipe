@@ -160,7 +160,10 @@ feeder_poll_interval=${feeder_poll_interval:-1.0}
 max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-4}
 # Store multimodal pixel tensors as bf16 in TransferQueue (~halves their RAM footprint in the
 # storage-unit actors; the model consumes bf16 anyway). Set False to keep float32.
-multimodal_storage_bf16=${multimodal_storage_bf16:-True}
+# Temporarily OFF: A/B test for the train<->infer logprob gap. bf16 pixel storage is a v1-only
+# feature (pre-v1 didn't have it) and a suspect for the elevated uncertain-token divergence.
+# NOTE: doubles image storage footprint -> only safe at the reduced bs=16.
+multimodal_storage_bf16=${multimodal_storage_bf16:-False}
 # TransferQueue total capacity in ENTRIES (rows + unique images), across all partitions/units.
 # The default (100000) is too small here and causes ring-buffer EVICTION of still-referenced images
 # -> "key ... not found in field 'image_grid_thw'" crashes. Size for the worst-case in-flight volume:

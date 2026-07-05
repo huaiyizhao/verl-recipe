@@ -89,88 +89,6 @@ def _log(msg: str, *, level: str = "DEBUG", debug: bool | None = None) -> None:
     print(f"[{_ts()}]{prefix} {msg}", file=sys.stderr, flush=True)
 
 
-# Trace-image encoding knobs. Screenshots are downscaled + JPEG-compressed before base64
-# embedding so a traced multi-turn rollout stays small in the mlflow trace store (a 1920x1080
-# PNG is ~2-6 MB; a 720p/1280-long-side JPEG q60 is ~100-150 KB). Default long side is 1280
-# (720p). With full tracing (max_samples_per_step_per_worker=null) this is ~400 MB/step into
-# the mlflow server; lower GUI_TRACE_IMG_MAX_SIDE / GUI_TRACE_IMG_QUALITY to shrink it.
-_TRACE_IMG_MAX_SIDE = int(os.getenv("GUI_TRACE_IMG_MAX_SIDE", "1280"))
-_TRACE_IMG_QUALITY = int(os.getenv("GUI_TRACE_IMG_QUALITY", "60"))
-
-
-def _screenshot_to_data_uri(image: Any) -> str | None:
-    """Encode a PIL screenshot as a compact base64 JPEG data-URI for mlflow trace rendering.
-
-    Returns ``None`` on any failure so tracing never breaks a rollout.
-    """
-    try:
-        import base64
-        import io
-
-        img = image
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        w, h = img.size
-        longest = max(w, h)
-        if longest > _TRACE_IMG_MAX_SIDE:
-            scale = _TRACE_IMG_MAX_SIDE / longest
-            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=_TRACE_IMG_QUALITY)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        return f"data:image/jpeg;base64,{b64}"
-    except Exception:
-        return None
-
-
-def _log_trace_conversation(
-    task_query: str,
-    trace_turns: list[tuple[Any, str]],
-    reward: float,
-    stop_reason: str,
-    num_turns: int,
-) -> None:
-    """Attach the full screenshot+action conversation to the active mlflow trace span.
-
-    ``@rollout_trace_op`` on :meth:`GUIAgentLoop.run` only opens an mlflow span for the
-    *sampled* rollouts (``max_samples_per_step_per_worker``); an absent active span therefore
-    means this rollout is not being traced, so we no-op instead of creating an orphan span.
-    Screenshots are embedded as OpenAI-style ``image_url`` data-URIs, which the mlflow trace
-    UI renders inline. Best-effort: any failure is swallowed so tracing never breaks training.
-    """
-    from verl.utils.rollout_trace import RolloutTraceConfig
-
-    if RolloutTraceConfig.get_backend() != "mlflow":
-        return
-    try:
-        import mlflow
-
-        active_span = mlflow.get_current_active_span()
-    except Exception:
-        return
-    if active_span is None:
-        return
-
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": [{"type": "text", "text": f"Task: {task_query}"}]}
-    ]
-    for idx, (screenshot, action_text) in enumerate(trace_turns, start=1):
-        content: list[dict[str, Any]] = []
-        uri = _screenshot_to_data_uri(screenshot) if screenshot is not None else None
-        if uri is not None:
-            content.append({"type": "image_url", "image_url": {"url": uri}})
-        content.append({"type": "text", "text": f"[turn {idx}] screenshot"})
-        messages.append({"role": "user", "content": content})
-        messages.append({"role": "assistant", "content": action_text or ""})
-
-    try:
-        with mlflow.start_span(name="gui_conversation") as span:
-            span.set_inputs({"messages": messages})
-            span.set_outputs({"reward": reward, "stop_reason": stop_reason, "num_turns": num_turns})
-    except Exception as exc:
-        _log(f"[GUIAgentLoop] mlflow screenshot trace failed: {exc!r}", level="WARNING")
-
-
 @register("gui_agent")
 class GUIAgentLoop(AgentLoopBase):
     """Multi-turn GUI agent loop for desktop computer-use tasks.
@@ -535,11 +453,6 @@ class GUIAgentLoop(AgentLoopBase):
             # Persistent turn records for history strategy.
             turn_records: list[TurnRecord] = []
 
-            # (screenshot_seen_this_turn, assistant_action_text) per turn, for the mlflow
-            # trace conversation. Populated for every turn incl. the final one; only emitted
-            # to the trace when this rollout was sampled for tracing.
-            trace_turns: list[tuple[Any, str]] = []
-
             while True:
                 turn += 1
 
@@ -683,12 +596,17 @@ class GUIAgentLoop(AgentLoopBase):
                     None,
                     lambda ids=response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
                 )
+                # Print the model's raw output (only tens of tokens) for the train<->infer gap hunt.
+                # Gated so it doesn't flood; enable with GUI_LOG_MODEL_OUTPUT=1.
+                if os.getenv("GUI_LOG_MODEL_OUTPUT", "0") not in ("0", "false", "False", ""):
+                    print(
+                        f"[MODEL_OUTPUT] {log_tag}[turn={turn}] resp_ids={len(response_ids)} "
+                        f"text={assistant_text!r}",
+                        flush=True,
+                    )
                 low_level_instruction = self._extract_low_level_instruction(
                     assistant_text, fallback_action=actions[0] if actions else None
                 )
-
-                # Record this turn (screenshot the model saw + its action) for the trace.
-                trace_turns.append((current_screenshot, assistant_text))
 
                 # 5. Decide whether this turn ends the rollout.
                 # Missing or malformed tool calls match eval behavior: no
@@ -894,10 +812,9 @@ class GUIAgentLoop(AgentLoopBase):
             for traj in self._trajectories:
                 traj.reward_score = shared_reward
                 traj.extra_fields["reward_extra_info"] = reward_extra_info
-            # Emit the screenshot+action conversation to the mlflow trace (no-op unless this
-            # rollout was sampled for tracing). Done here so the trace reflects the completed,
-            # non-discarded trajectory with its terminal reward.
-            _log_trace_conversation(task_query, trace_turns, shared_reward, stop_reason, turn)
+            # Screenshots/text now render in the mlflow trace via rollout_trace_op's OpenAI-chat
+            # serialization of run()'s output (each AgentLoopOutput.multi_modal_data image ->
+            # image_url part), so no separate conversation span is emitted here.
 
             # Chronological order: intermediate turns first, final turn last.
             trajectories = [*self._trajectories, final_output]
