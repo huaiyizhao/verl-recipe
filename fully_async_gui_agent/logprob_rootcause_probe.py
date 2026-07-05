@@ -133,6 +133,11 @@ def main():
             img_cursor += 1
         grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
         pix_i = torch.cat(seq_pixels).to(device).to(model.dtype) if seq_pixels else None
+        _log(
+            f"[IMG] n_img_tokens={n_img_tokens} images_assigned={len(seq_grids)} "
+            f"patches={pix_i.shape[0] if pix_i is not None else 0} "
+            f"(expect patches/merge^2 == n_img_tokens: {(pix_i.shape[0] // (merge * merge)) if pix_i is not None else 0})"
+        )
 
         # (B1) MROPE CHECK: reference position_ids from CURRENT ids+grid vs the FED ones (diff, not eyeball).
         if get_rope_index is not None and grid_i is not None:
@@ -244,21 +249,30 @@ def main():
             n = min(v_m.numel(), fsdp_m.numel())
             vf = v_m[:n].float() - fsdp_m[:n].float()
             k3 = (torch.exp(vf.clamp(-20, 20)) - 1.0 - vf).abs()
+            # bf16 self-swing: |HF-bf16 - HF-fp32| per token. Same (even if wrong) image, so this cleanly
+            # measures how bf16-SENSITIVE each token's logp is, independent of reconstruction errors.
+            # If the vLLM-FSDP gap tracks this bf16 swing -> the divergence is bf16 numerical (ROOT A).
+            if hf16_m is not None and hf32_m is not None:
+                nb = min(n, hf16_m.numel(), hf32_m.numel())
+                bf16sw_all = (hf16_m[:nb].float() - hf32_m[:nb].float()).abs()
+                max_bf16sw = float(bf16sw_all.max()) if nb else float("nan")
+            else:
+                bf16sw_all, max_bf16sw = None, float("nan")
             _log(
                 f"[VF] vLLM-vs-FSDP over {n} resp tok: mean|Δ|={vf.abs().mean():.4f} max|Δ|={vf.abs().max():.4f} "
                 f"seq_mean_k3={k3.mean():.5f} (mask@0.005 -> {'MASKED' if k3.mean() > 0.005 else 'kept'}) "
-                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())}"
+                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())} | pure-bf16 max_swing={max_bf16sw:.4f}"
             )
             order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
-            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP     Δ    k3   HF-fp32 | decoded")
+            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP    Δ(v-f)   k3   bf16swing | decoded")
             for j in order.tolist():
                 tid = int(ids_m[j].item()) if (ids_m is not None and j < ids_m.numel()) else -1
                 txt = processor.tokenizer.decode([tid]) if tid >= 0 else "?"
-                hf = hf32_m[j].item() if (hf32_m is not None and j < hf32_m.numel()) else float("nan")
+                bsw = bf16sw_all[j].item() if (bf16sw_all is not None and j < bf16sw_all.numel()) else float("nan")
                 _log(
                     f"   id={tid:6d} | {v_m[j].item():+.3f}  {fsdp_m[j].item():+.3f}  "
-                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  {hf:+.3f} | {txt!r}"
+                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  {bsw:.3f} | {txt!r}"
                 )
 
     _log(
