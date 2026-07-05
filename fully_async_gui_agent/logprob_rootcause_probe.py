@@ -92,26 +92,27 @@ def main():
         _log(f"[warn] could not import verl get_rope_index ({e!r}); mrope check will be skipped")
         get_rope_index = None
 
-    model = None
-    used_attn = None
-    for attn_try in [args.attn, "sdpa", "eager"]:
-        if attn_try == used_attn:
-            continue
-        try:
-            _log(f"=== loading model {model_path} (attn={attn_try}) ===")
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16, attn_implementation=attn_try, trust_remote_code=True
-            ).eval()
-            used_attn = attn_try
-            break
-        except Exception as e:  # noqa: BLE001
-            _log(f"[warn] attn={attn_try} failed ({e!r})")
-    if model is None:
-        _log("could not load model with any attn impl")
-        sys.exit(1)
-    _log(f"=== USING attn_implementation={used_attn} (verl trains with flash_attn_varlen) ===")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+
+    def _load(attn):
+        try:
+            m = AutoModelForImageTextToText.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16, attn_implementation=attn, trust_remote_code=True
+            ).eval()
+            return m.to(device)
+        except Exception as e:  # noqa: BLE001
+            _log(f"[warn] load attn={attn} failed ({e!r})")
+            return None
+
+    # sdpa model: supports fp32 (flash cannot) + bf16. flash model: bf16 only, MATCHES verl exactly.
+    _log(f"=== loading sdpa model {model_path} ===")
+    model_sdpa = _load("sdpa") or _load("eager")
+    if model_sdpa is None:
+        _log("could not load sdpa/eager model")
+        sys.exit(1)
+    _log("=== loading flash_attention_2 model (matches verl flash_attn_varlen) ===")
+    model_flash = _load("flash_attention_2")  # may be None if flash-attn unavailable
+    _log(f"=== flash model available: {model_flash is not None} ===")
 
     n_seq = min(args.max_seq, len(input_ids) if input_ids else 0)
     _log(f"=== analyzing {n_seq} sequences ===")
@@ -152,7 +153,7 @@ def main():
             consumed_tokens += patches // (merge * merge)
             img_cursor += 1
         grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
-        pix_i = torch.cat(seq_pixels).to(device).to(model.dtype) if seq_pixels else None
+        pix_i = torch.cat(seq_pixels).to(device) if seq_pixels else None  # _hf_logp re-casts per model
         _log(
             f"[IMG] n_img_tokens={n_img_tokens} images_assigned={len(seq_grids)} "
             f"patches={pix_i.shape[0] if pix_i is not None else 0} "
@@ -190,27 +191,36 @@ def main():
             except Exception as e:  # noqa: BLE001
                 _log(f"[MROPE] failed: {e!r}")
 
-        # HF forward (bf16, eager) with the model's OWN recomputed position_ids.
-        def _hf_logp(dtype, ids, pix, grid):
-            m = model if dtype == torch.bfloat16 else model.to(torch.float32)
-            with torch.no_grad():
-                kw = {"input_ids": ids.unsqueeze(0)}
-                if pix is not None:
-                    kw["pixel_values"] = pix.to(m.dtype)
-                    kw["image_grid_thw"] = grid
-                out = m(**kw, use_cache=False)
-                logits = out.logits[0].float()  # (L, V)
-                lp = torch.log_softmax(logits[:-1], dim=-1)
-                per_tok = lp.gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)  # logp of actual next token, len L-1
-            if dtype != torch.bfloat16:
-                model.to(torch.bfloat16)
-            return per_tok.cpu()
+        # HF forward -> per-token next-token logp (len L-1). mdl_dtype casts the model (fp32 only works
+        # with sdpa; flash-attn requires bf16/fp16). Each returns None on failure (never crashes the seq).
+        def _hf_logp(mdl, ids, pix, grid, cast_fp32=False):
+            if mdl is None:
+                return None
+            try:
+                if cast_fp32:
+                    mdl.to(torch.float32)
+                with torch.no_grad():
+                    kw = {"input_ids": ids.unsqueeze(0)}
+                    if pix is not None:
+                        kw["pixel_values"] = pix.to(mdl.dtype)
+                        kw["image_grid_thw"] = grid
+                    out = mdl(**kw, use_cache=False)
+                    logits = out.logits[0].float()  # (L, V)
+                    lp = torch.log_softmax(logits[:-1], dim=-1)
+                    per = lp.gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)  # logp of actual next token
+                return per.cpu()
+            except Exception as e:  # noqa: BLE001
+                _log(f"[FORWARD] failed ({e!r})")
+                return None
+            finally:
+                if cast_fp32:
+                    mdl.to(torch.bfloat16)
 
-        try:
-            hf_bf16 = _hf_logp(torch.bfloat16, ids_i, pix_i, grid_i)
-            hf_fp32 = _hf_logp(torch.float32, ids_i, pix_i, grid_i)
-        except Exception as e:  # noqa: BLE001
-            _log(f"[FORWARD] HF forward failed: {e!r}; skipping numeric forks for this seq")
+        hf_bf16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i)  # bf16 + sdpa
+        hf_fp32 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_fp32=True)  # fp32 + sdpa (the "truth")
+        hf_flash = _hf_logp(model_flash, ids_i, pix_i, grid_i)  # bf16 + flash == verl's exact config
+        if hf_bf16 is None or hf_fp32 is None:
+            _log("[FORWARD] sdpa forward failed; skipping seq")
             continue
 
         # ALIGN: response = the LAST resp_len tokens (contiguous tail = everything after the initial
@@ -244,8 +254,11 @@ def main():
         # seq). If only image-adjacent/response diverge -> multimodal-data specific.
         if f_full is not None and f_full.numel() >= L - 1:
             n2 = L - 1
-            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()  # fp32-HF  vs bf16-FSDP
-            d_bf = (hf_bf16[:n2].float() - f_full[:n2].float()).abs()  # bf16-HF  vs bf16-FSDP
+            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()  # fp32-HF-sdpa   vs bf16-FSDP
+            d_bf = (hf_bf16[:n2].float() - f_full[:n2].float()).abs()  # bf16-HF-sdpa   vs bf16-FSDP
+            # bf16-HF-FLASH vs bf16-FSDP == exactly verl's config (bf16 + flash_attn). If THIS collapses
+            # to ~0 while d_bf(sdpa) stays 0.09 -> the gap was sdpa-vs-flash attention accumulation.
+            d_fl = (hf_flash[:n2].float() - f_full[:n2].float()).abs() if hf_flash is not None else None
             nxt = ids_i[1 : n2 + 1].cpu()  # token predicted at each position p (= ids[p+1])
             is_img = (nxt == image_token_id) if image_token_id is not None else torch.zeros(n2, dtype=torch.bool)
             posn = torch.arange(n2)
@@ -261,11 +274,21 @@ def main():
                 return dv[msk].mean().item() if bool(msk.any()) else float("nan")
 
             _log(
-                f"[REGION] mean|Δ| FSDP-vs-HF(fp32/bf16): "
+                f"[REGION] mean|Δ| FSDP-vs-HF(fp32-sdpa/bf16-sdpa): "
                 f"pre_text={_rm(is_pre, d_all):.4f}/{_rm(is_pre, d_bf):.4f}(n={int(is_pre.sum())}) "
                 f"post_text={_rm(is_post, d_all):.4f}/{_rm(is_post, d_bf):.4f}(n={int(is_post.sum())}) "
                 f"response={_rm(is_resp & ~is_img, d_all):.4f}/{_rm(is_resp & ~is_img, d_bf):.4f}"
             )
+            if d_fl is not None:
+                _log(
+                    f"[REGION-FLASH] mean|Δ| FSDP-vs-HF(bf16-FLASH == verl config): "
+                    f"pre_text={_rm(is_pre, d_fl):.4f}(n={int(is_pre.sum())}) "
+                    f"post_text={_rm(is_post, d_fl):.4f} "
+                    f"response={_rm(is_resp & ~is_img, d_fl):.4f} "
+                    f"-- if pre_text ~0 (vs sdpa 0.09), the gap is sdpa-vs-flash attention accumulation"
+                )
+            else:
+                _log("[REGION-FLASH] flash model unavailable (flash-attn not installed?)")
 
             # Comprehensive characterization of the PURE-TEXT (pre-image) FSDP-vs-HFfp32 gap: signed
             # stats (constant offset?), OLS FSDP~a*HF+b (scaling?), split by token confidence, and raw
