@@ -45,6 +45,12 @@ def main():
     ap.add_argument("--model", default=None, help="HF model dir (defaults to model_path stored in the bundle)")
     ap.add_argument("--max-seq", type=int, default=8, help="how many sequences to analyze")
     ap.add_argument("--worst-k", type=int, default=8, help="worst-divergence tokens to print per sequence")
+    ap.add_argument(
+        "--attn",
+        default="sdpa",
+        help="HF attn_implementation: sdpa/flash_attention_2 (match training's flash) or eager. "
+        "If HF-vs-FSDP shrinks vs eager, the gap was an attention-kernel artifact, not a training bug.",
+    )
     args = ap.parse_args()
 
     if not os.path.exists(args.bundle):
@@ -86,10 +92,16 @@ def main():
         _log(f"[warn] could not import verl get_rope_index ({e!r}); mrope check will be skipped")
         get_rope_index = None
 
-    _log(f"=== loading model {model_path} (eager attn) ===")
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, attn_implementation="eager", trust_remote_code=True
-    ).eval()
+    _log(f"=== loading model {model_path} (attn={args.attn}) ===")
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, attn_implementation=args.attn, trust_remote_code=True
+        ).eval()
+    except Exception as e:  # noqa: BLE001
+        _log(f"[warn] attn_implementation={args.attn} failed ({e!r}); falling back to eager")
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, attn_implementation="eager", trust_remote_code=True
+        ).eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
