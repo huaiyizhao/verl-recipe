@@ -32,6 +32,18 @@ env_vars:
   # Lightweight per-step / per-sample timing breakdown ([STEP_PROFILE] / [SAMPLE_PROFILE]) plus
   # [FBP_PROFILE]. ON for the localization pass.
   VERL_STEP_PROFILE: "1"
+  # Print each rollout turn's decoded model output ([MODEL_OUTPUT]) — responses are only a few
+  # dozen tokens, so cheap. ON for the localization pass to eyeball what the policy emits.
+  GUI_LOG_MODEL_OUTPUT: "1"
+  # Model dir for the LOGPROB_GAP diagnostic to lazily load a tokenizer and print DECODED token
+  # text inline (worst token + per-token dump), instead of raw ids you'd decode by hand.
+  VERL_LOGPROB_DEBUG_TOKENIZER: "/efs/data/models/Qwen3-VL-8B-Instruct"
+  # One-shot root-cause probe: dump ONE real micro-batch (inputs + vLLM logp + FSDP logp) to disk
+  # so vLLM<->FSDP logprob divergence can be localized OFFLINE in a single run. Analyze with
+  # recipe/fully_async_gui_agent/logprob_rootcause_probe.py on the GPU box after the run.
+  VERL_LOGPROB_PROBE_DUMP: "1"
+  VERL_LOGPROB_PROBE_DIR: "/efs/data/rl/logprob_probe"
+  VERL_LOGPROB_PROBE_MAX: "1"
   VERL_LOGGING_LEVEL: "DEBUG"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
