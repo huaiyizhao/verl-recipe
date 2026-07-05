@@ -241,16 +241,26 @@ def main():
             is_img = (nxt == image_token_id) if image_token_id is not None else torch.zeros(n2, dtype=torch.bool)
             posn = torch.arange(n2)
             is_resp = posn >= (prompt_len - 1)
-            is_ptext = (~is_img) & (~is_resp)  # prompt tokens that are NOT image placeholders
+            # first image position -> tokens BEFORE it are pure text with NO image in context (the
+            # cleanest test of forward correctness, independent of any image handling).
+            imgpos = is_img.nonzero().flatten()
+            first_img = int(imgpos[0]) if imgpos.numel() else n2
+            is_pre = (posn < first_img) & (~is_img)  # pure text, no image seen yet
+            is_post = (~is_img) & (~is_resp) & (posn >= first_img)  # prompt text AFTER image (attends to it)
 
             def _rm(msk, dv=d_all):
                 return dv[msk].mean().item() if bool(msk.any()) else float("nan")
 
+            mp = int(d_all.argmax())
+            ctx = processor.tokenizer.decode([int(x) for x in ids_i[max(0, mp - 2) : mp + 4].cpu().tolist()])
             _log(
-                f"[REGION] HF-vs-FSDP mean|Δ|: prompt_text={_rm(is_ptext):.4f}(n={int(is_ptext.sum())}) "
-                f"image_tok={_rm(is_img):.4f}(n={int(is_img.sum())}) "
-                f"response={_rm(is_resp & ~is_img):.4f}(n={int((is_resp & ~is_img).sum())}) "
-                f"| max|Δ| anywhere={d_all.max().item():.3f} @pos={int(d_all.argmax())}/{n2}"
+                f"[REGION] HF-vs-FSDP mean|Δ|: PRE-image-text={_rm(is_pre):.4f}(n={int(is_pre.sum())}) "
+                f"post-image-text={_rm(is_post):.4f}(n={int(is_post.sum())}) "
+                f"response={_rm(is_resp & ~is_img):.4f} image_tok={_rm(is_img):.2f}(ignore)"
+            )
+            _log(
+                f"[REGION] max|Δ|={d_all.max().item():.2f} @pos={mp}/{n2} "
+                f"pred={processor.tokenizer.decode([int(nxt[mp])])!r} is_img={bool(is_img[mp])} ctx={ctx!r}"
             )
 
         # keep only assistant tokens (mask==1); tool tokens within the response region are not trained.
