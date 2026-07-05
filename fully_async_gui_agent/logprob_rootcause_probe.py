@@ -230,6 +230,29 @@ def main():
         f_full = fsdp_lp[si] if fsdp_lp else None
         fsdp_r = f_full[lo:hi] if (f_full is not None and f_full.numel() >= hi) else f_full
 
+        # DIAGNOSTIC (answers: is HF-vs-FSDP broken on ANY token, or only image/response?).
+        # fsdp_log_probs is full-length, so compare HF vs FSDP over the WHOLE sequence and split by
+        # region. If prompt generic-TEXT tokens also diverge -> systematic forward/alignment bug (any
+        # seq). If only image-adjacent/response diverge -> multimodal-data specific.
+        if f_full is not None and f_full.numel() >= L - 1:
+            n2 = L - 1
+            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()
+            nxt = ids_i[1 : n2 + 1].cpu()  # token predicted at each position p (= ids[p+1])
+            is_img = (nxt == image_token_id) if image_token_id is not None else torch.zeros(n2, dtype=torch.bool)
+            posn = torch.arange(n2)
+            is_resp = posn >= (prompt_len - 1)
+            is_ptext = (~is_img) & (~is_resp)  # prompt tokens that are NOT image placeholders
+
+            def _rm(msk, dv=d_all):
+                return dv[msk].mean().item() if bool(msk.any()) else float("nan")
+
+            _log(
+                f"[REGION] HF-vs-FSDP mean|Δ|: prompt_text={_rm(is_ptext):.4f}(n={int(is_ptext.sum())}) "
+                f"image_tok={_rm(is_img):.4f}(n={int(is_img.sum())}) "
+                f"response={_rm(is_resp & ~is_img):.4f}(n={int((is_resp & ~is_img).sum())}) "
+                f"| max|Δ| anywhere={d_all.max().item():.3f} @pos={int(d_all.argmax())}/{n2}"
+            )
+
         # keep only assistant tokens (mask==1); tool tokens within the response region are not trained.
         if rm is not None and rm.numel() == resp_len:
             mask = rm.bool()
