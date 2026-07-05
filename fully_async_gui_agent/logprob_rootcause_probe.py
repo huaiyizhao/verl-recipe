@@ -61,10 +61,12 @@ def main():
             _log(f"  {k}: {v!r}")
 
     model_path = args.model or b.get("model_path") or "/efs/data/models/Qwen3-VL-8B-Instruct"
-    input_ids = _unpack(b.get("input_ids"))  # list[1D] per seq
-    resp_mask = _unpack(b.get("response_mask"))
-    vllm_lp = _unpack(b.get("old_log_probs")) or _unpack(b.get("rollout_log_probs"))
-    fsdp_lp = _unpack(b.get("fsdp_log_probs"))
+    input_ids = _unpack(b.get("input_ids"))  # list[1D] per seq (FULL sequence: prompt + response)
+    responses = _unpack(b.get("responses"))  # per seq: response token ids (response-length)
+    resp_mask = _unpack(b.get("response_mask"))  # per seq: 1=assistant token, 0=tool token (response-length)
+    vllm_lp = _unpack(b.get("old_log_probs")) or _unpack(b.get("rollout_log_probs"))  # response-length
+    fsdp_lp = _unpack(b.get("fsdp_log_probs"))  # FULL-length per-token logp (rolled: pos p -> logp of token p+1)
+    pos_fed_raw = b.get("position_ids")  # {values:(channels,total), offsets}; sliced per seq below
     grid_all = b.get("image_grid_thw")
     pixels_all = b.get("pixel_values")
     if isinstance(grid_all, dict):
@@ -104,6 +106,13 @@ def main():
     img_cursor = 0  # index into grid_all
     patch_cursor = 0
 
+    def _pos_fed(si):
+        # fed position_ids sliced for seq si: (channels, seq_len). offsets index the last (token) dim.
+        if not isinstance(pos_fed_raw, dict):
+            return None
+        vals, offs = pos_fed_raw["values"], pos_fed_raw["offsets"].tolist()
+        return vals[:, offs[si] : offs[si + 1]]
+
     for si in range(n_seq):
         ids_i = input_ids[si].to(device)
         L = ids_i.numel()
@@ -125,15 +134,34 @@ def main():
         grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
         pix_i = torch.cat(seq_pixels).to(device).to(model.dtype) if seq_pixels else None
 
-        # (B1) MROPE CHECK: reference position_ids from CURRENT ids+grid vs the fed ones.
+        # (B1) MROPE CHECK: reference position_ids from CURRENT ids+grid vs the FED ones (diff, not eyeball).
         if get_rope_index is not None and grid_i is not None:
             try:
-                ref_pos = get_rope_index(processor, ids_i.cpu(), image_grid_thw=grid_i.cpu())  # (3 or 4, L)
-                _log(f"[MROPE] ref_pos shape={tuple(ref_pos.shape)}  fed_pos raw shape printed above")
-                # best-effort align: compare the fed positions for this seq if we can slice them.
-                # (fed layout varies; print ref so a human can eyeball vs the dumped fed tensor)
-                _log(f"[MROPE] ref_pos[:, :12]=\n{ref_pos[:, :12]}")
-                _log(f"[MROPE] ref_pos[:, -12:]=\n{ref_pos[:, -12:]}")
+                ref_pos = get_rope_index(processor, ids_i.cpu(), image_grid_thw=grid_i.cpu())  # (3, L)
+                fed = _pos_fed(si)  # (channels, L) or None
+                if fed is not None:
+                    # fed is 4-channel, ref is 3-channel. Qwen3-VL mrope order can be [t,h,w,*] or
+                    # [*,t,h,w]; try both alignments and report the BEST (min) diff so a channel-order
+                    # difference isn't mistaken for a position bug. Also print slices to eyeball.
+                    fedc = fed.long().cpu()
+                    refc = ref_pos.long().cpu()
+                    cand = {"fed[:3]": fedc[:3], "fed[1:4]": fedc[1:4]}
+                    best_name, best_mx, best_nmis = None, None, None
+                    for name, fsub in cand.items():
+                        if fsub.shape != refc.shape:
+                            continue
+                        d = (refc - fsub).abs()
+                        mx = int(d.max())
+                        if best_mx is None or mx < best_mx:
+                            best_name, best_mx, best_nmis = name, mx, int((d > 0).sum())
+                    _log(
+                        f"[MROPE] ref{tuple(ref_pos.shape)} vs fed{tuple(fed.shape)}: "
+                        f"best_align={best_name} max_abs_diff={best_mx} n_mismatch={best_nmis}"
+                    )
+                    _log(f"[MROPE] fed[:, :6]=\n{fedc[:, :6]}")
+                    _log(f"[MROPE] fed[:, -6:]=\n{fedc[:, -6:]}")
+                else:
+                    _log(f"[MROPE] fed pos unavailable; ref shape={tuple(ref_pos.shape)}")
             except Exception as e:  # noqa: BLE001
                 _log(f"[MROPE] failed: {e!r}")
 
@@ -160,49 +188,70 @@ def main():
             _log(f"[FORWARD] HF forward failed: {e!r}; skipping numeric forks for this seq")
             continue
 
-        # align vLLM / FSDP-train logp (stored per response token) to HF next-token logp.
-        rm = resp_mask[si] if resp_mask else None
+        # ALIGN: response = the LAST resp_len tokens (contiguous tail = everything after the initial
+        # prompt). vLLM logp & responses are response-length; FSDP logp & HF logp are full-length
+        # (next-token frame). Response token j == input_ids[prompt_len+j], its next-token logp sits at
+        # frame position prompt_len-1+j. So the response window in the L-1 frame is [prompt_len-1 : L-1].
         v = vllm_lp[si] if vllm_lp else None
-        f = fsdp_lp[si] if fsdp_lp else None
-        _log(f"[ALIGN] hf_next_len={hf_fp32.numel()} resp_mask_len={rm.numel() if rm is not None else None} "
-             f"vllm_len={v.numel() if v is not None else None} fsdp_len={f.numel() if f is not None else None}")
+        rm = resp_mask[si] if resp_mask else None
+        resp_ids = responses[si] if responses else None
+        resp_len = (
+            v.numel() if v is not None else (resp_ids.numel() if resp_ids is not None else 0)
+        )
+        prompt_len = L - resp_len
+        lo, hi = prompt_len - 1, L - 1
 
-        # response positions in the L-1 next-token frame: mask over tokens 1..L-1
-        if rm is not None and rm.numel() == L:
-            sel = rm[1:].bool()
-        elif rm is not None and rm.numel() == L - 1:
-            sel = rm.bool()
+        if resp_ids is not None:
+            tail = ids_i[prompt_len:].cpu()
+            ok = bool(tail.numel() == resp_ids.numel() and torch.equal(tail, resp_ids.cpu()))
+            _log(f"[ALIGN] resp_len={resp_len} prompt_len={prompt_len} tail==responses:{ok}")
+            if not ok:
+                _log("[ALIGN] WARNING: response is not a contiguous tail (multi-turn?) — numbers below suspect")
+
+        hf32_r = hf_fp32[lo:hi]
+        hf16_r = hf_bf16[lo:hi]
+        f_full = fsdp_lp[si] if fsdp_lp else None
+        fsdp_r = f_full[lo:hi] if (f_full is not None and f_full.numel() >= hi) else f_full
+
+        # keep only assistant tokens (mask==1); tool tokens within the response region are not trained.
+        if rm is not None and rm.numel() == resp_len:
+            mask = rm.bool()
         else:
-            sel = torch.ones(L - 1, dtype=torch.bool)
-        hf32_r = hf_fp32[sel]
-        hf16_r = hf_bf16[sel]
+            mask = torch.ones(resp_len, dtype=torch.bool)
 
-        def _mean_abs(a, ref):
-            if a is None:
+        def _sel(x, msk):
+            if x is None:
+                return None
+            n = min(x.numel(), msk.numel())
+            return x[:n][msk[:n]]
+
+        hf32_m, hf16_m, fsdp_m, v_m = _sel(hf32_r, mask), _sel(hf16_r, mask), _sel(fsdp_r, mask), _sel(v, mask)
+
+        def _mad(a, ref):
+            if a is None or ref is None:
                 return float("nan")
             n = min(a.numel(), ref.numel())
             return (a[:n].float() - ref[:n].float()).abs().mean().item()
 
-        v_f = _mean_abs(v, f) if (v is not None and f is not None) else float("nan")
-        _log("[FORK] mean |Δ| vs HF-fp32 (the clean reference):")
-        _log(f"   HF-bf16   vs HF-fp32 : {_mean_abs(hf16_r, hf32_r):.4f}   (>0 => bf16 precision matters)")
-        _log(f"   FSDP-train vs HF-fp32: {_mean_abs(f, hf32_r):.4f}   (>0 => train-path: remove_padding/FA/FSDP)")
-        _log(f"   vLLM      vs HF-fp32 : {_mean_abs(v, hf32_r):.4f}   (>0 => vLLM engine differs from clean HF)")
-        _log(f"   vLLM      vs FSDP    : {v_f:.4f}   (the gap that drives the mask)")
+        _log("[FORK] mean |Δ| over RESPONSE (assistant) tokens vs HF-fp32 (clean reference):")
+        _log(f"   HF-bf16   vs HF-fp32 : {_mad(hf16_m, hf32_m):.4f}   (>0 => bf16 precision)")
+        _log(f"   FSDP-train vs HF-fp32: {_mad(fsdp_m, hf32_m):.4f}   (>0 => train-path: remove_padding/FA/FSDP)")
+        _log(f"   vLLM      vs HF-fp32 : {_mad(v_m, hf32_m):.4f}   (>0 => vLLM engine vs clean HF)")
+        _log(f"   vLLM      vs FSDP    : {_mad(v_m, fsdp_m):.4f}   (the gap that drives the mask)")
 
-        # worst tokens by |vLLM - HF-fp32|
-        if v is not None:
-            n = min(v.numel(), hf32_r.numel())
-            d = (v[:n].float() - hf32_r[:n].float()).abs()
+        # worst RESPONSE tokens by |vLLM - HF-fp32|
+        if v_m is not None and hf32_m is not None:
+            n = min(v_m.numel(), hf32_m.numel())
+            d = (v_m[:n].float() - hf32_m[:n].float()).abs()
             order = torch.argsort(d, descending=True)[: args.worst_k]
-            resp_ids = ids_i[1:][sel][:n]
-            _log("[WORST] token | vLLM  HF-fp32  HF-bf16  FSDP  |  decoded")
+            ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
+            _log("[WORST resp] token | vLLM  HF-fp32  HF-bf16  FSDP | decoded")
             for j in order.tolist():
-                tid = int(resp_ids[j].item())
-                txt = processor.tokenizer.decode([tid])
-                fv = f[j].item() if (f is not None and j < f.numel()) else float("nan")
-                _log(f"   id={tid:6d} | {v[j].item():+.3f}  {hf32_r[j].item():+.3f}  "
-                     f"{hf16_r[j].item():+.3f}  {fv:+.3f}  | {txt!r}")
+                tid = int(ids_m[j].item()) if (ids_m is not None and j < ids_m.numel()) else -1
+                txt = processor.tokenizer.decode([tid]) if tid >= 0 else "?"
+                fv = fsdp_m[j].item() if (fsdp_m is not None and j < fsdp_m.numel()) else float("nan")
+                hb = hf16_m[j].item() if (hf16_m is not None and j < hf16_m.numel()) else float("nan")
+                _log(f"   id={tid:6d} | {v_m[j].item():+.3f}  {hf32_m[j].item():+.3f}  {hb:+.3f}  {fv:+.3f} | {txt!r}")
 
     _log(
         "\n=== VERDICT GUIDE ===\n"
