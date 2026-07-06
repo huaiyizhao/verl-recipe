@@ -110,6 +110,11 @@ def main():
     if model_sdpa is None:
         _log("could not load sdpa/eager model")
         sys.exit(1)
+    # flash model (bf16) to run HF UNPACKED with the SAME kernel FSDP uses -> isolates packing from
+    # kernel. If unpacked-flash == unpacked-sdpa but packed-FSDP differs, the bug is the PACKING.
+    _log("=== loading flash_attention_2 model (bf16, unpacked ref) ===")
+    model_flash = _load("flash_attention_2")
+    _log(f"=== flash model available: {model_flash is not None} ===")
 
     n_seq = min(args.max_seq, len(input_ids) if input_ids else 0)
     _log(f"=== analyzing {n_seq} sequences ===")
@@ -218,9 +223,10 @@ def main():
                     mdl.to(torch.bfloat16)
 
         # Same model+input+attention; ONLY compute precision differs. fp32 = the "truth".
-        hf_bf16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i)  # bf16 (current training precision)
+        hf_bf16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i)  # bf16 sdpa, UNPACKED
         hf_fp32 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_dtype=torch.float32)  # fp32 truth
         hf_fp16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_dtype=torch.float16)  # fp16 (proposed)
+        hf_flash = _hf_logp(model_flash, ids_i, pix_i, grid_i)  # bf16 FLASH, UNPACKED (same kernel as FSDP)
         if hf_bf16 is None or hf_fp32 is None or hf_fp16 is None:
             _log("[FORWARD] sdpa forward failed; skipping seq")
             continue
@@ -340,6 +346,7 @@ def main():
 
         hf32_m, hf16_m, fsdp_m, v_m = _sel(hf32_r, mask), _sel(hf16_r, mask), _sel(fsdp_r, mask), _sel(v, mask)
         hf16fp16_m = _sel(hf_fp16[lo:hi], mask)  # fp16 logp on response tokens
+        hfflash_m = _sel(hf_flash[lo:hi], mask) if hf_flash is not None else None  # bf16-flash UNPACKED
         # accumulate aligned response tokens for the final precision matrix (all same length/tokens)
         if all(x is not None for x in (hf32_m, hf16_m, hf16fp16_m, fsdp_m, v_m)):
             mlen = min(hf32_m.numel(), hf16_m.numel(), hf16fp16_m.numel(), fsdp_m.numel(), v_m.numel())
@@ -391,6 +398,14 @@ def main():
                 f"on |Δ|>0.1: FSDP-vs-HFbf16={_m2(fsdp_m, hf16_m, hi):.4f} vLLM-vs-HFbf16={_m2(v_m, hf16_m, hi):.4f} "
                 f"[the BIGGER one is the outlier vs transformers]"
             )
+            # PACKING vs KERNEL: HF-flash is UNPACKED + same flash kernel as FSDP. If HFflash≈HFsdpa
+            # (kernel agrees unpacked) but FSDP(packed-flash) differs -> the bug is the PACKING/rmpad.
+            if hfflash_m is not None:
+                _log(
+                    f"[PACK-TEST] on |Δ|>0.1 tokens: HFflash-vs-HFsdpa={_m2(hfflash_m, hf16_m, hi):.4f} "
+                    f"(≈0 => flash kernel fine unpacked) | FSDP-vs-HFflash={_m2(fsdp_m, hfflash_m, hi):.4f} "
+                    f"(large => PACKING is the bug, not the kernel)"
+                )
             order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
             _log("[WORST vLLM-FSDP] token |  vLLM     FSDP    HFbf16   HFfp32 | Δ(v-f)   k3   | decoded")
