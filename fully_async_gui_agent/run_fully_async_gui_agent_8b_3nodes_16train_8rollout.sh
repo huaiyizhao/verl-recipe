@@ -204,8 +204,8 @@ infer_ppo_max_token_len=100000
 
 # Timestamp in UTC+8 (Asia/Shanghai), independent of the host timezone.
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
-# project_name=${project_name:-fully_async_gui_agent_${run_timestamp}}
-project_name="fully_async_gui_agent_20260621_044118"
+project_name=${project_name:-fully_async_gui_agent_${run_timestamp}}
+# project_name="fully_async_gui_agent_20260621_044118"
 experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=30
