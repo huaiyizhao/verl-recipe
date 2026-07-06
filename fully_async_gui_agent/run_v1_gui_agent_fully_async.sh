@@ -224,11 +224,7 @@ actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
-# ISOLATION TEST (rmpad OFF): 24576 = max_prompt_length(20480)+max_response_length(4096) = the longest
-# possible single seq -> satisfies `assert max_token_len >= max_seq_len` (never crashes, drops nothing).
-# With rmpad off + dynamic bsz, KK packing isolates long seqs into their own bin, so padded peak stays
-# ~24k tokens (~11GB logits) << the 32.8GB that OOM'd at 70000. Restore 70000 once rmpad is confirmed.
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-24576}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-70000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
@@ -278,7 +274,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
-    actor_rollout_ref.model.use_remove_padding=False \
+    actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \

@@ -50,6 +50,10 @@ env_vars:
   # shared multi-image pixel tensor.
   VERL_LOGPROB_PROBE_MIN_K3: "0.005"
   VERL_LOGGING_LEVEL: "DEBUG"
+  # Train-side pixel integrity self-check in resolve_image_ids (dedup consume). Prints [PIXEL_FP] for
+  # the first ~40 images: hash_match=False => store returned the WRONG image for a key (train sees a
+  # different screenshot than vLLM used at rollout); bf16_roundtrip=True => stored pixels are bf16.
+  VERL_PIXEL_FINGERPRINT: "1"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
   VERL_LOGGING_LEVEL: "DEBUG"
