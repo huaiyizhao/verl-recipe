@@ -56,6 +56,26 @@ def _summ(tag, vllm_lp, hf_lp, ids, tokenizer, topk=12):
         f"mean_signed_d={d.mean():+.5f}  frac|d|>0.1={(ad > 0.1).float().mean():.3f}  "
         f"frac|d|>0.5={(ad > 0.5).float().mean():.3f}"
     )
+    # WHERE does the |d| mass concentrate?
+    # (a) direction split — is the gap systematic (vLLM over/under-confident) or symmetric noise?
+    tot = ad.sum().clamp(min=1e-9)
+    _p(
+        f"[{tag}] direction: |d| mass  vLLM-higher(d>0)={ad[d > 0].sum() / tot * 100:4.0f}%  "
+        f"vLLM-lower(d<0)={ad[d < 0].sum() / tot * 100:4.0f}%"
+    )
+    # (b) by vLLM's own confidence — does the gap live on near-deterministic tokens or high-entropy ones?
+    #     (high-entropy = the model is choosing among alternatives = where vision grounding matters).
+    for name, m in (
+        ("confident vLLM_lp>-0.5 ", v > -0.5),
+        ("mid  -2<=lp<=-0.5      ", (v <= -0.5) & (v >= -2.0)),
+        ("uncertain  lp<-2       ", v < -2.0),
+    ):
+        c = int(m.sum())
+        if c:
+            _p(
+                f"[{tag}]   {name}: n={c:3d}  mean_abs_d={ad[m].mean():.4f}  "
+                f"mass={ad[m].sum() / tot * 100:4.0f}%  mean_signed={d[m].mean():+.4f}"
+            )
     # worst tokens
     order = torch.argsort(ad, descending=True)[:topk]
     _p(f"[{tag}] worst {topk} tokens (pos | vLLM  HF  d | token):")
