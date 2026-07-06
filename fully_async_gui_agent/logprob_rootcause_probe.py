@@ -402,9 +402,10 @@ def main():
             # (kernel agrees unpacked) but FSDP(packed-flash) differs -> the bug is the PACKING/rmpad.
             if hfflash_m is not None:
                 _log(
-                    f"[PACK-TEST] on |Δ|>0.1 tokens: HFflash-vs-HFsdpa={_m2(hfflash_m, hf16_m, hi):.4f} "
-                    f"(≈0 => flash kernel fine unpacked) | FSDP-vs-HFflash={_m2(fsdp_m, hfflash_m, hi):.4f} "
-                    f"(large => PACKING is the bug, not the kernel)"
+                    f"[PACK-TEST] FSDP(packed) vs HFflash(unpacked, same kernel): "
+                    f"ALL_resp={_m2(fsdp_m, hfflash_m):.4f} on|Δ|>0.1={_m2(fsdp_m, hfflash_m, hi):.4f} | "
+                    f"HFflash-vs-HFsdpa(ALL)={_m2(hfflash_m, hf16_m):.4f} "
+                    f"[FSDP-vs-HFflash large => packing bug; after fix it should collapse to ~HFflash-vs-HFsdpa]"
                 )
             order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
