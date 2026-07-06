@@ -274,7 +274,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
-    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
