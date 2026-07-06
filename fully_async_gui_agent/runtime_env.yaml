@@ -42,8 +42,13 @@ env_vars:
   # New dir so we DON'T overwrite the unmasked bundle at /efs/data/rl/logprob_probe (keep for compare).
   VERL_LOGPROB_PROBE_DIR: "/efs/data/rl/logprob_probe_masked"
   VERL_LOGPROB_PROBE_MAX: "1"
-  # Only dump a micro-batch whose max per-seq mean-k3 >= this (RS mask fires at 0.005) -> a MASKED batch.
-  VERL_LOGPROB_PROBE_MIN_K3: "0"
+  # Gate == rollout_correction_rs_threshold (0.005): dump only a micro-batch whose max per-seq mean-k3
+  # >= 0.005 -> i.e. a batch that ACTUALLY got RS-masked (aligned with the mask, no gap that misses
+  # k3 in [0.005,0.006)). After the qwen3_vl varlen-attn patch: if the packing bug is truly fixed,
+  # NOTHING should exceed this (no dump == validation). If a masked batch still dumps, analyze via [VF]
+  # (vLLM-vs-FSDP direct) and IGNORE the [PACK-TEST]/HF columns — the offline HF ref mis-slices the
+  # shared multi-image pixel tensor.
+  VERL_LOGPROB_PROBE_MIN_K3: "0.005"
   VERL_LOGGING_LEVEL: "DEBUG"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
