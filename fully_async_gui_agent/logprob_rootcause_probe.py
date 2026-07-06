@@ -104,18 +104,19 @@ def main():
             _log(f"[warn] load attn={attn} failed ({e!r})")
             return None
 
-    # sdpa model: supports fp32 (flash cannot) + bf16. flash model: bf16 only, MATCHES verl exactly.
-    _log(f"=== loading sdpa model {model_path} ===")
+    # sdpa model supports fp32/fp16/bf16 (flash-attn cannot do fp32). One model, cast per-precision.
+    _log(f"=== loading model {model_path} (sdpa) ===")
     model_sdpa = _load("sdpa") or _load("eager")
     if model_sdpa is None:
         _log("could not load sdpa/eager model")
         sys.exit(1)
-    _log("=== loading flash_attention_2 model (matches verl flash_attn_varlen) ===")
-    model_flash = _load("flash_attention_2")  # may be None if flash-attn unavailable
-    _log(f"=== flash model available: {model_flash is not None} ===")
 
     n_seq = min(args.max_seq, len(input_ids) if input_ids else 0)
     _log(f"=== analyzing {n_seq} sequences ===")
+
+    # Accumulators for the final PRECISION MATRIX, over RESPONSE (assistant) tokens of the GUI image
+    # sequences. All aligned to the same tokens so we can diff each engine/precision vs HF-fp32 "truth".
+    ACC = {"hf32": [], "hf16": [], "hffp16": [], "fsdp": [], "vllm": []}
 
     # split concatenated pixel_values across images by patch count (grid_t*grid_h*grid_w per image);
     # images appear in sequence order, so we walk grids and consume patches + assign to sequences.
@@ -191,14 +192,14 @@ def main():
             except Exception as e:  # noqa: BLE001
                 _log(f"[MROPE] failed: {e!r}")
 
-        # HF forward -> per-token next-token logp (len L-1). mdl_dtype casts the model (fp32 only works
-        # with sdpa; flash-attn requires bf16/fp16). Each returns None on failure (never crashes the seq).
-        def _hf_logp(mdl, ids, pix, grid, cast_fp32=False):
+        # HF forward -> per-token next-token logp (len L-1). cast_dtype temporarily casts the model
+        # (fp32/fp16/bf16). Same forward each time, only compute precision differs. None on failure.
+        def _hf_logp(mdl, ids, pix, grid, cast_dtype=None):
             if mdl is None:
                 return None
             try:
-                if cast_fp32:
-                    mdl.to(torch.float32)
+                if cast_dtype is not None:
+                    mdl.to(cast_dtype)
                 with torch.no_grad():
                     kw = {"input_ids": ids.unsqueeze(0)}
                     if pix is not None:
@@ -213,13 +214,14 @@ def main():
                 _log(f"[FORWARD] failed ({e!r})")
                 return None
             finally:
-                if cast_fp32:
+                if cast_dtype is not None:
                     mdl.to(torch.bfloat16)
 
-        hf_bf16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i)  # bf16 + sdpa
-        hf_fp32 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_fp32=True)  # fp32 + sdpa (the "truth")
-        hf_flash = _hf_logp(model_flash, ids_i, pix_i, grid_i)  # bf16 + flash == verl's exact config
-        if hf_bf16 is None or hf_fp32 is None:
+        # Same model+input+attention; ONLY compute precision differs. fp32 = the "truth".
+        hf_bf16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i)  # bf16 (current training precision)
+        hf_fp32 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_dtype=torch.float32)  # fp32 truth
+        hf_fp16 = _hf_logp(model_sdpa, ids_i, pix_i, grid_i, cast_dtype=torch.float16)  # fp16 (proposed)
+        if hf_bf16 is None or hf_fp32 is None or hf_fp16 is None:
             _log("[FORWARD] sdpa forward failed; skipping seq")
             continue
 
@@ -254,41 +256,40 @@ def main():
         # seq). If only image-adjacent/response diverge -> multimodal-data specific.
         if f_full is not None and f_full.numel() >= L - 1:
             n2 = L - 1
-            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()  # fp32-HF-sdpa   vs bf16-FSDP
-            d_bf = (hf_bf16[:n2].float() - f_full[:n2].float()).abs()  # bf16-HF-sdpa   vs bf16-FSDP
-            # bf16-HF-FLASH vs bf16-FSDP == exactly verl's config (bf16 + flash_attn). If THIS collapses
-            # to ~0 while d_bf(sdpa) stays 0.09 -> the gap was sdpa-vs-flash attention accumulation.
-            d_fl = (hf_flash[:n2].float() - f_full[:n2].float()).abs() if hf_flash is not None else None
+            d_all = (hf_fp32[:n2].float() - f_full[:n2].float()).abs()  # fp32-HF vs bf16-FSDP
+            d_bf = (hf_bf16[:n2].float() - f_full[:n2].float()).abs()  # bf16-HF vs bf16-FSDP
+            # PRECISION error vs the fp32 "truth" (same model+input+attention, ONLY compute dtype changes).
+            # THE fp16 test: if fp16's error vs truth << bf16's, fp16 preserves the distribution -> if we
+            # move BOTH train+infer to fp16, they'd both stay near truth => match each other => mismatch fixed.
+            err_bf = (hf_bf16[:n2].float() - hf_fp32[:n2].float()).abs()  # bf16 error vs fp32-truth
+            err_16 = (hf_fp16[:n2].float() - hf_fp32[:n2].float()).abs()  # fp16 error vs fp32-truth
             nxt = ids_i[1 : n2 + 1].cpu()  # token predicted at each position p (= ids[p+1])
             is_img = (nxt == image_token_id) if image_token_id is not None else torch.zeros(n2, dtype=torch.bool)
             posn = torch.arange(n2)
             is_resp = posn >= (prompt_len - 1)
-            # first image position -> tokens BEFORE it are pure text with NO image in context (the
-            # cleanest test of forward correctness, independent of any image handling).
             imgpos = is_img.nonzero().flatten()
             first_img = int(imgpos[0]) if imgpos.numel() else n2
             is_pre = (posn < first_img) & (~is_img)  # pure text, no image seen yet
-            is_post = (~is_img) & (~is_resp) & (posn >= first_img)  # prompt text AFTER image (attends to it)
+            is_post = (~is_img) & (~is_resp) & (posn >= first_img)
+            unc_all = (hf_fp32[:n2].abs() > 1.0) & (~is_img)  # high-entropy tokens (sampled prob < e^-1)
 
             def _rm(msk, dv=d_all):
                 return dv[msk].mean().item() if bool(msk.any()) else float("nan")
 
             _log(
-                f"[REGION] mean|Δ| FSDP-vs-HF(fp32-sdpa/bf16-sdpa): "
+                f"[REGION] mean|Δ| FSDP-vs-HF(fp32/bf16): "
                 f"pre_text={_rm(is_pre, d_all):.4f}/{_rm(is_pre, d_bf):.4f}(n={int(is_pre.sum())}) "
                 f"post_text={_rm(is_post, d_all):.4f}/{_rm(is_post, d_bf):.4f}(n={int(is_post.sum())}) "
                 f"response={_rm(is_resp & ~is_img, d_all):.4f}/{_rm(is_resp & ~is_img, d_bf):.4f}"
             )
-            if d_fl is not None:
-                _log(
-                    f"[REGION-FLASH] mean|Δ| FSDP-vs-HF(bf16-FLASH == verl config): "
-                    f"pre_text={_rm(is_pre, d_fl):.4f}(n={int(is_pre.sum())}) "
-                    f"post_text={_rm(is_post, d_fl):.4f} "
-                    f"response={_rm(is_resp & ~is_img, d_fl):.4f} "
-                    f"-- if pre_text ~0 (vs sdpa 0.09), the gap is sdpa-vs-flash attention accumulation"
-                )
-            else:
-                _log("[REGION-FLASH] flash model unavailable (flash-attn not installed?)")
+            # === THE FP16 TEST: does fp16 track the fp32 truth far better than bf16? ===
+            _log(
+                f"[FP16-TEST seq{si}] |HF_x - HF_fp32truth| (same forward, only precision differs): "
+                f"ALL_txt bf16={_rm(~is_img, err_bf):.4f} fp16={_rm(~is_img, err_16):.4f} | "
+                f"UNCERTAIN(n={int(unc_all.sum())}) bf16={_rm(unc_all, err_bf):.4f} fp16={_rm(unc_all, err_16):.4f} | "
+                f"MAX_token bf16={err_bf[~is_img].max().item():.3f} fp16={err_16[~is_img].max().item():.3f}  "
+                f"[fp16<<bf16 => fp16 preserves precision]"
+            )
 
             # Comprehensive characterization of the PURE-TEXT (pre-image) FSDP-vs-HFfp32 gap: signed
             # stats (constant offset?), OLS FSDP~a*HF+b (scaling?), split by token confidence, and raw
@@ -313,23 +314,15 @@ def main():
                     f"|Δ|@confident={d_all[:n2][pi][conf].mean().item() if bool(conf.any()) else float('nan'):.4f} "
                     f"|Δ|@uncertain={d_all[:n2][pi][unc].mean().item() if bool(unc.any()) else float('nan'):.4f}"
                 )
-                # first 12 pre-text tokens IN ORDER (sanity: is pos0 broken? constant offset?)
-                _log("[PRETEXT first-12] pos | FSDP    HFfp32   HFbf16   Δ(F-Hf32) | prev->pred")
-                for p in pi[:12].tolist():
-                    _log(
-                        f"   {p:4d} | {f_full[p].item():+.4f} {hf_fp32[p].item():+.4f} {hf_bf16[p].item():+.4f} "
-                        f"{(f_full[p] - hf_fp32[p]).item():+.4f} | "
-                        f"{processor.tokenizer.decode([int(ids_i[p].item())])!r}->"
-                        f"{processor.tokenizer.decode([int(nxt[p])])!r}"
-                    )
-                # worst 12 pre-text tokens
+                # worst-12 pre-text tokens by FSDP-vs-fp32truth: show fp32/bf16/fp16 + per-token bf16-err
+                # vs fp16-err, so you can SEE fp16 tracking the truth token-by-token where bf16 doesn't.
                 worst = pi[torch.argsort(d_all[:n2][pi], descending=True)[:12]]
-                _log("[PRETEXT worst-12] pos | FSDP    HFfp32   HFbf16   Δ(F-Hf32) | prev->pred")
+                _log("[PRETEXT worst-12] pos | FSDP    fp32    bf16    fp16   | bf16err fp16err | pred")
                 for p in worst.tolist():
                     _log(
-                        f"   {p:4d} | {f_full[p].item():+.4f} {hf_fp32[p].item():+.4f} {hf_bf16[p].item():+.4f} "
-                        f"{(f_full[p] - hf_fp32[p]).item():+.4f} | "
-                        f"{processor.tokenizer.decode([int(ids_i[p].item())])!r}->"
+                        f"   {p:4d} | {f_full[p].item():+.3f} {hf_fp32[p].item():+.3f} {hf_bf16[p].item():+.3f} "
+                        f"{hf_fp16[p].item():+.3f} | {(hf_bf16[p] - hf_fp32[p]).abs().item():.3f}   "
+                        f"{(hf_fp16[p] - hf_fp32[p]).abs().item():.3f}   | "
                         f"{processor.tokenizer.decode([int(nxt[p])])!r}"
                     )
 
@@ -346,6 +339,15 @@ def main():
             return x[:n][msk[:n]]
 
         hf32_m, hf16_m, fsdp_m, v_m = _sel(hf32_r, mask), _sel(hf16_r, mask), _sel(fsdp_r, mask), _sel(v, mask)
+        hf16fp16_m = _sel(hf_fp16[lo:hi], mask)  # fp16 logp on response tokens
+        # accumulate aligned response tokens for the final precision matrix (all same length/tokens)
+        if all(x is not None for x in (hf32_m, hf16_m, hf16fp16_m, fsdp_m, v_m)):
+            mlen = min(hf32_m.numel(), hf16_m.numel(), hf16fp16_m.numel(), fsdp_m.numel(), v_m.numel())
+            ACC["hf32"].append(hf32_m[:mlen])
+            ACC["hf16"].append(hf16_m[:mlen])
+            ACC["hffp16"].append(hf16fp16_m[:mlen])
+            ACC["fsdp"].append(fsdp_m[:mlen])
+            ACC["vllm"].append(v_m[:mlen])
 
         def _mad(a, ref):
             if a is None or ref is None:
@@ -367,28 +369,113 @@ def main():
             # bf16 self-swing: |HF-bf16 - HF-fp32| per token. Same (even if wrong) image, so this cleanly
             # measures how bf16-SENSITIVE each token's logp is, independent of reconstruction errors.
             # If the vLLM-FSDP gap tracks this bf16 swing -> the divergence is bf16 numerical (ROOT A).
-            if hf16_m is not None and hf32_m is not None:
-                nb = min(n, hf16_m.numel(), hf32_m.numel())
-                bf16sw_all = (hf16_m[:nb].float() - hf32_m[:nb].float()).abs()
-                max_bf16sw = float(bf16sw_all.max()) if nb else float("nan")
-            else:
-                bf16sw_all, max_bf16sw = None, float("nan")
+            # per-token precision error vs fp32-truth: bf16 vs fp16. If fp16swing << bf16swing on the
+            # mask-driving tokens, fp16 removes exactly the noise that trips the RS mask.
+            nb = min(n, hf16_m.numel(), hf32_m.numel()) if (hf16_m is not None and hf32_m is not None) else 0
+            bf16sw_all = (hf16_m[:nb].float() - hf32_m[:nb].float()).abs() if nb else None
+            fp16sw_all = (
+                (hf16fp16_m[:nb].float() - hf32_m[:nb].float()).abs()
+                if (nb and hf16fp16_m is not None and hf16fp16_m.numel() >= nb)
+                else None
+            )
             _log(
                 f"[VF] vLLM-vs-FSDP over {n} resp tok: mean|Δ|={vf.abs().mean():.4f} max|Δ|={vf.abs().max():.4f} "
                 f"seq_mean_k3={k3.mean():.5f} (mask@0.005 -> {'MASKED' if k3.mean() > 0.005 else 'kept'}) "
-                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())} | pure-bf16 max_swing={max_bf16sw:.4f}"
+                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())} | "
+                f"max_swing vs fp32-truth: bf16={bf16sw_all.max().item() if bf16sw_all is not None else float('nan'):.3f} "
+                f"fp16={fp16sw_all.max().item() if fp16sw_all is not None else float('nan'):.3f}"
             )
             order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
-            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP    Δ(v-f)   k3   bf16swing | decoded")
+            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP    Δ(v-f)   k3  | bf16swing fp16swing | decoded")
             for j in order.tolist():
                 tid = int(ids_m[j].item()) if (ids_m is not None and j < ids_m.numel()) else -1
                 txt = processor.tokenizer.decode([tid]) if tid >= 0 else "?"
                 bsw = bf16sw_all[j].item() if (bf16sw_all is not None and j < bf16sw_all.numel()) else float("nan")
+                fsw = fp16sw_all[j].item() if (fp16sw_all is not None and j < fp16sw_all.numel()) else float("nan")
                 _log(
                     f"   id={tid:6d} | {v_m[j].item():+.3f}  {fsdp_m[j].item():+.3f}  "
-                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  {bsw:.3f} | {txt!r}"
+                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  | {bsw:.3f}    {fsw:.3f}   | {txt!r}"
                 )
+
+    # ---- SYNTHETIC PURE-TEXT case: run HF fp32/fp16/bf16 on a plain paragraph (no images) ----
+    text = (
+        "Reinforcement learning fine-tunes a policy by sampling trajectories, scoring them with a reward, "
+        "and increasing the probability of high-reward actions. In practice the rollout engine and the "
+        "training engine can disagree on token log-probabilities because of floating point rounding, which "
+        "turns nominally on-policy updates into biased off-policy ones. The larger the mantissa, the smaller "
+        "this disagreement becomes, so the choice of numeric format matters a great deal for stability."
+    )
+    txt_stats = None
+    try:
+        tids = processor.tokenizer(text, return_tensors="pt").input_ids[0].to(device)
+        t32 = _hf_logp(model_sdpa, tids, None, None, cast_dtype=torch.float32)
+        t16 = _hf_logp(model_sdpa, tids, None, None, cast_dtype=torch.float16)
+        tbf = _hf_logp(model_sdpa, tids, None, None)
+        if t32 is not None and t16 is not None and tbf is not None:
+            uncm = t32.abs() > 1.0  # high-entropy text tokens
+            txt_stats = {
+                "bf16_all": (tbf - t32).abs().mean().item(),
+                "fp16_all": (t16 - t32).abs().mean().item(),
+                "bf16_unc": (tbf - t32).abs()[uncm].mean().item() if bool(uncm.any()) else float("nan"),
+                "fp16_unc": (t16 - t32).abs()[uncm].mean().item() if bool(uncm.any()) else float("nan"),
+                "bf16_max": (tbf - t32).abs().max().item(),
+                "fp16_max": (t16 - t32).abs().max().item(),
+                "n": int(tids.numel()),
+                "n_unc": int(uncm.sum()),
+            }
+    except Exception as e:  # noqa: BLE001
+        _log(f"[TEXT] synthetic-text forward failed ({e!r})")
+
+    # ---- FINAL PRECISION MATRIX: deviation from HF-fp32 "truth" ----
+    _log("\n" + "=" * 78)
+    _log("=== PRECISION MATRIX: mean |logp - HF_fp32_truth| (lower = closer to truth) ===")
+    _log("    Engine/precision      | image-data(resp)           | text-data(synthetic)")
+    _log("                          | ALL      UNCERTAIN   MAXtok | ALL      UNCERTAIN   MAXtok")
+
+    def _fmt(a, ref, mask=None):
+        if a is None or ref is None:
+            return "  n/a  "
+        d = (a.float() - ref.float()).abs()
+        if mask is not None:
+            d = d[mask]
+        return f"{d.mean().item():.4f}" if d.numel() else "  n/a  "
+
+    if ACC["hf32"]:
+        H32 = torch.cat(ACC["hf32"])
+        H16 = torch.cat(ACC["hf16"])
+        HF16 = torch.cat(ACC["hffp16"])
+        FS = torch.cat(ACC["fsdp"])
+        VL = torch.cat(ACC["vllm"])
+        um = H32.abs() > 1.0  # high-entropy image-response tokens
+        img_n, img_unc = H32.numel(), int(um.sum())
+
+        def row(name, arr, tstats_key=None):
+            iall = _fmt(arr, H32)
+            iunc = _fmt(arr, H32, um)
+            imax = f"{(arr.float() - H32.float()).abs().max().item():.3f}" if arr is not None else " n/a "
+            if tstats_key and txt_stats:
+                tall = f"{txt_stats[tstats_key + '_all']:.4f}"
+                tunc = f"{txt_stats[tstats_key + '_unc']:.4f}"
+                tmax = f"{txt_stats[tstats_key + '_max']:.3f}"
+            else:
+                tall = tunc = tmax = " n/a "
+            _log(f"    {name:21s} | {iall}   {iunc}    {imax}  | {tall}   {tunc}    {tmax}")
+
+        _log(f"    (image n={img_n}, uncertain={img_unc}; text n={txt_stats['n'] if txt_stats else '?'}, "
+             f"uncertain={txt_stats['n_unc'] if txt_stats else '?'})")
+        row("HF-fp32 (truth)", H32, None)  # 0 by definition
+        row("HF-fp16", HF16, "fp16")
+        row("HF-bf16", H16, "bf16")
+        row("FSDP-bf16 (bundle)", FS, None)
+        row("vLLM-bf16 (bundle)", VL, None)
+        _log("    ------------------------------------------------------------------")
+        _log("    NOTE: FSDP/vLLM only exist at bf16 here (that's what training ran). Their fp16/fp32")
+        _log("    rows need a real engine rerun; the HF fp16-vs-bf16 gap PREDICTS them. fp32 is")
+        _log("    infeasible in flash-attn/vLLM -> it's only the reference 'truth', not a runnable config.")
+    else:
+        _log("    (no accumulated tokens)")
+    _log("=" * 78)
 
     _log(
         "\n=== VERDICT GUIDE ===\n"
