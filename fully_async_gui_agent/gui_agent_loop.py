@@ -596,14 +596,6 @@ class GUIAgentLoop(AgentLoopBase):
                     None,
                     lambda ids=response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
                 )
-                # Print the model's raw output (only tens of tokens) for the train<->infer gap hunt.
-                # Gated so it doesn't flood; enable with GUI_LOG_MODEL_OUTPUT=1.
-                if os.getenv("GUI_LOG_MODEL_OUTPUT", "0") not in ("0", "false", "False", ""):
-                    print(
-                        f"[MODEL_OUTPUT] {log_tag}[turn={turn}] resp_ids={len(response_ids)} "
-                        f"text={assistant_text!r}",
-                        flush=True,
-                    )
                 low_level_instruction = self._extract_low_level_instruction(
                     assistant_text, fallback_action=actions[0] if actions else None
                 )
