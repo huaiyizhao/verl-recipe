@@ -360,42 +360,48 @@ def main():
         _log(f"   FSDP-train vs HF-fp32: {_mad(fsdp_m, hf32_m):.4f}   (HF unreliable at image tokens)")
         _log(f"   vLLM      vs HF-fp32 : {_mad(v_m, hf32_m):.4f}   (HF unreliable at image tokens)")
 
-        # THE REAL QUESTION: where do vLLM(gen) and FSDP(recompute) — both REAL — diverge? That per-token
-        # k3 is exactly what the RS mask thresholds on (seq-mean k3 > 0.005 -> whole sequence masked).
+        # THE REAL QUESTION: where do vLLM(gen) and FSDP(recompute) diverge? That per-token k3 is what
+        # the RS mask thresholds on (seq-mean k3 > 0.005 -> whole sequence masked). AND: is vLLM or FSDP
+        # the outlier? FSDP and HF-bf16 are BOTH `transformers` (packed-flash vs unpacked-sdpa); vLLM is
+        # its OWN impl. All bf16. If |FSDP-HFbf16| << |vLLM-HFbf16| -> the two transformers forwards agree
+        # and vLLM is the outlier (impl/version). If the reverse -> FSDP's packed path is the outlier.
         if v_m is not None and fsdp_m is not None:
             n = min(v_m.numel(), fsdp_m.numel())
             vf = v_m[:n].float() - fsdp_m[:n].float()
             k3 = (torch.exp(vf.clamp(-20, 20)) - 1.0 - vf).abs()
-            # bf16 self-swing: |HF-bf16 - HF-fp32| per token. Same (even if wrong) image, so this cleanly
-            # measures how bf16-SENSITIVE each token's logp is, independent of reconstruction errors.
-            # If the vLLM-FSDP gap tracks this bf16 swing -> the divergence is bf16 numerical (ROOT A).
-            # per-token precision error vs fp32-truth: bf16 vs fp16. If fp16swing << bf16swing on the
-            # mask-driving tokens, fp16 removes exactly the noise that trips the RS mask.
-            nb = min(n, hf16_m.numel(), hf32_m.numel()) if (hf16_m is not None and hf32_m is not None) else 0
-            bf16sw_all = (hf16_m[:nb].float() - hf32_m[:nb].float()).abs() if nb else None
-            fp16sw_all = (
-                (hf16fp16_m[:nb].float() - hf32_m[:nb].float()).abs()
-                if (nb and hf16fp16_m is not None and hf16fp16_m.numel() >= nb)
-                else None
-            )
+            hi = vf.abs() > 0.1  # the mask-driving (diverging) tokens
+
+            def _m2(a, b, msk=None):
+                if a is None or b is None:
+                    return float("nan")
+                m = min(a.numel(), b.numel())
+                d = (a[:m].float() - b[:m].float()).abs()
+                if msk is not None:
+                    d = d[msk[:m]]
+                return d.mean().item() if d.numel() else float("nan")
+
             _log(
                 f"[VF] vLLM-vs-FSDP over {n} resp tok: mean|Δ|={vf.abs().mean():.4f} max|Δ|={vf.abs().max():.4f} "
                 f"seq_mean_k3={k3.mean():.5f} (mask@0.005 -> {'MASKED' if k3.mean() > 0.005 else 'kept'}) "
-                f"n(|Δ|>0.1)={int((vf.abs() > 0.1).sum())} | "
-                f"max_swing vs fp32-truth: bf16={bf16sw_all.max().item() if bf16sw_all is not None else float('nan'):.3f} "
-                f"fp16={fp16sw_all.max().item() if fp16sw_all is not None else float('nan'):.3f}"
+                f"n(|Δ|>0.1)={int(hi.sum())}"
+            )
+            _log(
+                f"[IMPL-TEST] both bf16, vs HF-bf16(=transformers): "
+                f"ALL FSDP-vs-HFbf16={_m2(fsdp_m, hf16_m):.4f} vLLM-vs-HFbf16={_m2(v_m, hf16_m):.4f} | "
+                f"on |Δ|>0.1: FSDP-vs-HFbf16={_m2(fsdp_m, hf16_m, hi):.4f} vLLM-vs-HFbf16={_m2(v_m, hf16_m, hi):.4f} "
+                f"[the BIGGER one is the outlier vs transformers]"
             )
             order = torch.argsort(vf.abs(), descending=True)[: args.worst_k]
             ids_m = _sel(resp_ids.float(), mask).long() if resp_ids is not None else None
-            _log("[WORST vLLM-FSDP] token |  vLLM    FSDP    Δ(v-f)   k3  | bf16swing fp16swing | decoded")
+            _log("[WORST vLLM-FSDP] token |  vLLM     FSDP    HFbf16   HFfp32 | Δ(v-f)   k3   | decoded")
             for j in order.tolist():
                 tid = int(ids_m[j].item()) if (ids_m is not None and j < ids_m.numel()) else -1
                 txt = processor.tokenizer.decode([tid]) if tid >= 0 else "?"
-                bsw = bf16sw_all[j].item() if (bf16sw_all is not None and j < bf16sw_all.numel()) else float("nan")
-                fsw = fp16sw_all[j].item() if (fp16sw_all is not None and j < fp16sw_all.numel()) else float("nan")
+                hb = hf16_m[j].item() if (hf16_m is not None and j < hf16_m.numel()) else float("nan")
+                hf = hf32_m[j].item() if (hf32_m is not None and j < hf32_m.numel()) else float("nan")
                 _log(
-                    f"   id={tid:6d} | {v_m[j].item():+.3f}  {fsdp_m[j].item():+.3f}  "
-                    f"{vf[j].item():+.3f}  {k3[j].item():.3f}  | {bsw:.3f}    {fsw:.3f}   | {txt!r}"
+                    f"   id={tid:6d} | {v_m[j].item():+.3f}  {fsdp_m[j].item():+.3f}  {hb:+.3f}  {hf:+.3f} "
+                    f"| {vf[j].item():+.3f}  {k3[j].item():.3f} | {txt!r}"
                 )
 
     # ---- SYNTHETIC PURE-TEXT case: run HF fp32/fp16/bf16 on a plain paragraph (no images) ----
