@@ -190,8 +190,28 @@ def main():
         pixel_values = proc["pixel_values"]
         image_grid_thw = proc["image_grid_thw"]
         _pixel_stats("microbench-clean", pixel_values)
-        # vLLM generate on the same raw image
-        out = llm.generate([{"prompt": prompt_text, "multi_modal_data": {"image": img}}], sp)[0].outputs[0]
+        # vLLM generate on the same raw image (keep the full RequestOutput to read vLLM's own prompt)
+        vout = llm.generate([{"prompt": prompt_text, "multi_modal_data": {"image": img}}], sp)[0]
+        out = vout.outputs[0]
+
+        # PREPROCESSING vs ENCODER discriminator: compare how many image tokens each side expanded the
+        # picture into. HF uses `processor`; vLLM does its OWN preprocessing (smart_resize/patchify). If
+        # the counts differ, vLLM fed the vision tower a DIFFERENT-resolution image -> the gap is (at
+        # least partly) PREPROCESSING and is fixable by aligning the mm config (min/max pixels). If the
+        # counts MATCH but the logp gap stays, pixels agree -> the gap is the vision ENCODER numerics.
+        img_tok_id = getattr(processor, "image_token_id", None)
+        if img_tok_id is None:
+            img_tok_id = getattr(hf.config, "image_token_id", None)
+        n_img_hf = int((prompt_ids == img_tok_id).sum()) if img_tok_id is not None else -1
+        vllm_prompt_ids = list(vout.prompt_token_ids) if getattr(vout, "prompt_token_ids", None) else []
+        n_img_vllm = sum(1 for t in vllm_prompt_ids if t == img_tok_id) if img_tok_id is not None else -1
+        _p(
+            f"[IMG-TOKENS] HF processor={n_img_hf}  vLLM={n_img_vllm}  match={n_img_hf == n_img_vllm}  "
+            f"| pixel_values patches={pixel_values.shape[0]} (n_tokens=patches/merge^2); "
+            f"vLLM_prompt_len={len(vllm_prompt_ids)} HF_prompt_len={prompt_ids.numel()}  "
+            f"{'<- MISMATCH => vLLM preprocessing differs (resolution/resize)' if n_img_hf != n_img_vllm else '<- counts match => preprocessing same, gap is encoder numerics'}"
+        )
+
         gen_ids = list(out.token_ids)
         vllm_lp = [out.logprobs[i][gen_ids[i]].logprob for i in range(len(gen_ids))]
         full = torch.cat([prompt_ids, torch.tensor(gen_ids, dtype=prompt_ids.dtype)])
@@ -206,10 +226,10 @@ def main():
     if "IMAGE" in results:
         imean, imax = results["IMAGE"]
         _p(f"IMAGE: mean_abs_d={imean:.4f} max_abs_d={imax:.4f}")
-        if tmean < 0.02 and imean > 3 * max(tmean, 1e-6):
+        if tmean < 0.1 and imean > 3 * max(tmean, 1e-6):
             _p(">> VISION path: text agrees, image diverges -> the gap is driven by the image/vision forward.")
-        elif tmean > 0.05:
-            _p(">> GENERAL numerics: text ALSO diverges -> attention backend / mrope / logit-scale, NOT vision.")
+        elif imean < 2 * max(tmean, 1e-6):
+            _p(">> GENERAL numerics: image ~ text -> attention backend / mrope / logit-scale, NOT vision.")
         else:
             _p(">> Inconclusive: compare magnitudes above; also compare IMAGE(here) vs the pipeline LOGPROB_GAP.")
     else:
