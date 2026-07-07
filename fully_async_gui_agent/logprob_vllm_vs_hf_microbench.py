@@ -273,6 +273,181 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
     _p("        aren't being applied (check the [VERL-PATCH] line and the position_ids shape print).")
 
 
+def _run_prove_positions(path, hf, processor, tokenizer, device):
+    """PROOF that v1's train<->infer gap is MRoPE position_ids computed WITHOUT mm_token_type_ids.
+    For each dumped seq: recompute position_ids the ASYNC way (verl.utils.model.compute_vlm_position_ids,
+    which builds mm_token_type_ids) and the V1 way (agent_loop._compute_position_ids logic: get_rope_index
+    WITHOUT mm_token_type_ids), compare BOTH to the DUMPED ground-truth positions (what training used, which
+    matched vLLM at 0.01). Then feed each to HF and print |A-C|. Expect: async-way == dump (|A-C|~0.006),
+    v1-way != dump (|A-C|~0.28)."""
+    b = torch.load(path, map_location="cpu", weights_only=False)
+    ii = b.get("input_ids")
+    n_seq = len(ii["offsets"]) - 1 if isinstance(ii, dict) else (ii.shape[0] if torch.is_tensor(ii) else 0)
+
+    def _seq(name, i):
+        v = b.get(name)
+        if v is None:
+            return None
+        if isinstance(v, dict) and "values" in v:
+            off = v["offsets"].tolist()
+            return v["values"][off[i]:off[i + 1]]
+        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[0] == n_seq:
+            return v[i]
+        return None
+
+    def _seq_pos(i):
+        v = b.get("position_ids")
+        if isinstance(v, dict) and "values" in v:
+            vv, off = v["values"], v["offsets"].tolist()
+            if vv.dim() == 2 and vv.shape[0] in (3, 4):
+                return vv[:, off[i]:off[i + 1]]
+        return None
+
+    def _norm(p):  # -> (channels, L) cpu long
+        if p is None:
+            return None
+        p = p.detach().cpu().long()
+        if p.dim() == 3:
+            p = p[:, 0] if p.shape[1] == 1 else p.reshape(p.shape[0], -1)
+        return p
+
+    # bind get_rope_index (verl normally binds the model's onto the processor)
+    grf = getattr(processor, "get_rope_index", None)
+    if grf is None:
+        m = getattr(hf, "model", hf)
+        grf = getattr(m, "get_rope_index", None) or getattr(hf, "get_rope_index", None)
+        if grf is not None:
+            processor.get_rope_index = grf
+    _p(f"[PROVE] get_rope_index bound on processor: {grf is not None}")
+    try:
+        from verl.utils.model import compute_vlm_position_ids
+    except Exception as e:  # noqa: BLE001
+        _p(f"[PROVE] cannot import compute_vlm_position_ids ({e!r})")
+        compute_vlm_position_ids = None
+
+    image_token_id = getattr(processor, "image_token_id", None)
+    merge = processor.image_processor.merge_size
+    grid_all, pix_all = b.get("image_grid_thw"), b.get("pixel_values")
+    img_cursor = patch_cursor = 0
+
+    for i in range(min(n_seq, 2)):  # first 2 seqs is enough to prove
+        ids_i = _seq("input_ids", i).long()
+        L = ids_i.numel()
+        ids2 = ids_i.unsqueeze(0).to(device)
+        attn = torch.ones((1, L), dtype=torch.long, device=device)
+        pd = _norm(_seq_pos(i))
+        n_img_tok = int((ids_i == image_token_id).sum()) if image_token_id is not None else 0
+        seq_grids, seq_pix, consumed = [], [], 0
+        while grid_all is not None and img_cursor < grid_all.shape[0] and consumed < n_img_tok:
+            g = grid_all[img_cursor]
+            patches = int(g[0] * g[1] * g[2])
+            seq_grids.append(g)
+            if pix_all is not None:
+                seq_pix.append(pix_all[patch_cursor:patch_cursor + patches])
+            patch_cursor += patches
+            consumed += patches // (merge * merge)
+            img_cursor += 1
+        grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
+        pix_i = torch.cat(seq_pix).to(device) if seq_pix else None
+        _p(f"\n[PROVE] ===== seq{i} L={L} n_img_tok={n_img_tok} grids={len(seq_grids)} =====")
+        if grid_i is None:
+            _p("[PROVE] no image grid for this seq; skipping")
+            continue
+
+        # V1 WAY: get_rope_index WITHOUT mm_token_type_ids, then prepend text axis (verbatim v1 logic)
+        pv = None
+        try:
+            vp, _ = grf(input_ids=ids2, attention_mask=attn, image_grid_thw=grid_i)
+            vp = vp.transpose(0, 1)  # (3,1,L) -> (1,3,L) as v1 does
+            textp = torch.ones((1, L), dtype=torch.long, device=vp.device)
+            textp[0] = torch.arange(L, device=vp.device)
+            textp = textp.unsqueeze(0)  # (1,1,L)
+            pv = _norm(torch.cat((textp, vp), dim=1))  # (4, L)
+        except Exception as e:  # noqa: BLE001
+            _p(f"[PROVE] v1-way get_rope_index failed: {e!r}")
+
+        # V1 MARK-ALL WAY: get_rope_index WITH mm_token_type_ids that marks ALL image_token positions
+        # (verbatim v1 agent_loop.py:991), vs async which marks only grid-budget tokens.
+        pm = None
+        try:
+            mmtt = torch.zeros_like(ids2)
+            if image_token_id is not None:
+                mmtt[0][ids2[0] == image_token_id] = 1
+            vp2, _ = grf(input_ids=ids2, attention_mask=attn, image_grid_thw=grid_i, mm_token_type_ids=mmtt)
+            vp2 = vp2.transpose(0, 1)
+            textp2 = torch.ones((1, L), dtype=torch.long, device=vp2.device)
+            textp2[0] = torch.arange(L, device=vp2.device)
+            pm = _norm(torch.cat((textp2.unsqueeze(0), vp2), dim=1))
+        except Exception as e:  # noqa: BLE001
+            _p(f"[PROVE] v1-markall get_rope_index failed: {e!r}")
+
+        # ASYNC WAY: compute_vlm_position_ids (builds mm_token_type_ids by grid budget)
+        pa = None
+        if compute_vlm_position_ids is not None:
+            try:
+                pa = _norm(compute_vlm_position_ids(processor, ids2.cpu(), attn.cpu(), {"image_grid_thw": grid_i.cpu()}))
+            except Exception as e:  # noqa: BLE001
+                _p(f"[PROVE] async-way failed: {e!r}")
+
+        def _cmp(name, x):
+            if x is None or pd is None:
+                _p(f"[PROVE] seq{i} {name}: n/a (x={x is not None}, dump={pd is not None})")
+                return
+            k = min(x.shape[-1], pd.shape[-1])
+            d = (x[:, :k] - pd[:, :k]).abs()
+            per_ch = d.max(dim=1).values.tolist()
+            nmis = int((d.sum(0) > 0).sum())
+            _p(f"[PROVE] {name:10s} vs DUMP: identical={nmis == 0} max_abs_per_channel(t,h,w,+)={per_ch} "
+               f"mismatch_positions={nmis}/{k}")
+            return nmis
+
+        _cmp("async(budget)", pa)
+        _cmp("v1-markall", pm)
+        nmis_v1 = _cmp("v1-no-mmtt", pv)
+        # show the FIRST divergent window so we can see the nature of the error
+        if pv is not None and pd is not None and nmis_v1:
+            d = (pv[:, :pd.shape[-1]] - pd[:, :pv.shape[-1]]).abs().sum(0)
+            first = int((d > 0).nonzero(as_tuple=True)[0][0])
+            w0, w1 = max(0, first - 1), min(pd.shape[-1], first + 5)
+            _p(f"[PROVE] first mismatch at pos {first}; window [{w0}:{w1}] (channels = text,t,h,w):")
+            _p(f"[PROVE]   DUMP  =\n{pd[:, w0:w1]}")
+            _p(f"[PROVE]   v1    =\n{pv[:, w0:w1]}")
+
+        # feed each to HF and show |A - C|
+        A = _seq("old_log_probs", i)
+        rm = _seq("response_mask", i)
+        if A is None:
+            continue
+        A = A.float().reshape(-1)
+        rm = rm.reshape(-1).bool() if rm is not None else None
+        rv = int(rm.sum()) if rm is not None else A.numel()
+        Av = A[rm] if (rm is not None and rm.numel() == A.numel()) else A[:rv]
+
+        def _hf_ac(tag, pos):
+            if pos is None:
+                return
+            with torch.no_grad():
+                kw = {"input_ids": ids2, "use_cache": False, "position_ids": pos.to(device).unsqueeze(1)}
+                if pix_i is not None:
+                    kw["pixel_values"] = pix_i.to(hf.dtype)
+                    kw["image_grid_thw"] = grid_i
+                lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
+            C = torch.tensor([float(lp[L - rv + j - 1, int(ids_i[L - rv + j])]) for j in range(rv)])
+            k = min(C.numel(), Av.numel())
+            d = (Av[:k].cpu() - C[:k]).abs()
+            m = torch.isfinite(d)
+            _p(f"[PROVE] |A-C| with {tag:10s} positions: mean={d[m].mean():.4f} max={d[m].max():.4f}")
+
+        _hf_ac("DUMP", pd)
+        _hf_ac("async(budget)", pa)
+        _hf_ac("v1-markall", pm)
+        _hf_ac("v1-no-mmtt", pv)
+    _p("\n[PROVE] READ: whichever variant == DUMP and gives |A-C|~0.006 is what training/vLLM use; whichever")
+    _p("[PROVE] differs from DUMP and gives |A-C|~0.28 is the v1 bug. mm_token_type_ids IS emitted by the")
+    _p("[PROVE] processor and REQUIRED by get_rope_index -> the divergence is HOW it's (re)built, not a")
+    _p("[PROVE] processor bug. Compare async(grid-budget) vs v1-markall(all image tokens) vs v1-no-mmtt.")
+
+
 def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_mem):
     """Load a ROLLOUT probe (raw images + tokens + recorded vLLM logprobs) and 3-way compare per response
     token: A=recorded-vLLM (as the async run stored it), C=fresh-HF, D=fresh-vLLM (recomputed here on the
@@ -442,6 +617,10 @@ def main():
     ap.add_argument("--no-position-ids", dest="feed_pos", action="store_false", default=True,
                     help="ASYNC-BUNDLE: do NOT feed the dumped training position_ids to HF (let HF recompute "
                     "MRoPE itself). Use to isolate whether position_ids (not the patch) closes the |B-C| gap.")
+    ap.add_argument("--prove-positions", dest="prove_positions", default=None,
+                    help="Path to the async .pt bundle. PROVE the root cause: recompute position_ids the ASYNC "
+                    "way (with mm_token_type_ids) and the V1 way (without) and compare BOTH to the dumped "
+                    "ground-truth positions; then feed each to HF and show |A-C|. Shows exactly where v1 diverges.")
     ap.add_argument("--gpu-mem", type=float, default=0.6, help="vLLM gpu_memory_utilization.")
     ap.add_argument("--dump", default=None, help="Optional probe .pt bundle -> report its train-side pixel stats.")
     ap.add_argument(
@@ -517,6 +696,17 @@ def main():
     # ---- BUNDLE MODES: run BOTH in one shot when given, then exit (no generation needed) -------------
     #   --async-bundle   : A=async-vLLM(old) / B=async-FSDP(fsdp) / C=fresh-HF   (HF only)
     #   --rollout-bundle : A=recorded-vLLM   / C=fresh-HF        / D=fresh-vLLM  (loads vLLM)
+    if args.prove_positions:
+        _p("\n################## PROVE-POSITIONS (async-way vs v1-way vs dumped ground truth) ##################")
+        try:
+            _run_prove_positions(args.prove_positions, hf, processor, tokenizer, device)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            _p(f"[PROVE] FAILED: {e!r}")
+            traceback.print_exc()
+        return
+
     if args.async_bundle or args.rollout_bundle:
         if args.async_bundle:
             _p("\n################## ASYNC-BUNDLE (A=async vLLM / B=async FSDP / C=fresh HF) ##################")
