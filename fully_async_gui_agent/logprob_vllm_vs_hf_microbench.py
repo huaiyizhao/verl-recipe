@@ -98,6 +98,69 @@ def _pixel_stats(tag, pv):
     )
 
 
+def _k3(ref_logp, other_logp):
+    """Per-token k3 approximate KL with tokens sampled from ref: exp(other-ref)-1-(other-ref)."""
+    n = min(ref_logp.numel(), other_logp.numel())
+    if n == 0:
+        return torch.empty(0, dtype=torch.float64)
+    ref = ref_logp[:n].to(torch.float64)
+    other = other_logp[:n].to(torch.float64)
+    d = (other - ref).clamp(-20, 20)
+    out = torch.exp(d) - 1.0 - d
+    return out[torch.isfinite(out)]
+
+
+def _k3_mean(ref_logp, other_logp):
+    v = _k3(ref_logp, other_logp)
+    return float(v.mean()) if v.numel() else float("nan")
+
+
+def _fmt(v):
+    return "nan" if not torch.isfinite(torch.tensor(v)) else f"{v:.5f}"
+
+
+def _print_k3_matrix(tag, seq_rows):
+    """Print seq-level pairwise k3 over whatever named logprob streams are available.
+
+    Label convention: K3(X||Y) means tokens are sampled from X and scored by Y, matching the
+    rollout-correction code path where d = logp_Y - logp_X.
+    """
+    pairs = [
+        ("A", "B"),
+        ("A", "C"),
+        ("A", "D"),
+        ("B", "C"),
+        ("B", "D"),
+        ("C", "D"),
+    ]
+    have_any = False
+    _p(f"\n[{tag}] ===== seq-level k3 approximate KL =====")
+    _p(f"[{tag}] convention: K3(X||Y)=mean(exp(logp_Y-logp_X)-1-(logp_Y-logp_X)) over response tokens")
+    for row in seq_rows:
+        vals = []
+        for a, b in pairs:
+            if row.get(a) is not None and row.get(b) is not None:
+                vals.append(f"K3({a}||{b})={_fmt(_k3_mean(row[a], row[b]))}")
+        if vals:
+            have_any = True
+            _p(f"[{tag}] seq{row['seq']} n={row['n']} " + " ".join(vals))
+    agg = {}
+    for a, b in pairs:
+        xs, ys = [], []
+        for row in seq_rows:
+            if row.get(a) is not None and row.get(b) is not None:
+                n = min(row[a].numel(), row[b].numel())
+                if n:
+                    xs.append(row[a][:n])
+                    ys.append(row[b][:n])
+        if xs:
+            agg[(a, b)] = _k3_mean(torch.cat(xs), torch.cat(ys))
+    if agg:
+        _p(f"[{tag}] aggregate " + " ".join(f"K3({a}||{b})={_fmt(v)}" for (a, b), v in agg.items()))
+    if not have_any:
+        _p(f"[{tag}] no pairwise streams available for k3")
+
+
 def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
     """Load an async-run probe bundle and 3-way compare, per response token:
         A = async's recorded old_log_probs  (vLLM, since bypass_mode sets old = rollout_log_probs)
@@ -171,6 +234,7 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
 
     img_cursor, patch_cursor = 0, 0
     accA, accB, accC = [], [], []
+    seq_rows = []
     for i in range(n_seq):
         ids_i = _seq("input_ids", i)
         if ids_i is None:
@@ -247,6 +311,16 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
         if Bm is not None:
             accB.append(Bm)
         accC.append(Cm)
+        seq_rows.append(
+            {
+                "seq": i,
+                "n": k,
+                "A": Am.detach().cpu() if Am is not None else None,
+                "B": Bm.detach().cpu() if Bm is not None else None,
+                "C": Cm.detach().cpu(),
+                "D": None,
+            }
+        )
         dab = (Am - Bm).abs().mean().item() if (Am is not None and Bm is not None) else float("nan")
         dac = (Am - Cm).abs().mean().item() if Am is not None else float("nan")
         dbc = (Bm - Cm).abs().mean().item() if Bm is not None else float("nan")
@@ -266,6 +340,9 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
     if B is not None:
         d = (B - C).abs()
         _p(f"  |B-C| async-FSDP vs FRESH-HF (sanity)  : mean={d.mean():.4f} max={d.max():.4f}")
+    _print_k3_matrix("ASYNC-BUNDLE", seq_rows)
+    _p("[ASYNC-BUNDLE] D=fresh-vLLM is not available from this bundle: it stores processed pixel_values, "
+       "not raw images. Use --rollout-bundle or dump raw images to compare D against A.")
     _p("  READ: with verl monkey_patch + the EXACT training position_ids fed, C reproduces training FSDP.")
     _p("        |B-C| ~0 => microbench == training FSDP; |A-C| ~0 => training vLLM == FSDP == microbench.")
     _p("        A ~0.28 gap only appears vs STOCK HF (no verl patch / wrong MRoPE positions) -> that was")
@@ -318,6 +395,17 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             p = p.transpose(0, 1)
         return p
 
+    def _add_text_axis_if_needed(p, L):
+        p = _norm(p)
+        if p is None or p.dim() != 2:
+            return p
+        if p.shape[0] == 4:
+            return p
+        if p.shape[0] == 3:
+            textp = torch.arange(L, dtype=torch.long).unsqueeze(0)
+            return torch.cat((textp, p), dim=0)
+        return p
+
     # bind get_rope_index (verl normally binds the model's onto the processor)
     grf = getattr(processor, "get_rope_index", None)
     if grf is None:
@@ -360,6 +448,85 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
         if grid_i is None:
             _p("[PROVE] no image grid for this seq; skipping")
             continue
+        grid_budget = int(((grid_i[:, 0] * grid_i[:, 1] * grid_i[:, 2]) // (merge * merge)).sum().item())
+        _p(f"[PROVE] image_token_count={n_img_tok} grid_budget_tokens={grid_budget} "
+           f"extra_image_tokens={max(0, n_img_tok - grid_budget)}")
+
+        def _capture_hf_recompute_positions():
+            """Run HF without explicit position_ids and capture any internal get_rope_index output."""
+            import inspect
+
+            calls = []
+            patched = []
+            seen = set()
+
+            def _summarize_mmtt(mmtt):
+                if mmtt is None:
+                    return "absent"
+                m = mmtt.detach().cpu()
+                vals = torch.unique(m)
+                counts = {int(v): int((m == v).sum()) for v in vals}
+                return f"shape={tuple(m.shape)} counts={counts}"
+
+            def _patch(obj_name, obj):
+                if obj is None or id(obj) in seen or not hasattr(obj, "get_rope_index"):
+                    return
+                seen.add(id(obj))
+                orig = getattr(obj, "get_rope_index")
+                try:
+                    sig = inspect.signature(orig)
+                except Exception:  # noqa: BLE001
+                    sig = None
+
+                def wrapped(*args, **kwargs):
+                    bound_args = {}
+                    if sig is not None:
+                        try:
+                            bound_args = dict(sig.bind_partial(*args, **kwargs).arguments)
+                        except Exception:  # noqa: BLE001
+                            bound_args = {}
+                    merged = dict(bound_args)
+                    merged.update(kwargs)
+                    out = orig(*args, **kwargs)
+                    pos = out[0] if isinstance(out, (tuple, list)) else out
+                    calls.append(
+                        {
+                            "where": obj_name,
+                            "n_args": len(args),
+                            "keys": sorted(merged.keys()),
+                            "mmtt": _summarize_mmtt(merged.get("mm_token_type_ids")),
+                            "pos_shape": tuple(pos.shape) if torch.is_tensor(pos) else type(pos).__name__,
+                            "pos": _add_text_axis_if_needed(pos, L) if torch.is_tensor(pos) else None,
+                        }
+                    )
+                    return out
+
+                setattr(obj, "get_rope_index", wrapped)
+                patched.append((obj, orig))
+
+            _patch("hf", hf)
+            _patch("hf.model", getattr(hf, "model", None))
+            _patch("processor", processor)
+            try:
+                with torch.no_grad():
+                    kw = {"input_ids": ids2, "use_cache": False}
+                    if pix_i is not None:
+                        kw["pixel_values"] = pix_i.to(hf.dtype)
+                        kw["image_grid_thw"] = grid_i
+                    hf(**kw)
+            except Exception as e:  # noqa: BLE001
+                _p(f"[PROVE] HF forward recompute-position run failed: {e!r}")
+            finally:
+                for obj, orig in patched:
+                    setattr(obj, "get_rope_index", orig)
+
+            if not calls:
+                _p("[PROVE] HF forward recompute did not call any captured get_rope_index attr")
+                return None
+            for cidx, call in enumerate(calls):
+                _p(f"[PROVE] HF get_rope_index call{cidx}@{call['where']}: n_args={call['n_args']} "
+                   f"keys={call['keys']} mm_token_type_ids={call['mmtt']} out_shape={call['pos_shape']}")
+            return calls[-1]["pos"]
 
         # V1 WAY: get_rope_index WITHOUT mm_token_type_ids, then prepend text axis (verbatim v1 logic)
         pv = None
@@ -396,6 +563,9 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             except Exception as e:  # noqa: BLE001
                 _p(f"[PROVE] async-way failed: {e!r}")
 
+        # HF FORWARD RECOMPUTE: this is the exact path exercised by --no-position-ids.
+        ph = _capture_hf_recompute_positions()
+
         def _cmp(name, x):
             if x is None or pd is None:
                 _p(f"[PROVE] seq{i} {name}: n/a (x={x is not None}, dump={pd is not None})")
@@ -408,17 +578,26 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                f"mismatch_positions={nmis}/{k}")
             return nmis
 
-        _cmp("async(budget)", pa)
-        _cmp("v1-markall", pm)
-        nmis_v1 = _cmp("v1-no-mmtt", pv)
-        # show the FIRST divergent window so we can see the nature of the error
-        if pv is not None and pd is not None and nmis_v1:
-            d = (pv[:, :pd.shape[-1]] - pd[:, :pv.shape[-1]]).abs().sum(0)
+        def _show_first_mismatch(name, x, nmis):
+            if x is None or pd is None or not nmis:
+                return
+            k = min(x.shape[-1], pd.shape[-1])
+            d = (x[:, :k] - pd[:, :k]).abs().sum(0)
             first = int((d > 0).nonzero(as_tuple=True)[0][0])
-            w0, w1 = max(0, first - 1), min(pd.shape[-1], first + 5)
-            _p(f"[PROVE] first mismatch at pos {first}; window [{w0}:{w1}] (channels = text,t,h,w):")
+            w0, w1 = max(0, first - 1), min(k, first + 5)
+            _p(f"[PROVE] {name} first mismatch at pos {first}; window [{w0}:{w1}] "
+               f"(channels = text,t,h,w):")
             _p(f"[PROVE]   DUMP  =\n{pd[:, w0:w1]}")
-            _p(f"[PROVE]   v1    =\n{pv[:, w0:w1]}")
+            _p(f"[PROVE]   {name} =\n{x[:, w0:w1]}")
+
+        nmis_async = _cmp("async(budget)", pa)
+        nmis_markall = _cmp("v1-markall", pm)
+        nmis_v1 = _cmp("v1-no-mmtt", pv)
+        nmis_hf = _cmp("hf-recompute", ph)
+        _show_first_mismatch("async(budget)", pa, nmis_async)
+        _show_first_mismatch("v1-markall", pm, nmis_markall)
+        _show_first_mismatch("v1-no-mmtt", pv, nmis_v1)
+        _show_first_mismatch("hf-recompute", ph, nmis_hf)
 
         # feed each to HF and show |A - C|
         A = _seq("old_log_probs", i)
@@ -449,6 +628,7 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
         _hf_ac("async(budget)", pa)
         _hf_ac("v1-markall", pm)
         _hf_ac("v1-no-mmtt", pv)
+        _hf_ac("hf-recompute", ph)
     _p("\n[PROVE] READ: whichever variant == DUMP and gives |A-C|~0.006 is what training/vLLM use; whichever")
     _p("[PROVE] differs from DUMP and gives |A-C|~0.28 is the v1 bug. mm_token_type_ids IS emitted by the")
     _p("[PROVE] processor and REQUIRED by get_rope_index -> the divergence is HOW it's (re)built, not a")
@@ -590,6 +770,21 @@ def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_
         _cmp("|A-C| recorded-vLLM vs FRESH-HF/FSDP", A, C)
     if C is not None and D is not None:
         _cmp("|C-D| FRESH-HF vs FRESH-vLLM (clean gap)", C, D)
+    _print_k3_matrix(
+        "ROLLOUT-BUNDLE",
+        [
+            {
+                "seq": 0,
+                "n": n,
+                "A": A.detach().cpu(),
+                "B": None,
+                "C": C.detach().cpu() if C is not None else None,
+                "D": D.detach().cpu() if D is not None else None,
+            }
+        ],
+    )
+    _p("[ROLLOUT-BUNDLE] B=dump-FSDP is not in a raw rollout bundle. A/B/C/D in one table requires a dump "
+       "that stores raw images plus fsdp_log_probs, or a matched rollout bundle and FSDP probe for the same sample.")
     # worst tokens on the clean gap (finite only, so nan tokens don't sort to the top as garbage)
     if C is not None and D is not None:
         cd = (C - D).abs()
