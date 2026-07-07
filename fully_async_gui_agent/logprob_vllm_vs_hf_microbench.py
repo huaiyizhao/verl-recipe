@@ -303,12 +303,19 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                 return vv[:, off[i]:off[i + 1]]
         return None
 
-    def _norm(p):  # -> (channels, L) cpu long
+    def _norm(p):  # -> (channels, L) cpu long, robust to (C,1,L)/(1,C,L)/(C,L)/(L,C)
         if p is None:
             return None
         p = p.detach().cpu().long()
         if p.dim() == 3:
-            p = p[:, 0] if p.shape[1] == 1 else p.reshape(p.shape[0], -1)
+            if p.shape[0] in (3, 4) and p.shape[1] == 1:      # (C, 1, L)
+                p = p[:, 0]
+            elif p.shape[1] in (3, 4) and p.shape[0] == 1:    # (1, C, L)
+                p = p[0]
+            else:
+                p = p.reshape(p.shape[0], -1)
+        if p.dim() == 2 and p.shape[0] not in (3, 4) and p.shape[1] in (3, 4):  # (L, C) -> (C, L)
+            p = p.transpose(0, 1)
         return p
 
     # bind get_rope_index (verl normally binds the model's onto the processor)
