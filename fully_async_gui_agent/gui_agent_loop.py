@@ -58,6 +58,11 @@ from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
+# One-shot rollout-side probe: dump raw images + tokens + vLLM logprobs (the ONLY place these are
+# together) so the microbench can recompute a FRESH vLLM (D) and FRESH HF (C) on the SAME data and
+# compare to the recorded vLLM logprob (A). Gated by VERL_ROLLOUT_PROBE_DUMP=1.
+_ROLLOUT_PROBE_DONE = [0]
+
 # We bypass the ``logging`` framework entirely here because verl's global
 # ``basicConfig(WARNING)`` plus Ray's early-attached handlers silently drop
 # INFO/DEBUG records regardless of per-logger levels. ``print`` goes straight
@@ -637,6 +642,41 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                     "num_turns": turn * 2,
                     "extra_fields": extra_fields,
                 }
+
+                # One-shot rollout probe: dump raw images + tokens + vLLM logprobs so the microbench can
+                # recompute FRESH vLLM (D) and FRESH HF (C) on the same data and 3-way compare to the
+                # recorded vLLM logprob (A). Only a turn WITH images and WITH logprobs is useful.
+                if (
+                    os.getenv("VERL_ROLLOUT_PROBE_DUMP", "0") == "1"
+                    and response_logprobs is not None
+                    and multi_modal_data.get("images")
+                    and _ROLLOUT_PROBE_DONE[0] < int(os.getenv("VERL_ROLLOUT_PROBE_MAX", "1"))
+                ):
+                    try:
+                        import torch as _torch
+
+                        _rp_dir = os.getenv("VERL_ROLLOUT_PROBE_DIR", "/tmp/rollout_probe")
+                        os.makedirs(_rp_dir, exist_ok=True)
+                        _rp_path = os.path.join(_rp_dir, f"rollout_probe_{_ROLLOUT_PROBE_DONE[0]}.pt")
+                        _torch.save(
+                            {
+                                "prompt_ids": list(prompt_ids),
+                                "response_ids": list(response_ids),
+                                "response_logprobs": list(response_logprobs),  # A = vLLM logp (as recorded)
+                                "multi_modal_data": multi_modal_data,  # raw PIL images sent to vLLM (for D & C)
+                                "turn": turn,
+                                "model_path": os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", ""),
+                            },
+                            _rp_path,
+                        )
+                        _ROLLOUT_PROBE_DONE[0] += 1
+                        print(
+                            f"[ROLLOUT_PROBE] dumped raw images + tokens + vLLM logp "
+                            f"(n_img={len(multi_modal_data.get('images', []))}, resp={len(response_ids)}) -> {_rp_path}",
+                            flush=True,
+                        )
+                    except Exception as _e:  # noqa: BLE001 - probe must never break rollout
+                        print(f"[ROLLOUT_PROBE] dump failed: {_e!r}", flush=True)
 
                 # 4. Parse tool calls. A single model response may contain
                 # multiple computer_use calls; execute them sequentially below.

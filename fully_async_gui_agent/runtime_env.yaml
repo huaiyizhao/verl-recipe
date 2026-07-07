@@ -28,6 +28,18 @@ env_vars:
   MLFLOW_TRACKING_URI: "http://172.20.70.149:29004"  # MLflow server 地址
   HF_HOME: "/efs/data/hf"
 
+  # --- ONE-SHOT logprob probe dumps (for the offline microbench A/B/C/D comparison) --------------
+  # Rollout dump (raw images + tokens + vLLM logp) -> enables fresh vLLM(D) & HF(C) recompute.
+  VERL_ROLLOUT_PROBE_DUMP: "1"
+  VERL_ROLLOUT_PROBE_DIR: "/efs/data/rl/rollout_probe"
+  VERL_ROLLOUT_PROBE_MAX: "1"
+  # FSDP dump (tokens + pixels + async's vLLM(old) & FSDP(fsdp) logp) -> gives B (async FSDP).
+  VERL_LOGPROB_PROBE_DUMP: "1"
+  VERL_LOGPROB_PROBE_DIR: "/efs/data/rl/logprob_probe_async"
+  VERL_LOGPROB_PROBE_MAX: "1"
+  # Model dir stamped into both bundles (and used by the [LOGPROB_GAP] inline token decode).
+  VERL_LOGPROB_DEBUG_TOKENIZER: "/efs/train/hf_models/qwen3-vl-8b-instruct"
+
   # --- Ray/gRPC SIGABRT mitigation ---------------------------------
   # The core-worker's gRPC IO thread has been observed to abort inside
   # ``uv__epoll_ctl_flush`` after ~1h of sustained task-event traffic.

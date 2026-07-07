@@ -98,6 +98,197 @@ def _pixel_stats(tag, pv):
     )
 
 
+def _run_async_bundle(path, hf, processor, tokenizer, device):
+    """Load an async-run probe bundle and 3-way compare, per response token:
+        A = async's recorded old_log_probs  (vLLM, since bypass_mode sets old = rollout_log_probs)
+        B = async's recorded fsdp_log_probs (the async FSDP forward during that run)
+        C = a FRESH HF/FSDP recompute here, on the SAME tokens+pixels.
+    |A-B| reproduces async's tiny recorded gap. |A-C| is the KEY: if small, async's "vLLM" old_log_prob
+    actually matches a fresh FSDP forward on real GUI data (=> the real vLLM<->FSDP gap is small, and the
+    microbench's 0.28 was a verbose-prompt artifact); if ~0.28, async old IS vLLM-with-vision-gap.
+    |B-C| is a sanity check (async FSDP vs fresh HF; should be ~bf16 noise)."""
+    _p(f"=== [ASYNC-BUNDLE] loading {path} ===")
+    b = torch.load(path, map_location="cpu", weights_only=False)
+
+    def _nested(field):
+        f = b.get(field)
+        if f is None:
+            return None, None
+        if isinstance(f, dict) and "values" in f:
+            return f["values"], f["offsets"].tolist()
+        return f, None
+
+    ids_v, ids_off = _nested("input_ids")
+    old_v, old_off = _nested("old_log_probs")  # A
+    fsdp_v, fsdp_off = _nested("fsdp_log_probs")  # B
+    rm_v, rm_off = _nested("response_mask")
+    pix, _ = _nested("pixel_values")
+    grid, _ = _nested("image_grid_thw")
+    if ids_off is None:
+        _p("[ASYNC-BUNDLE] input_ids not nested per-seq; cannot proceed")
+        return
+    n_seq = len(ids_off) - 1
+    image_token_id = getattr(processor, "image_token_id", None)
+    merge = processor.image_processor.merge_size
+    _p(f"[ASYNC-BUNDLE] n_seq={n_seq} has_A(old/vLLM)={old_v is not None} has_B(fsdp)={fsdp_v is not None} "
+       f"has_pixels={pix is not None}")
+
+    img_cursor, patch_cursor = 0, 0
+    accA, accB, accC = [], [], []
+    for i in range(n_seq):
+        ids_i = ids_v[ids_off[i]:ids_off[i + 1]].to(device)
+        L = ids_i.numel()
+        A = old_v[old_off[i]:old_off[i + 1]].float() if old_v is not None else None
+        Bfull = fsdp_v[fsdp_off[i]:fsdp_off[i + 1]].float() if fsdp_v is not None else None
+        rm = rm_v[rm_off[i]:rm_off[i + 1]] if rm_v is not None else None
+        resp_len = A.numel() if A is not None else (rm.numel() if rm is not None else 0)
+        if resp_len == 0:
+            continue
+        B = Bfull[-resp_len:] if Bfull is not None else None  # response tail of the full FSDP logp
+        # split pixels for this seq (images appear in order; consume by patch count)
+        n_img_tok = int((ids_i.cpu() == image_token_id).sum()) if image_token_id is not None else 0
+        seq_grids, seq_pix, consumed = [], [], 0
+        while grid is not None and img_cursor < grid.shape[0] and consumed < n_img_tok:
+            g = grid[img_cursor]
+            patches = int(g[0] * g[1] * g[2])
+            seq_grids.append(g)
+            if pix is not None:
+                seq_pix.append(pix[patch_cursor:patch_cursor + patches])
+            patch_cursor += patches
+            consumed += patches // (merge * merge)
+            img_cursor += 1
+        grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
+        pix_i = torch.cat(seq_pix).to(device) if seq_pix else None
+        # fresh HF forward -> logp of each response token (tail alignment)
+        with torch.no_grad():
+            kw = {"input_ids": ids_i.unsqueeze(0), "use_cache": False}
+            if pix_i is not None:
+                kw["pixel_values"] = pix_i.to(hf.dtype)
+                kw["image_grid_thw"] = grid_i
+            lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
+        C = torch.tensor([float(lp[L - resp_len + j - 1, int(ids_i[L - resp_len + j])]) for j in range(resp_len)])
+        m = rm.bool() if (rm is not None and rm.numel() == resp_len) else torch.ones(resp_len, dtype=torch.bool)
+        Cm = C[m]
+        Am = A[m] if A is not None else None
+        Bm = B[m] if B is not None else None
+        if Am is not None:
+            accA.append(Am)
+        if Bm is not None:
+            accB.append(Bm)
+        accC.append(Cm)
+        dab = (Am - Bm).abs().mean().item() if (Am is not None and Bm is not None) else float("nan")
+        dac = (Am - Cm).abs().mean().item() if Am is not None else float("nan")
+        dbc = (Bm - Cm).abs().mean().item() if Bm is not None else float("nan")
+        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp={resp_len} imgtok={n_img_tok} | "
+           f"|A-B|async_gap={dab:.4f} |A-C|asyncVLLM_vs_freshFSDP={dac:.4f} |B-C|asyncFSDP_vs_freshFSDP={dbc:.4f}")
+
+    A = torch.cat(accA) if accA else None
+    B = torch.cat(accB) if accB else None
+    C = torch.cat(accC)
+    _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
+    if A is not None and B is not None:
+        d = (A - B).abs()
+        _p(f"  |A-B| async recorded gap (vLLM vs FSDP): mean={d.mean():.4f} max={d.max():.4f}")
+    if A is not None:
+        d = (A - C).abs()
+        _p(f"  |A-C| async-vLLM(old) vs FRESH-HF/FSDP : mean={d.mean():.4f} max={d.max():.4f}")
+    if B is not None:
+        d = (B - C).abs()
+        _p(f"  |B-C| async-FSDP vs FRESH-HF (sanity)  : mean={d.mean():.4f} max={d.max():.4f}")
+    _p("  READ: |A-C| small (~|B-C|) => async 'vLLM' old_log_prob matches a fresh FSDP forward => the real")
+    _p("        vLLM<->FSDP gap on GUI data is SMALL (microbench's 0.28 was the verbose-prompt artifact).")
+    _p("        |A-C| ~0.28 while |B-C| small => async old IS vLLM-with-vision-gap; async's small recorded")
+    _p("        |A-B| would then be impossible -> so this case points to old_log_prob NOT being raw vLLM.")
+
+
+def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_mem):
+    """Load a ROLLOUT probe (raw images + tokens + recorded vLLM logprobs) and 3-way compare per response
+    token: A=recorded-vLLM (as the async run stored it), C=fresh-HF, D=fresh-vLLM (recomputed here on the
+    SAME raw images + tokens). |A-D| = is the recorded vLLM logprob reproducible; |C-D| = clean vLLM<->FSDP
+    gap on real GUI data; |A-C| = recorded-vLLM vs fresh-FSDP."""
+    _p(f"=== [ROLLOUT-BUNDLE] loading {path} ===")
+    b = torch.load(path, map_location="cpu", weights_only=False)
+    prompt_ids = [int(x) for x in b["prompt_ids"]]
+    response_ids = [int(x) for x in b["response_ids"]]
+    A = torch.tensor([float(x) for x in b["response_logprobs"]], dtype=torch.float64)  # recorded vLLM
+    mm = b.get("multi_modal_data") or {}
+    images = mm.get("images") or mm.get("image") or []
+    full = prompt_ids + response_ids
+    plen, rlen = len(prompt_ids), len(response_ids)
+    n = min(rlen, A.numel())
+    _p(f"[ROLLOUT-BUNDLE] prompt={plen} response={rlen} n_images={len(images)} recorded_vLLM_logp_n={A.numel()}")
+
+    # ---- C: fresh HF/FSDP on the same raw images + tokens ----
+    C = None
+    try:
+        img_inputs = processor.image_processor(images, return_tensors="pt") if images else {}
+        pv = img_inputs.get("pixel_values")
+        grid = img_inputs.get("image_grid_thw")
+        with torch.no_grad():
+            kw = {"input_ids": torch.tensor(full, device=device).unsqueeze(0), "use_cache": False}
+            if pv is not None:
+                kw["pixel_values"] = pv.to(hf.dtype).to(device)
+                kw["image_grid_thw"] = grid.to(device)
+            lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
+        C = torch.tensor([float(lp[plen + j - 1, full[plen + j]]) for j in range(n)], dtype=torch.float64)
+    except Exception as e:  # noqa: BLE001
+        _p(f"[ROLLOUT-BUNDLE] fresh-HF (C) failed: {e!r}")
+
+    # ---- D: fresh vLLM on the same raw images + tokens (teacher-forcing via prompt_logprobs) ----
+    D = None
+    try:
+        from vllm import LLM, SamplingParams
+
+        _p("[ROLLOUT-BUNDLE] loading vLLM for fresh recompute (D)...")
+        llm = LLM(
+            model=model_path,
+            dtype="bfloat16",
+            trust_remote_code=True,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=32768,
+            limit_mm_per_prompt={"image": max(1, len(images))},
+            enforce_eager=True,
+        )
+        sp = SamplingParams(temperature=1.0, max_tokens=1, prompt_logprobs=0)
+        req = {"prompt_token_ids": full}
+        if images:
+            req["multi_modal_data"] = {"image": images}
+        out = llm.generate([req], sp)[0]
+        pl = out.prompt_logprobs  # list aligned with `full`; pl[i] = {token_id: Logprob} for position i
+        Dvals = []
+        for j in range(n):
+            p = plen + j
+            entry = pl[p] if pl is not None and p < len(pl) else None
+            tok = full[p]
+            Dvals.append(entry[tok].logprob if (entry and tok in entry) else float("nan"))
+        D = torch.tensor(Dvals, dtype=torch.float64)
+    except Exception as e:  # noqa: BLE001
+        _p(f"[ROLLOUT-BUNDLE] fresh-vLLM (D) failed ({e!r}); reporting A vs C only")
+
+    A = A[:n]
+
+    def _cmp(name, x, y):
+        d = (x - y).abs()
+        _p(f"  {name}: mean={d.mean():.4f} max={d.max():.4f} frac>0.1={(d > 0.1).float().mean():.3f}")
+
+    _p("\n[ROLLOUT-BUNDLE] ===== per-response-token comparison =====")
+    if D is not None:
+        _cmp("|A-D| recorded-vLLM vs FRESH-vLLM  ", A, D)
+    if C is not None:
+        _cmp("|A-C| recorded-vLLM vs FRESH-HF/FSDP", A, C)
+    if C is not None and D is not None:
+        _cmp("|C-D| FRESH-HF vs FRESH-vLLM (clean gap)", C, D)
+    # worst tokens on the clean gap
+    if C is not None and D is not None:
+        order = torch.argsort((C - D).abs(), descending=True)[:12]
+        _p("  worst |C-D| tokens (pos | A  C  D | token):")
+        for i in order.tolist():
+            tok = tokenizer.decode([full[plen + i]])
+            _p(f"    {i:4d} | {A[i]:+7.3f} {C[i]:+7.3f} {D[i]:+7.3f} | {tok!r}")
+    _p("  READ: |A-D| small => recorded vLLM is a faithful vLLM recompute (async old IS vLLM).")
+    _p("        |C-D| is the REAL vLLM<->FSDP gap on this GUI data; compare it to async's recorded |A-B|.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -115,6 +306,15 @@ def main():
     ap.add_argument("--gpu-mem", type=float, default=0.6, help="vLLM gpu_memory_utilization.")
     ap.add_argument("--dump", default=None, help="Optional probe .pt bundle -> report its train-side pixel stats.")
     ap.add_argument(
+        "--async-bundle",
+        dest="async_bundle",
+        default=None,
+        help="A probe .pt dumped from the ASYNC run (tokens+pixels+old_log_probs[vLLM]+fsdp_log_probs[FSDP]). "
+        "Recompute a FRESH HF/FSDP logprob on the SAME data and 3-way compare A=async-vLLM(old), "
+        "B=async-FSDP(fsdp), C=fresh-HF. Answers: is the async old_log_prob vLLM-with-gap or FSDP-consistent, "
+        "and what is the real vLLM<->FSDP gap on actual GUI data. Runs HF only (no vLLM), then exits.",
+    )
+    ap.add_argument(
         "--text-prompt",
         default="Write a detailed, imaginative short story about a lighthouse keeper who discovers "
         "something impossible washed up on the shore one foggy morning. Be creative and specific.",
@@ -124,6 +324,14 @@ def main():
         "--image-prompt",
         default="You are a GUI agent. Look at this screenshot and describe, step by step and in "
         "specific detail, what is on the screen and what you would click to open the main menu.",
+    )
+    ap.add_argument(
+        "--rollout-bundle",
+        dest="rollout_bundle",
+        default=None,
+        help="A ROLLOUT probe .pt (raw images + tokens + recorded vLLM logprobs). Recompute a FRESH vLLM (D) "
+        "and FRESH HF (C) on the SAME raw images/tokens and 3-way compare to A=recorded-vLLM. |A-D| tells "
+        "whether the recorded 'vLLM' logprob is a faithful vLLM recompute; |C-D| is the clean vLLM<->FSDP gap.",
     )
     args = ap.parse_args()
 
@@ -144,7 +352,6 @@ def main():
                 _p(f"[DUMP] image_grid_thw={tuple(g.shape)} sum(t*h*w)={int((g[:, 0] * g[:, 1] * g[:, 2]).sum())}")
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
-    from vllm import LLM, SamplingParams
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     tokenizer = processor.tokenizer
@@ -153,6 +360,20 @@ def main():
     hf = AutoModelForImageTextToText.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, attn_implementation=args.attn, trust_remote_code=True
     ).eval().to(device)
+
+    # ---- BUNDLE MODES: run BOTH in one shot when given, then exit (no generation needed) -------------
+    #   --async-bundle   : A=async-vLLM(old) / B=async-FSDP(fsdp) / C=fresh-HF   (HF only)
+    #   --rollout-bundle : A=recorded-vLLM   / C=fresh-HF        / D=fresh-vLLM  (loads vLLM)
+    if args.async_bundle or args.rollout_bundle:
+        if args.async_bundle:
+            _p("\n################## ASYNC-BUNDLE (A=async vLLM / B=async FSDP / C=fresh HF) ##################")
+            _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device)
+        if args.rollout_bundle:
+            _p("\n################## ROLLOUT-BUNDLE (A=recorded vLLM / C=fresh HF / D=fresh vLLM) ##################")
+            _run_rollout_bundle(args.rollout_bundle, args.model, hf, processor, tokenizer, device, args.gpu_mem)
+        return
+
+    from vllm import LLM, SamplingParams
 
     _p("=== loading vLLM (fresh, its own clean image processing) ===")
     llm = LLM(
