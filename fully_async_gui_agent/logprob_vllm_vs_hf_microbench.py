@@ -168,10 +168,11 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
             continue
         # A (padded response logp) -> valid entries
         Av = (A[rm] if (A is not None and rm is not None and rm.numel() == A.numel()) else (A[:resp_valid] if A is not None else None))
-        # B: full-seq logp -> response tail; else padded response -> masked
+        # B: full-seq logp. verl uses the ROLLED convention (log_probs[t] = logp of input_ids[t+1]), so the
+        # response tokens at abs pos [L-resp_valid, L-1] have their logp at indices [L-resp_valid-1, L-2].
         if Bfull is not None:
             if Bfull.numel() == L:
-                Bv = Bfull[L - resp_valid:]
+                Bv = Bfull[L - resp_valid - 1:L - 1]
             elif rm is not None and rm.numel() == Bfull.numel():
                 Bv = Bfull[rm]
             else:
@@ -285,21 +286,36 @@ def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_
             limit_mm_per_prompt={"image": max(1, len(images))},
             enforce_eager=True,
         )
-        sp = SamplingParams(temperature=1.0, max_tokens=1, prompt_logprobs=0)
+        sp = SamplingParams(temperature=1.0, max_tokens=1, prompt_logprobs=1)
         req = {"prompt_token_ids": full}
         if images:
             req["multi_modal_data"] = {"image": images}
         out = llm.generate([req], sp)[0]
-        pl = out.prompt_logprobs  # list aligned with `full`; pl[i] = {token_id: Logprob} for position i
-        Dvals = []
-        for j in range(n):
-            p = plen + j
-            entry = pl[p] if pl is not None and p < len(pl) else None
-            tok = full[p]
-            Dvals.append(entry[tok].logprob if (entry and tok in entry) else float("nan"))
+        pl = out.prompt_logprobs  # list aligned with vLLM's prompt; pl[i] = {token_id: Logprob}
+
+        def _lp(entry, tok):
+            if not entry or tok not in entry:
+                return float("nan")
+            e = entry[tok]
+            return float(getattr(e, "logprob", e))  # Logprob obj or raw float
+
+        _p(f"[ROLLOUT-BUNDLE] vLLM prompt_logprobs: type={type(pl).__name__} len={len(pl) if pl is not None else None} "
+           f"len(full)={len(full)} (should match for correct alignment)")
+        if pl is not None:
+            _sp = pl[plen] if plen < len(pl) else None
+            _p(f"[ROLLOUT-BUNDLE] sample entry at first response pos {plen}: "
+               f"{ {k: round(getattr(v, 'logprob', v), 3) for k, v in _sp.items()} if _sp else None }")
+        # vLLM may prepend/shift for multimodal; align by matching from the END (response is the tail).
+        off = (len(pl) - len(full)) if pl is not None else 0
+        Dvals = [_lp(pl[plen + j + off] if (pl is not None and 0 <= plen + j + off < len(pl)) else None, full[plen + j])
+                 for j in range(n)]
         D = torch.tensor(Dvals, dtype=torch.float64)
+        _p(f"[ROLLOUT-BUNDLE] D valid (non-nan): {int((~torch.isnan(D)).sum())}/{n} (offset applied={off})")
     except Exception as e:  # noqa: BLE001
+        import traceback
+
         _p(f"[ROLLOUT-BUNDLE] fresh-vLLM (D) failed ({e!r}); reporting A vs C only")
+        traceback.print_exc()
 
     A = A[:n]
 
