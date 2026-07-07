@@ -140,7 +140,7 @@ loss_scale_factor=${loss_scale_factor:-null}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=8
 require_batches=${require_batches:-1}
 total_rollout_steps=${total_rollout_steps:-100000}
 total_epochs=100000
@@ -148,7 +148,7 @@ test_freq=-1
 
 
 # Async stream pipeline with partial rollout (see fully_async README).
-staleness_threshold=${staleness_threshold:-2}
+staleness_threshold=${staleness_threshold:-1}
 trigger_parameter_sync_step=${trigger_parameter_sync_step:-2}
 partial_rollout=${partial_rollout:-True}
 
