@@ -110,41 +110,74 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
     _p(f"=== [ASYNC-BUNDLE] loading {path} ===")
     b = torch.load(path, map_location="cpu", weights_only=False)
 
-    def _nested(field):
-        f = b.get(field)
-        if f is None:
-            return None, None
-        if isinstance(f, dict) and "values" in f:
-            return f["values"], f["offsets"].tolist()
-        return f, None
+    # Fields can be nested ({values, offsets}) OR plain padded tensors (n_seq, ...). Print + handle both.
+    for k in ("input_ids", "old_log_probs", "fsdp_log_probs", "response_mask", "pixel_values", "image_grid_thw"):
+        v = b.get(k)
+        if isinstance(v, dict) and "values" in v:
+            _p(f"  {k}: nested values={tuple(v['values'].shape)} n_off={len(v['offsets'])}")
+        elif torch.is_tensor(v):
+            _p(f"  {k}: tensor {tuple(v.shape)} {v.dtype}")
+        else:
+            _p(f"  {k}: {type(v).__name__}")
 
-    ids_v, ids_off = _nested("input_ids")
-    old_v, old_off = _nested("old_log_probs")  # A
-    fsdp_v, fsdp_off = _nested("fsdp_log_probs")  # B
-    rm_v, rm_off = _nested("response_mask")
-    pix, _ = _nested("pixel_values")
-    grid, _ = _nested("image_grid_thw")
-    if ids_off is None:
-        _p("[ASYNC-BUNDLE] input_ids not nested per-seq; cannot proceed")
+    ii = b.get("input_ids")
+    if isinstance(ii, dict) and "values" in ii:
+        n_seq = len(ii["offsets"]) - 1
+    elif torch.is_tensor(ii):
+        n_seq = ii.shape[0] if ii.dim() >= 2 else 1
+    else:
+        _p("[ASYNC-BUNDLE] no usable input_ids; cannot proceed")
         return
-    n_seq = len(ids_off) - 1
+
+    def _seq(name, i):
+        v = b.get(name)
+        if v is None:
+            return None
+        if isinstance(v, dict) and "values" in v:
+            off = v["offsets"].tolist()
+            return v["values"][off[i]:off[i + 1]]
+        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[0] == n_seq:
+            return v[i]
+        if torch.is_tensor(v) and v.dim() == 1 and n_seq == 1:
+            return v
+        return None
+
+    pix = b.get("pixel_values")
+    grid = b.get("image_grid_thw")
     image_token_id = getattr(processor, "image_token_id", None)
     merge = processor.image_processor.merge_size
-    _p(f"[ASYNC-BUNDLE] n_seq={n_seq} has_A(old/vLLM)={old_v is not None} has_B(fsdp)={fsdp_v is not None} "
-       f"has_pixels={pix is not None}")
+    _p(f"[ASYNC-BUNDLE] n_seq={n_seq}")
 
     img_cursor, patch_cursor = 0, 0
     accA, accB, accC = [], [], []
     for i in range(n_seq):
-        ids_i = ids_v[ids_off[i]:ids_off[i + 1]].to(device)
-        L = ids_i.numel()
-        A = old_v[old_off[i]:old_off[i + 1]].float() if old_v is not None else None
-        Bfull = fsdp_v[fsdp_off[i]:fsdp_off[i + 1]].float() if fsdp_v is not None else None
-        rm = rm_v[rm_off[i]:rm_off[i + 1]] if rm_v is not None else None
-        resp_len = A.numel() if A is not None else (rm.numel() if rm is not None else 0)
-        if resp_len == 0:
+        ids_i = _seq("input_ids", i)
+        if ids_i is None:
             continue
-        B = Bfull[-resp_len:] if Bfull is not None else None  # response tail of the full FSDP logp
+        ids_i = ids_i.to(device).long().reshape(-1)
+        L = ids_i.numel()
+        A = _seq("old_log_probs", i)
+        Bfull = _seq("fsdp_log_probs", i)
+        rm = _seq("response_mask", i)
+        A = A.float().reshape(-1) if A is not None else None
+        Bfull = Bfull.float().reshape(-1) if Bfull is not None else None
+        rm = rm.reshape(-1).bool() if rm is not None else None
+        # valid response length (drop right-padding via response_mask)
+        resp_valid = int(rm.sum()) if rm is not None else (A.numel() if A is not None else 0)
+        if resp_valid == 0 or resp_valid > L:
+            continue
+        # A (padded response logp) -> valid entries
+        Av = (A[rm] if (A is not None and rm is not None and rm.numel() == A.numel()) else (A[:resp_valid] if A is not None else None))
+        # B: full-seq logp -> response tail; else padded response -> masked
+        if Bfull is not None:
+            if Bfull.numel() == L:
+                Bv = Bfull[L - resp_valid:]
+            elif rm is not None and rm.numel() == Bfull.numel():
+                Bv = Bfull[rm]
+            else:
+                Bv = Bfull[-resp_valid:]
+        else:
+            Bv = None
         # split pixels for this seq (images appear in order; consume by patch count)
         n_img_tok = int((ids_i.cpu() == image_token_id).sum()) if image_token_id is not None else 0
         seq_grids, seq_pix, consumed = [], [], 0
@@ -159,18 +192,21 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
             img_cursor += 1
         grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
         pix_i = torch.cat(seq_pix).to(device) if seq_pix else None
-        # fresh HF forward -> logp of each response token (tail alignment)
+        # fresh HF forward -> logp of the last `resp_valid` (response) tokens
         with torch.no_grad():
             kw = {"input_ids": ids_i.unsqueeze(0), "use_cache": False}
             if pix_i is not None:
                 kw["pixel_values"] = pix_i.to(hf.dtype)
                 kw["image_grid_thw"] = grid_i
             lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
-        C = torch.tensor([float(lp[L - resp_len + j - 1, int(ids_i[L - resp_len + j])]) for j in range(resp_len)])
-        m = rm.bool() if (rm is not None and rm.numel() == resp_len) else torch.ones(resp_len, dtype=torch.bool)
-        Cm = C[m]
-        Am = A[m] if A is not None else None
-        Bm = B[m] if B is not None else None
+        Cm = torch.tensor(
+            [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
+        )
+        # defensive: align all to the common valid length
+        k = min(x.numel() for x in (Cm,) + ((Av,) if Av is not None else ()) + ((Bv,) if Bv is not None else ()))
+        Cm = Cm[:k]
+        Am = Av[:k] if Av is not None else None
+        Bm = Bv[:k] if Bv is not None else None
         if Am is not None:
             accA.append(Am)
         if Bm is not None:
@@ -179,7 +215,7 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
         dab = (Am - Bm).abs().mean().item() if (Am is not None and Bm is not None) else float("nan")
         dac = (Am - Cm).abs().mean().item() if Am is not None else float("nan")
         dbc = (Bm - Cm).abs().mean().item() if Bm is not None else float("nan")
-        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp={resp_len} imgtok={n_img_tok} | "
+        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp_valid={resp_valid} imgtok={n_img_tok} | "
            f"|A-B|async_gap={dab:.4f} |A-C|asyncVLLM_vs_freshFSDP={dac:.4f} |B-C|asyncFSDP_vs_freshFSDP={dbc:.4f}")
 
     A = torch.cat(accA) if accA else None
@@ -367,10 +403,22 @@ def main():
     if args.async_bundle or args.rollout_bundle:
         if args.async_bundle:
             _p("\n################## ASYNC-BUNDLE (A=async vLLM / B=async FSDP / C=fresh HF) ##################")
-            _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device)
+            try:
+                _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device)
+            except Exception as e:  # noqa: BLE001 - don't let it block the rollout-bundle below
+                import traceback
+
+                _p(f"[ASYNC-BUNDLE] FAILED: {e!r}")
+                traceback.print_exc()
         if args.rollout_bundle:
             _p("\n################## ROLLOUT-BUNDLE (A=recorded vLLM / C=fresh HF / D=fresh vLLM) ##################")
-            _run_rollout_bundle(args.rollout_bundle, args.model, hf, processor, tokenizer, device, args.gpu_mem)
+            try:
+                _run_rollout_bundle(args.rollout_bundle, args.model, hf, processor, tokenizer, device, args.gpu_mem)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+
+                _p(f"[ROLLOUT-BUNDLE] FAILED: {e!r}")
+                traceback.print_exc()
         return
 
     from vllm import LLM, SamplingParams

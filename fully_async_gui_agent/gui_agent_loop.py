@@ -657,7 +657,9 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
 
                         _rp_dir = os.getenv("VERL_ROLLOUT_PROBE_DIR", "/tmp/rollout_probe")
                         os.makedirs(_rp_dir, exist_ok=True)
-                        _rp_path = os.path.join(_rp_dir, f"rollout_probe_{_ROLLOUT_PROBE_DONE[0]}.pt")
+                        # Unique per worker (many AgentLoopWorkers run concurrently); otherwise they all
+                        # write the same file and clobber / corrupt each other. Pick ANY one for the microbench.
+                        _rp_path = os.path.join(_rp_dir, f"rollout_probe_pid{os.getpid()}_{_ROLLOUT_PROBE_DONE[0]}.pt")
                         _torch.save(
                             {
                                 "prompt_ids": list(prompt_ids),
