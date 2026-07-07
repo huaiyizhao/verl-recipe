@@ -39,6 +39,57 @@ def _unpack(field):
     return field
 
 
+def _collapse_image_runs(ids, image_token_id):
+    """Dump input_ids have image placeholders ALREADY expanded (image_token_id repeated per patch). vLLM
+    wants the UN-expanded prompt (ONE image_token_id per image; it re-expands via its own processor).
+    Collapse each maximal run of image_token_id to a single token. Returns (ids_list, n_runs)."""
+    out, n_runs, prev = [], 0, False
+    for t in ids:
+        t = int(t)
+        is_img = t == image_token_id
+        if is_img:
+            if not prev:
+                out.append(t)
+                n_runs += 1
+        else:
+            out.append(t)
+        prev = is_img
+    return out, n_runs
+
+
+def _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, n):
+    """Teacher-force ONE sequence through a fresh vLLM (D). Pass the un-expanded prompt+response + raw
+    images; vLLM re-expands, so align the response as the LAST n tokens of vLLM's own expanded prompt.
+    Returns a float64 tensor of D logprobs (nan where unavailable)."""
+    req = {"prompt_token_ids": [int(x) for x in unexpanded_full]}
+    if images:
+        req["multi_modal_data"] = {"image": images}
+    out = llm.generate([req], sp)[0]
+    pl = out.prompt_logprobs
+    vpids = [int(x) for x in out.prompt_token_ids] if out.prompt_token_ids is not None else list(unexpanded_full)
+
+    def _lp(entry, tok):
+        if not entry:
+            return float("nan")
+        for k in (tok, str(tok)):  # some vLLM versions key prompt_logprobs by str token id
+            if k in entry:
+                e = entry[k]
+                return float(getattr(e, "logprob", e))
+        return float("nan")
+
+    resp_ids_n = [int(x) for x in response_ids[:n]]
+    base = len(vpids) - n
+    if vpids[-n:] != resp_ids_n:  # robustness: locate the response inside vLLM's expanded prompt
+        for s in range(len(vpids) - n, -1, -1):
+            if vpids[s : s + n] == resp_ids_n:
+                base = s
+                break
+        else:
+            _log("[VD] WARNING: response not found verbatim in vLLM prompt; using tail")
+    return torch.tensor([_lp(pl[base + j] if pl is not None else None, vpids[base + j]) for j in range(n)],
+                        dtype=torch.float64)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bundle", nargs="?", default="/tmp/logprob_probe/probe_rank0_0.pt")
@@ -51,6 +102,15 @@ def main():
         help="HF attn_implementation. Default flash_attention_2 to MATCH verl's flash_attn_varlen "
         "(fp32 accumulation). Falls back sdpa->eager if unavailable.",
     )
+    ap.add_argument(
+        "--with-vllm",
+        dest="with_vllm",
+        action="store_true",
+        default=False,
+        help="Also load vLLM and recompute a FRESH vLLM(D) from the bundle's raw_images, adding a [VD] "
+        "line: |A-D| (recorded vs fresh vLLM), |D-fp32| (fresh vLLM vs HF-fp32 truth), |D-FSDP|.",
+    )
+    ap.add_argument("--gpu-mem", type=float, default=0.4, help="vLLM gpu_memory_utilization (HF is co-resident).")
     args = ap.parse_args()
 
     if not os.path.exists(args.bundle):
@@ -79,6 +139,9 @@ def main():
         grid_all = grid_all["values"]
     if isinstance(pixels_all, dict):
         pixels_all = pixels_all["values"]
+    raw_images = b.get("raw_images")  # list[n_seq] of list[PIL]; only in enriched dumps -> enables fresh vLLM(D)
+    temperature = b.get("temperature")
+    logprobs_mode = b.get("logprobs_mode")
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -115,6 +178,33 @@ def main():
     _log("=== loading flash_attention_2 model (bf16, unpacked ref) ===")
     model_flash = _load("flash_attention_2")
     _log(f"=== flash model available: {model_flash is not None} ===")
+
+    # Optional fresh vLLM(D): recompute vLLM on the SAME raw images the dump carried. Off by default.
+    llm = SamplingParams = None
+    if args.with_vllm:
+        if not (raw_images and any(raw_images)):
+            _log("[VD] --with-vllm set but bundle has no raw_images; skip D (re-dump with the enriched probe)")
+        else:
+            try:
+                from vllm import LLM, SamplingParams
+
+                if logprobs_mode is None:
+                    logprobs_mode = "raw_logprobs"
+                    _log("[VD] WARNING: logprobs_mode not in dump; defaulting raw_logprobs (match rollout config)")
+                max_imgs = max((len(im or []) for im in raw_images), default=1)
+                _log(f"[VD] loading vLLM for fresh D (logprobs_mode={logprobs_mode} max_imgs={max_imgs} "
+                     f"gpu_mem={args.gpu_mem})...")
+                kw = dict(model=model_path, dtype="bfloat16", trust_remote_code=True,
+                          gpu_memory_utilization=args.gpu_mem, max_model_len=32768,
+                          limit_mm_per_prompt={"image": max(1, max_imgs)}, enforce_eager=True)
+                try:
+                    llm = LLM(logprobs_mode=logprobs_mode, **kw)
+                except TypeError:  # older vLLM: logprobs_mode not an LLM() arg
+                    _log("[VD] (this vLLM build doesn't take logprobs_mode=; using default)")
+                    llm = LLM(**kw)
+            except Exception as e:  # noqa: BLE001
+                _log(f"[VD] vLLM init failed ({e!r}); D skipped")
+                llm = None
 
     n_seq = min(args.max_seq, len(input_ids) if input_ids else 0)
     _log(f"=== analyzing {n_seq} sequences ===")
@@ -347,6 +437,30 @@ def main():
         hf32_m, hf16_m, fsdp_m, v_m = _sel(hf32_r, mask), _sel(hf16_r, mask), _sel(fsdp_r, mask), _sel(v, mask)
         hf16fp16_m = _sel(hf_fp16[lo:hi], mask)  # fp16 logp on response tokens
         hfflash_m = _sel(hf_flash[lo:hi], mask) if hf_flash is not None else None  # bf16-flash UNPACKED
+
+        # ---- fresh vLLM(D): recompute on the SAME raw images, aligned to the SAME assistant tokens ----
+        D_m = None
+        if llm is not None:
+            imgs_si = raw_images[si] if (raw_images and si < len(raw_images)) else None
+            if imgs_si:
+                try:
+                    unexp, n_runs = _collapse_image_runs(ids_i.tolist(), image_token_id)
+                    if n_runs != len(imgs_si):
+                        _log(f"[VD] seq{si} WARN: image runs {n_runs} != n_images {len(imgs_si)}; D may misalign")
+                    resp_ids_list = [int(x) for x in ids_i[prompt_len:].tolist()]
+                    temp_i = 1.0
+                    if temperature is not None:
+                        try:
+                            temp_i = float(temperature[si].reshape(-1)[0] if hasattr(temperature[si], "reshape")
+                                           else temperature[si])
+                        except Exception:  # noqa: BLE001
+                            temp_i = 1.0
+                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
+                    D_full = _vllm_seq_logprobs(llm, sp, unexp, imgs_si, resp_ids_list, resp_len)
+                    D_m = _sel(D_full.float(), mask)
+                except Exception as e:  # noqa: BLE001
+                    _log(f"[VD] seq{si} fresh-vLLM(D) failed: {e!r}")
+                    D_m = None
         # accumulate aligned response tokens for the final precision matrix (all same length/tokens)
         if all(x is not None for x in (hf32_m, hf16_m, hf16fp16_m, fsdp_m, v_m)):
             mlen = min(hf32_m.numel(), hf16_m.numel(), hf16fp16_m.numel(), fsdp_m.numel(), v_m.numel())
@@ -398,6 +512,15 @@ def main():
                 f"on |Δ|>0.1: FSDP-vs-HFbf16={_m2(fsdp_m, hf16_m, hi):.4f} vLLM-vs-HFbf16={_m2(v_m, hf16_m, hi):.4f} "
                 f"[the BIGGER one is the outlier vs transformers]"
             )
+            # FRESH vLLM(D): |A-D| ~0 => the recorded vLLM(A) is a faithful vLLM recompute; |D-fp32| is the
+            # clean vLLM-vs-HF gap; |D-FSDP| the clean vLLM-vs-training gap. If |A-D| is large, the recorded
+            # A itself is off (stale/corrupted) and A-based lines above are suspect.
+            if D_m is not None:
+                _log(
+                    f"[VD] fresh-vLLM(D): |A-D| recVLLM-vs-freshVLLM={_m2(v_m, D_m):.4f} | "
+                    f"|D-fp32| freshVLLM-vs-HFfp32={_m2(D_m, hf32_m):.4f} | "
+                    f"|D-FSDP| freshVLLM-vs-FSDP={_m2(D_m, fsdp_m):.4f}"
+                )
             # PACKING vs KERNEL: HF-flash is UNPACKED + same flash kernel as FSDP. If HFflash≈HFsdpa
             # (kernel agrees unpacked) but FSDP(packed-flash) differs -> the bug is the PACKING/rmpad.
             if hfflash_m is not None:
