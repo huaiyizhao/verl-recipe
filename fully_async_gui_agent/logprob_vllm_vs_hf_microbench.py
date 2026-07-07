@@ -98,7 +98,7 @@ def _pixel_stats(tag, pv):
     )
 
 
-def _run_async_bundle(path, hf, processor, tokenizer, device):
+def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
     """Load an async-run probe bundle and 3-way compare, per response token:
         A = async's recorded old_log_probs  (vLLM, since bypass_mode sets old = rollout_log_probs)
         B = async's recorded fsdp_log_probs (the async FSDP forward during that run)
@@ -222,13 +222,17 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
                 kw["image_grid_thw"] = grid_i
             # feed the EXACT training position_ids (MRoPE) so C uses the same positions as training FSDP,
             # not HF's internally-recomputed ones. Shape -> (channels, batch=1, seq_len).
-            pos_i = _seq_pos(i)
+            # --no-position-ids sets feed_pos=False to isolate: if |B-C| jumps back to ~0.28, position_ids
+            # (not the monkey_patch) are what closed the gap.
+            pos_i = _seq_pos(i) if feed_pos else None
             if pos_i is not None:
                 pos_i = pos_i.to(device).long()
                 if pos_i.dim() == 2 and pos_i.shape[0] in (3, 4) and pos_i.shape[1] == L:
                     kw["position_ids"] = pos_i.unsqueeze(1)  # (channels, 1, L)
                 elif i == 0:
                     _p(f"[ASYNC-BUNDLE] position_ids shape {tuple(pos_i.shape)} != (channels,{L}); letting HF recompute")
+            elif i == 0:
+                _p(f"[ASYNC-BUNDLE] feed_pos={feed_pos}: {'letting HF recompute MRoPE positions' if not feed_pos else 'no position_ids in dump'}")
             lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
         Cm = torch.tensor(
             [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
@@ -262,10 +266,11 @@ def _run_async_bundle(path, hf, processor, tokenizer, device):
     if B is not None:
         d = (B - C).abs()
         _p(f"  |B-C| async-FSDP vs FRESH-HF (sanity)  : mean={d.mean():.4f} max={d.max():.4f}")
-    _p("  READ: |A-C| small (~|B-C|) => async 'vLLM' old_log_prob matches a fresh FSDP forward => the real")
-    _p("        vLLM<->FSDP gap on GUI data is SMALL (microbench's 0.28 was the verbose-prompt artifact).")
-    _p("        |A-C| ~0.28 while |B-C| small => async old IS vLLM-with-vision-gap; async's small recorded")
-    _p("        |A-B| would then be impossible -> so this case points to old_log_prob NOT being raw vLLM.")
+    _p("  READ: with verl monkey_patch + the EXACT training position_ids fed, C reproduces training FSDP.")
+    _p("        |B-C| ~0 => microbench == training FSDP; |A-C| ~0 => training vLLM == FSDP == microbench.")
+    _p("        A ~0.28 gap only appears vs STOCK HF (no verl patch / wrong MRoPE positions) -> that was")
+    _p("        the artifact, NOT a real train-infer gap. If |B-C| is still large, the patch/positions")
+    _p("        aren't being applied (check the [VERL-PATCH] line and the position_ids shape print).")
 
 
 def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_mem):
@@ -434,6 +439,9 @@ def main():
                     help="Apply verl's monkey_patch to HF so its forward == the TRAINING FSDP forward (default on).")
     ap.add_argument("--no-verl-patch", dest="verl_patch", action="store_false",
                     help="Use STOCK transformers HF (the old behavior that differs from verl FSDP by ~0.28).")
+    ap.add_argument("--no-position-ids", dest="feed_pos", action="store_false", default=True,
+                    help="ASYNC-BUNDLE: do NOT feed the dumped training position_ids to HF (let HF recompute "
+                    "MRoPE itself). Use to isolate whether position_ids (not the patch) closes the |B-C| gap.")
     ap.add_argument("--gpu-mem", type=float, default=0.6, help="vLLM gpu_memory_utilization.")
     ap.add_argument("--dump", default=None, help="Optional probe .pt bundle -> report its train-side pixel stats.")
     ap.add_argument(
@@ -513,7 +521,7 @@ def main():
         if args.async_bundle:
             _p("\n################## ASYNC-BUNDLE (A=async vLLM / B=async FSDP / C=fresh HF) ##################")
             try:
-                _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device)
+                _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device, feed_pos=args.feed_pos)
             except Exception as e:  # noqa: BLE001 - don't let it block the rollout-bundle below
                 import traceback
 
