@@ -457,6 +457,7 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             import inspect
 
             rope_calls = []
+            compute3d_calls = []
             lm_calls = []
             patched = []
             seen = set()
@@ -486,9 +487,10 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                 return msg
 
             def _patch_rope(obj_name, obj):
-                if obj is None or id(obj) in seen or not hasattr(obj, "get_rope_index"):
+                key = (id(obj), "get_rope_index")
+                if obj is None or key in seen or not hasattr(obj, "get_rope_index"):
                     return
-                seen.add(id(obj))
+                seen.add(key)
                 orig = getattr(obj, "get_rope_index")
                 try:
                     sig = inspect.signature(orig)
@@ -521,18 +523,57 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                 setattr(obj, "get_rope_index", wrapped)
                 patched.append((obj, "get_rope_index", orig))
 
-            def _patch_lm_forward(obj_name, obj):
-                if obj is None or not hasattr(obj, "forward") or id(obj) in seen:
+            def _patch_compute3d(obj_name, obj):
+                key = (id(obj), "compute_3d_position_ids")
+                if obj is None or key in seen or not hasattr(obj, "compute_3d_position_ids"):
                     return
-                seen.add(id(obj))
+                seen.add(key)
+                orig = getattr(obj, "compute_3d_position_ids")
+                try:
+                    sig = inspect.signature(orig)
+                except Exception:  # noqa: BLE001
+                    sig = None
+
+                def wrapped(*args, **kwargs):
+                    bound_args = {}
+                    if sig is not None:
+                        try:
+                            bound_args = dict(sig.bind_partial(*args, **kwargs).arguments)
+                        except Exception:  # noqa: BLE001
+                            bound_args = {}
+                    merged = dict(bound_args)
+                    merged.update(kwargs)
+                    out = orig(*args, **kwargs)
+                    compute3d_calls.append(
+                        {
+                            "where": obj_name,
+                            "n_args": len(args),
+                            "keys": sorted(merged.keys()),
+                            "attention_mask": _summarize_pos(merged.get("attention_mask")),
+                            "pos_shape": tuple(out.shape) if torch.is_tensor(out) else type(out).__name__,
+                            "pos": _add_text_axis_if_needed(out, L) if torch.is_tensor(out) else None,
+                        }
+                    )
+                    return out
+
+                setattr(obj, "compute_3d_position_ids", wrapped)
+                patched.append((obj, "compute_3d_position_ids", orig))
+
+            def _patch_lm_forward(obj_name, obj):
+                key = (id(obj), "forward")
+                if obj is None or not hasattr(obj, "forward") or key in seen:
+                    return
+                seen.add(key)
                 orig = getattr(obj, "forward")
 
                 def wrapped(*args, **kwargs):
+                    pos = kwargs.get("position_ids")
                     lm_calls.append(
                         {
                             "where": obj_name,
                             "keys": sorted(kwargs.keys()),
-                            "position_ids": _summarize_pos(kwargs.get("position_ids")),
+                            "position_ids": _summarize_pos(pos),
+                            "position_ids_tensor": _add_text_axis_if_needed(pos, L) if torch.is_tensor(pos) else None,
                             "cache_position": _summarize_pos(kwargs.get("cache_position")),
                             "attention_mask": _summarize_pos(kwargs.get("attention_mask")),
                             "inputs_embeds": _summarize_pos(kwargs.get("inputs_embeds")),
@@ -546,6 +587,8 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             _patch_rope("hf", hf)
             _patch_rope("hf.model", getattr(hf, "model", None))
             _patch_rope("processor", processor)
+            _patch_compute3d("hf", hf)
+            _patch_compute3d("hf.model", getattr(hf, "model", None))
             _patch_lm_forward("hf.language_model", getattr(hf, "language_model", None))
             _patch_lm_forward("hf.model.language_model", getattr(getattr(hf, "model", None), "language_model", None))
             try:
@@ -566,13 +609,32 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             for cidx, call in enumerate(rope_calls):
                 _p(f"[PROVE] HF get_rope_index call{cidx}@{call['where']}: n_args={call['n_args']} "
                    f"keys={call['keys']} mm_token_type_ids={call['mmtt']} out_shape={call['pos_shape']}")
+            if not compute3d_calls:
+                _p("[PROVE] HF forward recompute did not call any captured compute_3d_position_ids attr")
+            for cidx, call in enumerate(compute3d_calls):
+                _p(f"[PROVE] HF compute_3d_position_ids call{cidx}@{call['where']}: n_args={call['n_args']} "
+                   f"keys={call['keys']} attention_mask={call['attention_mask']} out_shape={call['pos_shape']}")
             if not lm_calls:
                 _p("[PROVE] HF forward recompute did not reach a captured language_model.forward")
             for cidx, call in enumerate(lm_calls):
                 _p(f"[PROVE] HF language_model.forward call{cidx}@{call['where']}: keys={call['keys']} "
                    f"position_ids={call['position_ids']} cache_position={call['cache_position']} "
                    f"attention_mask={call['attention_mask']} inputs_embeds={call['inputs_embeds']}")
-            return rope_calls[-1]["pos"] if rope_calls else None
+            out = {}
+            if rope_calls:
+                out["hf-get_rope"] = rope_calls[-1]["pos"]
+            if compute3d_calls:
+                out["hf-compute3d"] = compute3d_calls[-1]["pos"]
+            lm_pos = next((call["position_ids_tensor"] for call in reversed(lm_calls) if call["position_ids_tensor"] is not None), None)
+            if lm_pos is not None:
+                out["hf-lm-pos"] = lm_pos
+            elif lm_calls:
+                # If the text model receives no explicit position_ids, its own fallback is
+                # cache_position expanded to the three MRoPE axes. Compare that effective
+                # fallback explicitly so the mismatch is visible.
+                ar = torch.arange(L, dtype=torch.long)
+                out["hf-lm-fallback"] = ar.unsqueeze(0).expand(4, -1)
+            return out
 
         # V1 WAY: get_rope_index WITHOUT mm_token_type_ids, then prepend text axis (verbatim v1 logic)
         pv = None
@@ -620,7 +682,7 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             d = (x[:, :k] - pd[:, :k]).abs()
             per_ch = d.max(dim=1).values.tolist()
             nmis = int((d.sum(0) > 0).sum())
-            _p(f"[PROVE] {name:10s} vs DUMP: identical={nmis == 0} max_abs_per_channel(t,h,w,+)={per_ch} "
+            _p(f"[PROVE] {name:15s} vs DUMP: identical={nmis == 0} max_abs_per_channel(text,t,h,w)={per_ch} "
                f"mismatch_positions={nmis}/{k}")
             return nmis
 
@@ -639,11 +701,13 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
         nmis_async = _cmp("async(budget)", pa)
         nmis_markall = _cmp("v1-markall", pm)
         nmis_v1 = _cmp("v1-no-mmtt", pv)
-        nmis_hf = _cmp("hf-recompute", ph)
+        hf_pos_items = ph if isinstance(ph, dict) else {"hf-recompute": ph}
+        nmis_hf = {name: _cmp(name, pos) for name, pos in hf_pos_items.items()}
         _show_first_mismatch("async(budget)", pa, nmis_async)
         _show_first_mismatch("v1-markall", pm, nmis_markall)
         _show_first_mismatch("v1-no-mmtt", pv, nmis_v1)
-        _show_first_mismatch("hf-recompute", ph, nmis_hf)
+        for name, pos in hf_pos_items.items():
+            _show_first_mismatch(name, pos, nmis_hf.get(name))
 
         # feed each to HF and show |A - C|
         A = _seq("old_log_probs", i)
@@ -674,7 +738,8 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
         _hf_ac("async(budget)", pa)
         _hf_ac("v1-markall", pm)
         _hf_ac("v1-no-mmtt", pv)
-        _hf_ac("hf-recompute", ph)
+        for name, pos in hf_pos_items.items():
+            _hf_ac(name, pos)
     _p("\n[PROVE] READ: async(grid-budget) / v1-markall / DUMP identify whether trainer-side MRoPE construction")
     _p("[PROVE] matches the saved training positions. hf-recompute is the --no-position-ids path; under verl's")
     _p("[PROVE] patched Qwen3-VL forward it may not call processor/model.get_rope_index at all, which means")
