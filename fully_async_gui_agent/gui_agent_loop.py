@@ -666,6 +666,25 @@ class GUIAgentLoop(MultiTrajectoryAgentLoop):
                                 "response_ids": list(response_ids),
                                 "response_logprobs": list(response_logprobs),  # A = vLLM logp (as recorded)
                                 "multi_modal_data": multi_modal_data,  # raw PIL images sent to vLLM (for D & C)
+                                # Sampling params ACTUALLY used at rollout (temperature/top_p/top_k/seed/...).
+                                "sampling_params": dict(sampling_params) if isinstance(sampling_params, dict) else str(sampling_params),
+                                # logprobs_mode is a ROLLOUT ENGINE config (NOT in sampling_params) and it decides
+                                # whether the recorded A is raw vs processed logprobs (default is processed!). The
+                                # fresh vLLM (D) MUST use the same, or A-D won't match. Read it from rollout_config.
+                                "logprobs_mode": getattr(self.rollout_config, "logprobs_mode", None),
+                                "calculate_log_probs": getattr(self.rollout_config, "calculate_log_probs", None),
+                                # vLLM's OWN image-expanded prompt token ids for byte-exact replay. TokenOutput has
+                                # no such field today, so this is usually None (would need a vLLM-server-side dump of
+                                # final_res.prompt_token_ids into extra_fields). D falls back to re-expanding the raw
+                                # image (deterministic -> same prompt) and aligns via vLLM's own prompt_token_ids.
+                                "vllm_prompt_token_ids": (
+                                    list(getattr(output, "prompt_token_ids", None))
+                                    if getattr(output, "prompt_token_ids", None) is not None
+                                    else (list((output.extra_fields or {}).get("prompt_token_ids"))
+                                          if getattr(output, "extra_fields", None)
+                                          and (output.extra_fields or {}).get("prompt_token_ids") is not None
+                                          else None)
+                                ),
                                 "turn": turn,
                                 "model_path": os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", ""),
                             },
