@@ -453,10 +453,11 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
            f"extra_image_tokens={max(0, n_img_tok - grid_budget)}")
 
         def _capture_hf_recompute_positions():
-            """Run HF without explicit position_ids and capture any internal get_rope_index output."""
+            """Run HF without explicit position_ids and capture the actual patched-HF position path."""
             import inspect
 
-            calls = []
+            rope_calls = []
+            lm_calls = []
             patched = []
             seen = set()
 
@@ -468,7 +469,23 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                 counts = {int(v): int((m == v).sum()) for v in vals}
                 return f"shape={tuple(m.shape)} counts={counts}"
 
-            def _patch(obj_name, obj):
+            def _summarize_pos(pos):
+                if pos is None:
+                    return "absent"
+                if not torch.is_tensor(pos):
+                    return type(pos).__name__
+                p = pos.detach().cpu()
+                msg = f"shape={tuple(p.shape)} dtype={p.dtype}"
+                if p.numel():
+                    flat = p.reshape(-1)
+                    msg += f" min={int(flat.min())} max={int(flat.max())}"
+                    if p.dim() >= 1:
+                        last = p.reshape(-1, p.shape[-1])
+                        starts = int((last[:, 0] == 0).sum())
+                        msg += f" first_col_zero_rows={starts}/{last.shape[0]}"
+                return msg
+
+            def _patch_rope(obj_name, obj):
                 if obj is None or id(obj) in seen or not hasattr(obj, "get_rope_index"):
                     return
                 seen.add(id(obj))
@@ -489,7 +506,7 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                     merged.update(kwargs)
                     out = orig(*args, **kwargs)
                     pos = out[0] if isinstance(out, (tuple, list)) else out
-                    calls.append(
+                    rope_calls.append(
                         {
                             "where": obj_name,
                             "n_args": len(args),
@@ -502,11 +519,35 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
                     return out
 
                 setattr(obj, "get_rope_index", wrapped)
-                patched.append((obj, orig))
+                patched.append((obj, "get_rope_index", orig))
 
-            _patch("hf", hf)
-            _patch("hf.model", getattr(hf, "model", None))
-            _patch("processor", processor)
+            def _patch_lm_forward(obj_name, obj):
+                if obj is None or not hasattr(obj, "forward") or id(obj) in seen:
+                    return
+                seen.add(id(obj))
+                orig = getattr(obj, "forward")
+
+                def wrapped(*args, **kwargs):
+                    lm_calls.append(
+                        {
+                            "where": obj_name,
+                            "keys": sorted(kwargs.keys()),
+                            "position_ids": _summarize_pos(kwargs.get("position_ids")),
+                            "cache_position": _summarize_pos(kwargs.get("cache_position")),
+                            "attention_mask": _summarize_pos(kwargs.get("attention_mask")),
+                            "inputs_embeds": _summarize_pos(kwargs.get("inputs_embeds")),
+                        }
+                    )
+                    return orig(*args, **kwargs)
+
+                setattr(obj, "forward", wrapped)
+                patched.append((obj, "forward", orig))
+
+            _patch_rope("hf", hf)
+            _patch_rope("hf.model", getattr(hf, "model", None))
+            _patch_rope("processor", processor)
+            _patch_lm_forward("hf.language_model", getattr(hf, "language_model", None))
+            _patch_lm_forward("hf.model.language_model", getattr(getattr(hf, "model", None), "language_model", None))
             try:
                 with torch.no_grad():
                     kw = {"input_ids": ids2, "use_cache": False}
@@ -517,16 +558,21 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
             except Exception as e:  # noqa: BLE001
                 _p(f"[PROVE] HF forward recompute-position run failed: {e!r}")
             finally:
-                for obj, orig in patched:
-                    setattr(obj, "get_rope_index", orig)
+                for obj, attr, orig in patched:
+                    setattr(obj, attr, orig)
 
-            if not calls:
+            if not rope_calls:
                 _p("[PROVE] HF forward recompute did not call any captured get_rope_index attr")
-                return None
-            for cidx, call in enumerate(calls):
+            for cidx, call in enumerate(rope_calls):
                 _p(f"[PROVE] HF get_rope_index call{cidx}@{call['where']}: n_args={call['n_args']} "
                    f"keys={call['keys']} mm_token_type_ids={call['mmtt']} out_shape={call['pos_shape']}")
-            return calls[-1]["pos"]
+            if not lm_calls:
+                _p("[PROVE] HF forward recompute did not reach a captured language_model.forward")
+            for cidx, call in enumerate(lm_calls):
+                _p(f"[PROVE] HF language_model.forward call{cidx}@{call['where']}: keys={call['keys']} "
+                   f"position_ids={call['position_ids']} cache_position={call['cache_position']} "
+                   f"attention_mask={call['attention_mask']} inputs_embeds={call['inputs_embeds']}")
+            return rope_calls[-1]["pos"] if rope_calls else None
 
         # V1 WAY: get_rope_index WITHOUT mm_token_type_ids, then prepend text axis (verbatim v1 logic)
         pv = None
@@ -629,10 +675,12 @@ def _run_prove_positions(path, hf, processor, tokenizer, device):
         _hf_ac("v1-markall", pm)
         _hf_ac("v1-no-mmtt", pv)
         _hf_ac("hf-recompute", ph)
-    _p("\n[PROVE] READ: whichever variant == DUMP and gives |A-C|~0.006 is what training/vLLM use; whichever")
-    _p("[PROVE] differs from DUMP and gives |A-C|~0.28 is the v1 bug. mm_token_type_ids IS emitted by the")
-    _p("[PROVE] processor and REQUIRED by get_rope_index -> the divergence is HOW it's (re)built, not a")
-    _p("[PROVE] processor bug. Compare async(grid-budget) vs v1-markall(all image tokens) vs v1-no-mmtt.")
+    _p("\n[PROVE] READ: async(grid-budget) / v1-markall / DUMP identify whether trainer-side MRoPE construction")
+    _p("[PROVE] matches the saved training positions. hf-recompute is the --no-position-ids path; under verl's")
+    _p("[PROVE] patched Qwen3-VL forward it may not call processor/model.get_rope_index at all, which means")
+    _p("[PROVE] the mismatch is 'no explicit training MRoPE positions were fed', not necessarily a bad")
+    _p("[PROVE] mm_token_type_ids calculation. If async/v1-markall == DUMP but --no-position-ids has a large")
+    _p("[PROVE] logprob gap, treat that gap as a microbench recompute/fallback artifact.")
 
 
 def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_mem):
