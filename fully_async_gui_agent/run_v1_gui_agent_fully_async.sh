@@ -146,12 +146,13 @@ test_freq=-1  # disabled: validation competes for desktop-env containers
 # Streaming: the feeder is the sole producer and fills the pipeline itself, so no
 # warmup backlog (warmup only injects stale gs~0 prompts that age past budget).
 num_warmup_batches=${num_warmup_batches:-0}
-# Every N steps the trainer pushes new weights to the standalone rollout pool
-# (feeder is paused around the sync).
-parameter_sync_step=${parameter_sync_step:-2}
-# Off-policy staleness budget (in parameter-sync units) that sizes the in-flight
-# prompt budget: max_inflight = (1 + staleness_threshold) * parameter_sync_step * train_batch_size.
-staleness_threshold=${staleness_threshold:-1.5}
+# Every N steps the trainer pushes new weights to the standalone rollout pool.
+# Force 1 for on-policy debugging; otherwise rollout can lag the actor between
+# sync points even when staleness_threshold=0.
+parameter_sync_step=1
+# Off-policy staleness budget (in parameter-sync units). Force 0 for on-policy
+# debugging; raise this only when intentionally measuring async throughput.
+staleness_threshold=0
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
 # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).

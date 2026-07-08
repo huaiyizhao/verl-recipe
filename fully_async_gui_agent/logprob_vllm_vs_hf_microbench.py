@@ -280,15 +280,30 @@ def _fmt_abs(x, y):
     return "mean=nan max=nan n=0/0" if s is None else f"mean={s[0]:.4f} max={s[1]:.4f} n={s[2]}/{s[3]}"
 
 
+def _gather_logp_from_logits(logits, labels, temperature=1.0):
+    if temperature is None or temperature <= 0:
+        temperature = 1.0
+    x = logits / float(temperature) if abs(float(temperature) - 1.0) > 1e-8 else logits
+    return torch.log_softmax(x, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+
 def _print_k3_matrix(tag, seq_rows):
     """Print seq-level pairwise K3 in verl rollout-RS direction."""
     pairs = [
         ("A", "B"),
+        ("A", "Bref"),
         ("A", "C"),
+        ("A", "Cpack"),
         ("A", "D"),
+        ("B", "Bref"),
         ("B", "C"),
+        ("B", "Cpack"),
         ("B", "D"),
+        ("Bref", "C"),
+        ("Bref", "Cpack"),
+        ("C", "Cpack"),
         ("C", "D"),
+        ("Cpack", "D"),
     ]
     have_any = False
     _p(f"\n[{tag}] ===== seq-level RS-K3 approximate KL =====")
@@ -337,7 +352,8 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
 
     # Fields can be nested ({values, offsets}) OR plain padded tensors (n_seq, ...). Print + handle both.
     for k in ("input_ids", "position_ids", "responses", "old_log_probs", "rollout_log_probs", "fsdp_log_probs",
-              "response_mask", "pixel_values", "image_grid_thw", "logprobs_mode", "probe_maxk3"):
+              "fsdp_log_probs_ref", "response_mask", "pixel_values", "image_grid_thw", "logprobs_mode",
+              "probe_maxk3"):
         v = b.get(k)
         if isinstance(v, dict) and "values" in v:
             _p(f"  {k}: nested values={tuple(v['values'].shape)} n_off={len(v['offsets'])}")
@@ -407,6 +423,7 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     accA, accB, accC, accD = [], [], [], []
     seq_rows = []
     d_jobs = []
+    pack_jobs = []
 
     def _temp_for_seq(i):
         if temperature is None:
@@ -424,6 +441,99 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         except Exception:  # noqa: BLE001
             return 1.0
 
+    def _run_packed_hf_recompute():
+        """Replay the same dumped sequences as one remove-padding packed HF forward.
+
+        C is the clean per-sequence HF replay. Cpack/Cp is the missing control for the
+        trainer path: concatenate the same rows into a single (1, total_len) sequence,
+        feed the dumped MRoPE position_ids as (channels, 1, total_len), and let the
+        verl Qwen3-VL monkey patch inject varlen cu_seq_lens exactly like training.
+        """
+        if not pack_jobs:
+            return
+        bad_pos = [j["row"]["seq"] for j in pack_jobs if j.get("pos") is None]
+        if bad_pos:
+            _p(f"[ASYNC-BUNDLE] skipping fresh-HF packed(Cp): missing dumped position_ids for seqs={bad_pos}")
+            return
+        ids_parts, pos_parts, pix_parts, grid_parts = [], [], [], []
+        for job in pack_jobs:
+            ids = job["ids"].long().reshape(-1)
+            pos = job["pos"].long()
+            if pos.dim() != 2 or pos.shape[-1] != ids.numel() or pos.shape[0] not in (3, 4):
+                _p(f"[ASYNC-BUNDLE] skipping fresh-HF packed(Cp): seq{job['row']['seq']} "
+                   f"position_ids shape={tuple(pos.shape)} ids_len={ids.numel()}")
+                return
+            ids_parts.append(ids)
+            pos_parts.append(pos)
+            pix_parts.extend(job["seq_pix"])
+            grid_parts.extend(job["seq_grids"])
+        ids_cat = torch.cat(ids_parts).to(device)
+        pos_cat = torch.cat(pos_parts, dim=-1).to(device)
+        _p(f"[ASYNC-BUNDLE] running fresh-HF packed(Cp): n_seq={len(pack_jobs)} "
+           f"total_len={ids_cat.numel()} position_ids={tuple(pos_cat.shape)}")
+        try:
+            with torch.no_grad():
+                kw = {
+                    "input_ids": ids_cat.unsqueeze(0),
+                    "attention_mask": None,
+                    "use_cache": False,
+                    "position_ids": pos_cat.unsqueeze(1),  # (channels, batch=1, total_len)
+                }
+                if pix_parts:
+                    kw["pixel_values"] = torch.cat(pix_parts).to(device).to(hf.dtype)
+                    kw["image_grid_thw"] = torch.stack(grid_parts).to(device)
+                logits_pack = hf(**kw).logits[0].float()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            _p(f"[ASYNC-BUNDLE] fresh-HF packed(Cp) failed: {e!r}")
+            traceback.print_exc()
+            return
+
+        offset = 0
+        for job in pack_jobs:
+            row = job["row"]
+            ids = job["ids"].long().reshape(-1)
+            L = ids.numel()
+            if job["align_mode"] == "response-window":
+                prompt_len = int(job["prompt_len"])
+                resp_len = int(job["resp_len"])
+                lo, hi = offset + prompt_len - 1, offset + L - 1
+                target = ids[prompt_len:L].to(device)
+                mask = job["mask"]
+                if not torch.is_tensor(mask):
+                    mask = torch.ones(resp_len, dtype=torch.bool)
+                mask = mask.bool().reshape(-1)
+                Cp0 = _gather_logp_from_logits(logits_pack[lo:hi], target, temperature=1.0).detach().cpu()
+                Cpt0 = _gather_logp_from_logits(
+                    logits_pack[lo:hi], target, temperature=float(job["temperature"])
+                ).detach().cpu()
+                n = min(Cp0.numel(), mask.numel())
+                Cp = Cp0[:n][mask[:n]]
+                Cpt = Cpt0[:n][mask[:n]]
+            else:
+                rv = int(job["resp_valid"])
+                lo, hi = offset + L - rv - 1, offset + L - 1
+                target = ids[L - rv:L].to(device)
+                Cp = _gather_logp_from_logits(logits_pack[lo:hi], target, temperature=1.0).detach().cpu()
+                Cpt = _gather_logp_from_logits(
+                    logits_pack[lo:hi], target, temperature=float(job["temperature"])
+                ).detach().cpu()
+                mask = job["mask"]
+                if torch.is_tensor(mask) and mask.numel() == Cp.numel():
+                    Cp = Cp[mask.bool().reshape(-1)]
+                    Cpt = Cpt[mask.bool().reshape(-1)]
+
+            k = min(row["n"], Cp.numel(), Cpt.numel())
+            if k > 0:
+                for name in ("A", "B", "Bref", "C", "Ctemp", "tokens"):
+                    if row.get(name) is not None:
+                        row[name] = row[name][:k]
+                row["Cpack"] = Cp[:k]
+                row["CpackTemp"] = Cpt[:k]
+                row["n"] = k
+            offset += L
+
     n_loop = min(n_seq, max_seq) if max_seq and max_seq > 0 else n_seq
     for i in range(n_loop):
         ids_i = _seq("input_ids", i)
@@ -435,10 +545,12 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         if A is None:
             A = _seq("rollout_log_probs", i)
         Bfull = _seq("fsdp_log_probs", i)
+        BrefFull = _seq("fsdp_log_probs_ref", i)
         R = _seq("responses", i)
         rm = _seq("response_mask", i)
         A = A.float().reshape(-1) if A is not None else None
         Bfull = Bfull.float().reshape(-1) if Bfull is not None else None
+        BrefFull = BrefFull.float().reshape(-1) if BrefFull is not None else None
         R = R.long().reshape(-1) if R is not None else None
         rm = rm.reshape(-1).bool() if rm is not None else None
 
@@ -517,8 +629,9 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                     _p(f"[ASYNC-BUNDLE] position_ids shape {tuple(pos_i.shape)} != (channels,{L}); letting HF recompute")
             elif i == 0:
                 _p(f"[ASYNC-BUNDLE] feed_pos={feed_pos}: {'letting HF recompute MRoPE positions' if not feed_pos else 'no position_ids in dump'}")
-            lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
+            logits = hf(**kw).logits[0].float()
         Dv = None
+        Ctm = None
         if align_mode == "response-window":
             mask = rm[:resp_len].detach().cpu() if (rm is not None and rm.numel() >= resp_len) else torch.ones(resp_len, dtype=torch.bool)
 
@@ -533,9 +646,12 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
 
             Av0 = A[:resp_len].detach().cpu() if (A is not None and A.numel() >= resp_len) else None
             Bv0 = _resp_frame(Bfull)
+            Bref0 = _resp_frame(BrefFull)
             target = ids_i[prompt_len:L]
             frames = torch.arange(lo, hi, device=device)
-            Cm0 = lp[frames, target].detach().cpu()
+            resp_logits = logits[frames]
+            Cm0 = _gather_logp_from_logits(resp_logits, target, temperature=1.0).detach().cpu()
+            Ct0 = _gather_logp_from_logits(resp_logits, target, temperature=_temp_for_seq(i)).detach().cpu()
 
             def _masked(x):
                 if x is None:
@@ -545,7 +661,9 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
 
             Av = _masked(Av0)
             Bv = _masked(Bv0)
+            Brefv = _masked(Bref0)
             Cm = _masked(Cm0)
+            Ctm = _masked(Ct0)
             Tv = _masked(target.detach().cpu()).long()
         else:
             # Ambiguous older bundle: no full response frame is available, so compare valid tail tokens.
@@ -561,9 +679,20 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                     Bv = Bfull[-resp_valid:].detach().cpu()
             else:
                 Bv = None
-            Cm = torch.tensor(
-                [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
-            )
+            if BrefFull is not None:
+                if BrefFull.numel() >= L - 1:
+                    Brefv = BrefFull[L - resp_valid - 1:L - 1].detach().cpu()
+                elif rm is not None and rm.numel() == BrefFull.numel():
+                    Brefv = BrefFull[rm].detach().cpu()
+                else:
+                    Brefv = BrefFull[-resp_valid:].detach().cpu()
+            else:
+                Brefv = None
+            frames = torch.arange(L - resp_valid - 1, L - 1, device=device)
+            target = ids_i[L - resp_valid:L]
+            resp_logits = logits[frames]
+            Cm = _gather_logp_from_logits(resp_logits, target, temperature=1.0).detach().cpu()
+            Ctm = _gather_logp_from_logits(resp_logits, target, temperature=_temp_for_seq(i)).detach().cpu()
             Tv0 = ids_i[L - resp_valid:L].detach().cpu()
             Tv = Tv0[mask.bool()] if (torch.is_tensor(mask) and mask.numel() == Tv0.numel()) else Tv0[:resp_valid]
         # defensive: align all to the common valid length
@@ -572,12 +701,16 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             for x in (Cm,)
             + ((Av,) if Av is not None else ())
             + ((Bv,) if Bv is not None else ())
+            + ((Brefv,) if Brefv is not None else ())
+            + ((Ctm,) if Ctm is not None else ())
         )
         if k == 0:
             continue
         Cm = Cm[:k]
+        Ctm = Ctm[:k] if Ctm is not None else None
         Am = Av[:k] if Av is not None else None
         Bm = Bv[:k] if Bv is not None else None
+        Brefm = Brefv[:k] if Brefv is not None else None
         Tm = Tv[:k] if Tv is not None else None
         if Am is not None:
             accA.append(Am)
@@ -589,7 +722,11 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             "n": k,
             "A": Am.detach().cpu() if Am is not None else None,
             "B": Bm.detach().cpu() if Bm is not None else None,
+            "Bref": Brefm.detach().cpu() if Brefm is not None else None,
             "C": Cm.detach().cpu(),
+            "Ctemp": Ctm.detach().cpu() if Ctm is not None else None,
+            "Cpack": None,
+            "CpackTemp": None,
             "D": None,
             "tokens": Tm.detach().cpu() if Tm is not None else None,
             "L": L,
@@ -599,8 +736,24 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             "align_mode": align_mode,
             "resp_len_src": resp_len_src,
             "n_img_tok": n_img_tok,
+            "temperature": _temp_for_seq(i),
         }
         seq_rows.append(row)
+        pack_jobs.append(
+            {
+                "row": row,
+                "ids": ids_i.detach().cpu(),
+                "pos": pos_i.detach().cpu() if pos_i is not None else None,
+                "resp_len": resp_len,
+                "resp_valid": resp_valid,
+                "prompt_len": prompt_len,
+                "align_mode": align_mode,
+                "mask": mask.detach().cpu() if torch.is_tensor(mask) else mask,
+                "seq_pix": [p.detach().cpu() for p in seq_pix],
+                "seq_grids": [g.detach().cpu() for g in seq_grids],
+                "temperature": _temp_for_seq(i),
+            }
+        )
         if with_vllm:
             d_jobs.append(
                 {
@@ -622,10 +775,12 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         _p("[ASYNC-BUNDLE] no comparable response tokens after alignment; check responses/response_mask lengths")
         return
 
+    _run_packed_hf_recompute()
+
     if with_vllm and d_jobs:
         import gc
 
-        ids_i = grid_i = pix_i = lp = kw = pos_i = target = frames = None
+        ids_i = grid_i = pix_i = logits = resp_logits = kw = pos_i = target = frames = None
         _p("[ASYNC-BUNDLE] finished HF(C); releasing HF before loading fresh vLLM(D)")
         del hf
         gc.collect()
@@ -711,11 +866,12 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                         else:
                             Dv = Dv0[:resp_valid]
 
-                    existing = [row[k] for k in ("A", "B", "C") if row.get(k) is not None]
+                    existing = [row[k] for k in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp")
+                                if row.get(k) is not None]
                     k = min([Dv.numel()] + [x.numel() for x in existing])
                     if k == 0:
                         continue
-                    for name in ("A", "B", "C"):
+                    for name in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp"):
                         if row.get(name) is not None:
                             row[name] = row[name][:k]
                     if row.get("tokens") is not None:
@@ -750,10 +906,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             return
         order = finite[torch.argsort(d[finite], descending=True)[:topk]]
         toks = row.get("tokens")
-        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} tokens (pos | A B C D | token):")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} tokens (pos | A B Bref C Cp Ct Cpt D | token):")
         for j in order.tolist():
             vals = []
-            for name in ("A", "B", "C", "D"):
+            for name in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp", "D"):
                 v = row.get(name)
                 vals.append("   nan" if v is None or j >= v.numel() else f"{float(v[j]):+7.3f}")
             tok_id = int(toks[j]) if torch.is_tensor(toks) and j < toks.numel() else None
@@ -761,25 +917,52 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             _p(f"    {j:4d} | {' '.join(vals)} | {tok!r}")
 
     for row in seq_rows:
-        Am, Bm, Cm, Dm = row.get("A"), row.get("B"), row.get("C"), row.get("D")
+        Am, Bm = row.get("A"), row.get("B")
+        Brm, Cm = row.get("Bref"), row.get("C")
+        Cpm, Ctm, Cptm, Dm = row.get("Cpack"), row.get("Ctemp"), row.get("CpackTemp"), row.get("D")
         dab = _mean_abs_or_nan(Am, Bm)
+        dabr = _mean_abs_or_nan(Am, Brm)
         dac = _mean_abs_or_nan(Am, Cm)
+        dacp = _mean_abs_or_nan(Am, Cpm)
+        dbbr = _mean_abs_or_nan(Bm, Brm)
         dbc = _mean_abs_or_nan(Bm, Cm)
+        dbcp = _mean_abs_or_nan(Bm, Cpm)
+        dbrc = _mean_abs_or_nan(Brm, Cm)
+        dbrcp = _mean_abs_or_nan(Brm, Cpm)
+        dccp = _mean_abs_or_nan(Cm, Cpm)
+        dbct = _mean_abs_or_nan(Bm, Ctm)
+        dbcpt = _mean_abs_or_nan(Bm, Cptm)
         dad = _mean_abs_or_nan(Am, Dm)
         dcd = _mean_abs_or_nan(Cm, Dm)
+        dcpd = _mean_abs_or_nan(Cpm, Dm)
         kab = _rs_k3_mean(Am, Bm) if (Am is not None and Bm is not None) else float("nan")
         _p(f"[ASYNC-BUNDLE] seq{row['seq']} L={row['L']} resp_len={row['resp_len']} "
            f"resp_valid={row['resp_valid']} prompt_len={row['prompt_len']} "
-           f"align={row['align_mode']}/{row['resp_len_src']} imgtok={row['n_img_tok']} | "
+           f"align={row['align_mode']}/{row['resp_len_src']} imgtok={row['n_img_tok']} "
+           f"temp={row['temperature']:.4g} | "
            f"|A-B|dumpVLLM_vs_dumpFSDP={dab:.4f} |A-C|dumpVLLM_vs_freshHF={dac:.4f} "
-           f"|B-C|dumpFSDP_vs_freshHF={dbc:.4f} |A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
-           f"|C-D|freshHF_vs_freshVLLM={dcd:.4f}")
+           f"|A-Cp|dumpVLLM_vs_freshHF_PACK={dacp:.4f} "
+           f"|B-C|dumpFSDP_vs_freshHF={dbc:.4f} |B-Cp|dumpFSDP_vs_freshHF_PACK={dbcp:.4f} "
+           f"|C-Cp|singleHF_vs_packHF={dccp:.4f} "
+           f"|B-Ctemp|dumpFSDP_vs_HF/temp={dbct:.4f} |B-Cptemp|dumpFSDP_vs_PACK/temp={dbcpt:.4f} "
+           f"|A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
+           f"|C-D|freshHF_vs_freshVLLM={dcd:.4f} |Cp-D|freshHF_PACK_vs_freshVLLM={dcpd:.4f}")
+        if Brm is not None:
+            _p(f"[ASYNC-BUNDLE] seq{row['seq']} FSDP-logprob-check: "
+               f"|B-Bref|kernel_vs_torch_ref={dbbr:.6f} |A-Bref|dumpVLLM_vs_ref={dabr:.4f} "
+               f"|Bref-C|torch_ref_vs_freshHF={dbrc:.4f} |Bref-Cp|torch_ref_vs_freshHF_PACK={dbrcp:.4f}")
         _p(f"[ASYNC-BUNDLE] seq{row['seq']} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
            f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
         _print_worst_pair(row, "|A-B|", "A", "B")
+        _print_worst_pair(row, "|B-Bref|", "B", "Bref")
         _print_worst_pair(row, "|B-C|", "B", "C")
+        _print_worst_pair(row, "|B-Cp|", "B", "Cpack")
+        _print_worst_pair(row, "|C-Cp|", "C", "Cpack")
+        _print_worst_pair(row, "|Bref-C|", "Bref", "C")
+        _print_worst_pair(row, "|Bref-Cp|", "Bref", "Cpack")
         _print_worst_pair(row, "|A-D|", "A", "D")
         _print_worst_pair(row, "|C-D|", "C", "D")
+        _print_worst_pair(row, "|Cp-D|", "Cpack", "D")
 
     _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
 
@@ -803,17 +986,28 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             _p(f"  {label}: {_fmt_abs(x, y)}")
 
     _print_pair("|A-B| dump-vLLM vs dump-FSDP       ", "A", "B")
+    _print_pair("|A-Br| dump-vLLM vs FSDP torch-ref ", "A", "Bref")
     _print_pair("|A-C| dump-vLLM vs fresh-HF/FSDP    ", "A", "C")
+    _print_pair("|A-Cp| dump-vLLM vs fresh-HF PACK   ", "A", "Cpack")
+    _print_pair("|B-Br| FSDP kernel vs torch-ref     ", "B", "Bref")
     _print_pair("|B-C| dump-FSDP vs fresh-HF (sanity)", "B", "C")
+    _print_pair("|B-Cp| dump-FSDP vs fresh-HF PACK   ", "B", "Cpack")
+    _print_pair("|Br-C| FSDP torch-ref vs fresh-HF   ", "Bref", "C")
+    _print_pair("|Br-Cp| FSDP torch-ref vs HF PACK   ", "Bref", "Cpack")
+    _print_pair("|C-Cp| fresh-HF single vs HF PACK   ", "C", "Cpack")
+    _print_pair("|B-Ct| dump-FSDP vs fresh-HF/temp   ", "B", "Ctemp")
+    _print_pair("|B-Cpt| dump-FSDP vs HF PACK/temp   ", "B", "CpackTemp")
     _print_pair("|A-D| dump-vLLM vs fresh-vLLM       ", "A", "D")
     _print_pair("|B-D| dump-FSDP vs fresh-vLLM       ", "B", "D")
     _print_pair("|C-D| fresh-HF vs fresh-vLLM        ", "C", "D")
+    _print_pair("|Cp-D| fresh-HF PACK vs fresh-vLLM  ", "Cpack", "D")
     _print_k3_matrix("ASYNC-BUNDLE", seq_rows)
     if not accD:
         _p("[ASYNC-BUNDLE] D=fresh-vLLM is unavailable because vLLM init/replay failed; A/B/C are still valid.")
-    _p("  READ: A=dump vLLM, B=dump FSDP, C=fresh HF/FSDP, D=fresh vLLM.")
-    _p("        |B-C| small => offline HF reproduces dumped FSDP. |A-D| small => dumped vLLM is reproducible.")
-    _p("        |C-D| is the clean fresh HF-vs-vLLM gap on the same reconstructed visual input.")
+    _p("  READ: A=dump vLLM, B=dump FSDP, C=fresh HF single-seq, Cp=fresh HF packed-varlen, D=fresh vLLM.")
+    _p("        |B-Cp| small while |C-Cp|/|B-C| large => the training packed/varlen path reproduces B.")
+    _p("        |B-Cp| large too => B differs beyond packing (weights/FSDP state/logprob kernel).")
+    _p("        |A-D| small => dumped vLLM is reproducible; |C-D|/|Cp-D| are clean HF-vs-vLLM gaps.")
 
 
 def _run_prove_positions(path, hf, processor, tokenizer, device):
@@ -1393,7 +1587,7 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     tokenizer = processor.tokenizer
 
-    _p("\n################## ABCD BENCH (A=dump vLLM / B=dump FSDP / C=fresh HF / D=fresh vLLM) ##################")
+    _p("\n################## ABCD+Cp BENCH (A=dump vLLM / B=dump FSDP / C=fresh HF single / Cp=fresh HF packed / D=fresh vLLM) ##################")
     _run_async_bundle(
         args.async_bundle,
         args.model,
