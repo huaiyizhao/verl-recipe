@@ -34,6 +34,7 @@ Run on the GPU box (needs vLLM + a GPU):
 """
 
 import argparse
+import math
 
 import torch
 
@@ -98,20 +99,143 @@ def _pixel_stats(tag, pv):
     )
 
 
-def _k3(ref_logp, other_logp):
-    """Per-token k3 approximate KL with tokens sampled from ref: exp(other-ref)-1-(other-ref)."""
-    n = min(ref_logp.numel(), other_logp.numel())
+def _collapse_image_runs(ids, image_token_id):
+    """vLLM wants one image placeholder per image; dumped input_ids have one per image patch token."""
+    out, n_runs, prev = [], 0, False
+    for t in ids:
+        t = int(t)
+        is_img = image_token_id is not None and t == image_token_id
+        if is_img:
+            if not prev:
+                out.append(t)
+                n_runs += 1
+        else:
+            out.append(t)
+        prev = is_img
+    return out, n_runs
+
+
+def _vllm_seq_logprobs(llm, sampling_params, unexpanded_full, images, response_ids, n):
+    """Teacher-force one sequence through vLLM and return response-token prompt logprobs."""
+    req = {"prompt_token_ids": [int(x) for x in unexpanded_full]}
+    if images:
+        req["multi_modal_data"] = {"image": images}
+    out = llm.generate([req], sampling_params)[0]
+    prompt_logprobs = out.prompt_logprobs
+    vpids = [int(x) for x in out.prompt_token_ids] if out.prompt_token_ids is not None else list(unexpanded_full)
+
+    def _lp(entry, tok):
+        if not entry:
+            return float("nan")
+        for k in (tok, str(tok)):
+            if k in entry:
+                e = entry[k]
+                return float(getattr(e, "logprob", e))
+        return float("nan")
+
+    resp_ids_n = [int(x) for x in response_ids[:n]]
+    base = len(vpids) - n
+    if n and vpids[-n:] != resp_ids_n:
+        for s in range(len(vpids) - n, -1, -1):
+            if vpids[s:s + n] == resp_ids_n:
+                base = s
+                break
+        else:
+            _p("[FRESH-vLLM] WARNING: response not found verbatim in vLLM prompt; using tail")
+    return torch.tensor(
+        [_lp(prompt_logprobs[base + j] if prompt_logprobs is not None else None, vpids[base + j]) for j in range(n)],
+        dtype=torch.float64,
+    )
+
+
+def _processor_param(processor, name, default=None):
+    for obj in (getattr(processor, "image_processor", None), getattr(processor, "video_processor", None)):
+        if obj is not None and hasattr(obj, name):
+            v = getattr(obj, name)
+            if v is not None:
+                return v
+    return default
+
+
+def _as_3(v, default):
+    if v is None:
+        v = default
+    if isinstance(v, (int, float)):
+        return [float(v), float(v), float(v)]
+    return [float(x) for x in v]
+
+
+def _pixels_to_reconstructed_images(pixel_chunks, grid_chunks, processor):
+    """Invert Qwen2/Qwen3-VL patchify+normalize into resized PIL images for fresh vLLM replay.
+
+    This reconstructs the post-resize uint8 image represented by pixel_values. It cannot recover the
+    original screenshot dimensions/crop, but reprocessing this image should reproduce the same visual
+    patches up to dtype/rounding noise.
+    """
+    from PIL import Image
+
+    patch_size = int(_processor_param(processor, "patch_size", 0) or 0)
+    temporal_patch_size = int(_processor_param(processor, "temporal_patch_size", 2) or 2)
+    merge_size = int(_processor_param(processor, "merge_size", None) or _processor_param(processor, "spatial_merge_size", 2) or 2)
+    do_normalize = bool(_processor_param(processor, "do_normalize", True))
+    do_rescale = bool(_processor_param(processor, "do_rescale", True))
+    rescale_factor = float(_processor_param(processor, "rescale_factor", 1 / 255.0) or (1 / 255.0))
+    mean = _as_3(_processor_param(processor, "image_mean", None), [0.5, 0.5, 0.5])
+    std = _as_3(_processor_param(processor, "image_std", None), [0.5, 0.5, 0.5])
+
+    images = []
+    for pv, grid in zip(pixel_chunks, grid_chunks, strict=False):
+        pv = pv.detach().cpu().float()
+        t, h, w = [int(x) for x in grid.detach().cpu().reshape(-1)[:3].tolist()]
+        dim = int(pv.shape[-1])
+        if patch_size <= 0 or 3 * temporal_patch_size * patch_size * patch_size != dim:
+            if patch_size > 0 and dim % (3 * patch_size * patch_size) == 0:
+                temporal_patch_size = dim // (3 * patch_size * patch_size)
+            else:
+                patch_size = int(round(math.sqrt(dim / (3 * temporal_patch_size))))
+        expected_dim = 3 * temporal_patch_size * patch_size * patch_size
+        if expected_dim != dim:
+            raise ValueError(
+                f"cannot invert pixel_values dim={dim}; inferred patch={patch_size}, temporal={temporal_patch_size}"
+            )
+        n_patches = t * h * w
+        if pv.shape[0] < n_patches:
+            raise ValueError(f"pixel chunk too short: got {pv.shape[0]} patches, need {n_patches}")
+        ghm, gwm = h // merge_size, w // merge_size
+        if ghm * merge_size != h or gwm * merge_size != w:
+            raise ValueError(f"grid h/w must be divisible by merge_size: grid={(t, h, w)} merge={merge_size}")
+
+        x = pv[:n_patches].reshape(
+            t, ghm, gwm, merge_size, merge_size, 3, temporal_patch_size, patch_size, patch_size
+        )
+        # Forward patchify order is (t, gh/m, gw/m, m, m, c, tp, p, p). Invert back to frames, C, H, W.
+        frames = x.permute(0, 6, 5, 1, 3, 7, 2, 4, 8).contiguous()
+        frames = frames.reshape(t * temporal_patch_size, 3, h * patch_size, w * patch_size)
+        if do_normalize:
+            mean_t = torch.tensor(mean, dtype=frames.dtype).view(1, 3, 1, 1)
+            std_t = torch.tensor(std, dtype=frames.dtype).view(1, 3, 1, 1)
+            frames = frames * std_t + mean_t
+        if do_rescale:
+            frames = frames / rescale_factor
+        arr = frames[0].permute(1, 2, 0).clamp(0, 255).round().to(torch.uint8).numpy()
+        images.append(Image.fromarray(arr, mode="RGB"))
+    return images
+
+
+def _rs_k3(rollout_logp, training_logp):
+    """K3 in the same direction as verl rollout RS: d = logp_training - logp_rollout."""
+    n = min(rollout_logp.numel(), training_logp.numel())
     if n == 0:
         return torch.empty(0, dtype=torch.float64)
-    ref = ref_logp[:n].to(torch.float64)
-    other = other_logp[:n].to(torch.float64)
-    d = (other - ref).clamp(-20, 20)
+    rollout = rollout_logp[:n].to(torch.float64)
+    training = training_logp[:n].to(torch.float64)
+    d = (training - rollout).clamp(-20, 20)
     out = torch.exp(d) - 1.0 - d
     return out[torch.isfinite(out)]
 
 
-def _k3_mean(ref_logp, other_logp):
-    v = _k3(ref_logp, other_logp)
+def _rs_k3_mean(rollout_logp, training_logp):
+    v = _rs_k3(rollout_logp, training_logp)
     return float(v.mean()) if v.numel() else float("nan")
 
 
@@ -119,12 +243,27 @@ def _fmt(v):
     return "nan" if not torch.isfinite(torch.tensor(v)) else f"{v:.5f}"
 
 
-def _print_k3_matrix(tag, seq_rows):
-    """Print seq-level pairwise k3 over whatever named logprob streams are available.
+def _abs_stats(x, y):
+    if x is None or y is None:
+        return None
+    n = min(x.numel(), y.numel())
+    if n == 0:
+        return None
+    d = (x[:n].to(torch.float64) - y[:n].to(torch.float64)).abs()
+    m = torch.isfinite(d)
+    if int(m.sum()) == 0:
+        return None
+    dd = d[m]
+    return float(dd.mean()), float(dd.max()), int(m.sum()), int(m.numel())
 
-    Label convention: K3(X||Y) means tokens are sampled from X and scored by Y, matching the
-    rollout-correction code path where d = logp_Y - logp_X.
-    """
+
+def _fmt_abs(x, y):
+    s = _abs_stats(x, y)
+    return "mean=nan max=nan n=0/0" if s is None else f"mean={s[0]:.4f} max={s[1]:.4f} n={s[2]}/{s[3]}"
+
+
+def _print_k3_matrix(tag, seq_rows):
+    """Print seq-level pairwise K3 in verl rollout-RS direction."""
     pairs = [
         ("A", "B"),
         ("A", "C"),
@@ -134,13 +273,13 @@ def _print_k3_matrix(tag, seq_rows):
         ("C", "D"),
     ]
     have_any = False
-    _p(f"\n[{tag}] ===== seq-level k3 approximate KL =====")
-    _p(f"[{tag}] convention: K3(X||Y)=mean(exp(logp_Y-logp_X)-1-(logp_Y-logp_X)) over response tokens")
+    _p(f"\n[{tag}] ===== seq-level RS-K3 approximate KL =====")
+    _p(f"[{tag}] convention: K3(rollout||training)=mean(exp(logp_training-logp_rollout)-1-(logp_training-logp_rollout))")
     for row in seq_rows:
         vals = []
         for a, b in pairs:
             if row.get(a) is not None and row.get(b) is not None:
-                vals.append(f"K3({a}||{b})={_fmt(_k3_mean(row[a], row[b]))}")
+                vals.append(f"K3({a}||{b})={_fmt(_rs_k3_mean(row[a], row[b]))}")
         if vals:
             have_any = True
             _p(f"[{tag}] seq{row['seq']} n={row['n']} " + " ".join(vals))
@@ -154,18 +293,20 @@ def _print_k3_matrix(tag, seq_rows):
                     xs.append(row[a][:n])
                     ys.append(row[b][:n])
         if xs:
-            agg[(a, b)] = _k3_mean(torch.cat(xs), torch.cat(ys))
+            agg[(a, b)] = _rs_k3_mean(torch.cat(xs), torch.cat(ys))
     if agg:
         _p(f"[{tag}] aggregate " + " ".join(f"K3({a}||{b})={_fmt(v)}" for (a, b), v in agg.items()))
     if not have_any:
         _p(f"[{tag}] no pairwise streams available for k3")
 
 
-def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
+def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_pos=True, with_vllm=True,
+                      gpu_mem=0.6, max_seq=0):
     """Load an async-run probe bundle and 3-way compare, per response token:
         A = async's recorded old_log_probs  (vLLM, since bypass_mode sets old = rollout_log_probs)
         B = async's recorded fsdp_log_probs (the async FSDP forward during that run)
         C = a FRESH HF/FSDP recompute here, on the SAME tokens+pixels.
+        D = optional FRESH vLLM recompute; if raw_images are absent, reconstruct resized images from pixel_values.
     |A-B| reproduces async's tiny recorded gap. |A-C| is the KEY: if small, async's "vLLM" old_log_prob
     actually matches a fresh FSDP forward on real GUI data (=> the real vLLM<->FSDP gap is small, and the
     microbench's 0.28 was a verbose-prompt artifact); if ~0.28, async old IS vLLM-with-vision-gap.
@@ -174,8 +315,8 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
     b = torch.load(path, map_location="cpu", weights_only=False)
 
     # Fields can be nested ({values, offsets}) OR plain padded tensors (n_seq, ...). Print + handle both.
-    for k in ("input_ids", "position_ids", "old_log_probs", "fsdp_log_probs", "response_mask", "pixel_values",
-              "image_grid_thw"):
+    for k in ("input_ids", "position_ids", "responses", "old_log_probs", "rollout_log_probs", "fsdp_log_probs",
+              "response_mask", "pixel_values", "image_grid_thw", "logprobs_mode", "probe_maxk3"):
         v = b.get(k)
         if isinstance(v, dict) and "values" in v:
             _p(f"  {k}: nested values={tuple(v['values'].shape)} n_off={len(v['offsets'])}")
@@ -228,42 +369,133 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
 
     pix = b.get("pixel_values")
     grid = b.get("image_grid_thw")
+    if isinstance(pix, dict) and "values" in pix:
+        pix = pix["values"]
+    if isinstance(grid, dict) and "values" in grid:
+        grid = grid["values"]
+    raw_images = b.get("raw_images")
+    logprobs_mode = b.get("logprobs_mode") or "raw_logprobs"
+    temperature = b.get("temperature")
     image_token_id = getattr(processor, "image_token_id", None)
-    merge = processor.image_processor.merge_size
+    if image_token_id is None:
+        image_token_id = getattr(getattr(hf, "config", None), "image_token_id", None)
+    merge = int(_processor_param(processor, "merge_size", None) or _processor_param(processor, "spatial_merge_size", 2) or 2)
     _p(f"[ASYNC-BUNDLE] n_seq={n_seq}")
 
+    llm = SamplingParams = None
+    if with_vllm:
+        try:
+            from vllm import LLM, SamplingParams
+
+            if raw_images and any(raw_images):
+                max_imgs = max((len(x or []) for x in raw_images), default=1)
+                img_src_msg = "raw_images"
+            else:
+                max_imgs = int(grid.shape[0]) if torch.is_tensor(grid) else 1
+                img_src_msg = "reconstructed from pixel_values"
+            _p(f"[ASYNC-BUNDLE] loading fresh vLLM(D), images={img_src_msg}, "
+               f"logprobs_mode={logprobs_mode}, max_imgs={max(1, max_imgs)}, gpu_mem={gpu_mem}")
+            llm_kwargs = dict(
+                model=model_path,
+                dtype="bfloat16",
+                trust_remote_code=True,
+                gpu_memory_utilization=gpu_mem,
+                max_model_len=32768,
+                limit_mm_per_prompt={"image": max(1, max_imgs)},
+                enforce_eager=True,
+            )
+            try:
+                llm = LLM(logprobs_mode=logprobs_mode, **llm_kwargs)
+            except TypeError:
+                _p("[ASYNC-BUNDLE] this vLLM build does not accept logprobs_mode= on LLM(); using default")
+                llm = LLM(**llm_kwargs)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            _p(f"[ASYNC-BUNDLE] fresh vLLM(D) init failed: {e!r}; continuing with A/B/C only")
+            traceback.print_exc()
+            llm = None
+
     img_cursor, patch_cursor = 0, 0
-    accA, accB, accC = [], [], []
+    accA, accB, accC, accD = [], [], [], []
     seq_rows = []
-    for i in range(n_seq):
+
+    def _temp_for_seq(i):
+        if temperature is None:
+            return 1.0
+        try:
+            if torch.is_tensor(temperature):
+                if temperature.dim() == 0:
+                    return float(temperature.item())
+                if temperature.shape[0] == n_seq:
+                    return float(temperature[i].reshape(-1)[0].item())
+                return float(temperature.reshape(-1)[0].item())
+            if isinstance(temperature, (list, tuple)):
+                return float(temperature[i] if i < len(temperature) else temperature[0])
+            return float(temperature)
+        except Exception:  # noqa: BLE001
+            return 1.0
+
+    n_loop = min(n_seq, max_seq) if max_seq and max_seq > 0 else n_seq
+    for i in range(n_loop):
         ids_i = _seq("input_ids", i)
         if ids_i is None:
             continue
         ids_i = ids_i.to(device).long().reshape(-1)
         L = ids_i.numel()
         A = _seq("old_log_probs", i)
+        if A is None:
+            A = _seq("rollout_log_probs", i)
         Bfull = _seq("fsdp_log_probs", i)
+        R = _seq("responses", i)
         rm = _seq("response_mask", i)
         A = A.float().reshape(-1) if A is not None else None
         Bfull = Bfull.float().reshape(-1) if Bfull is not None else None
+        R = R.long().reshape(-1) if R is not None else None
         rm = rm.reshape(-1).bool() if rm is not None else None
-        # valid response length (drop right-padding via response_mask)
+
+        # Training computes rollout-correction on response-frame tensors:
+        #   A / response_mask / responses: (response_len,)
+        #   B / C: full next-token frame, where response token j at input_ids[prompt_len+j]
+        #          is scored by frame prompt_len-1+j.
+        # Therefore we must slice the full frame with response_len first, then apply response_mask.
+        # Using response_mask.sum() as the response length shifts the window when masked/tool/pad tokens exist.
         resp_valid = int(rm.sum()) if rm is not None else (A.numel() if A is not None else 0)
-        if resp_valid == 0 or resp_valid > L:
+        resp_len = None
+        resp_len_src = "unknown"
+        if R is not None and 0 < R.numel() < L:
+            resp_len = int(R.numel())
+            resp_len_src = "responses"
+        elif A is not None and rm is not None and A.numel() == rm.numel() and int(rm.sum()) == A.numel() and 0 < A.numel() < L:
+            # No masking/padding inside the response frame, so A/rm length is unambiguous.
+            resp_len = int(A.numel())
+            resp_len_src = "old_log_probs"
+        elif A is not None and rm is None and 0 < A.numel() < L:
+            resp_len = int(A.numel())
+            resp_len_src = "old_log_probs"
+
+        align_mode = "response-window"
+        if resp_len is None:
+            # Older async dumps did not save responses and may have padded old_log_probs to max_response_len
+            # while input_ids are trimmed to actual tokens. In that ambiguous case, preserve the old tail-valid
+            # behavior instead of inventing a prompt length.
+            resp_len = resp_valid
+            resp_len_src = "mask.sum fallback"
+            align_mode = "valid-tail"
+
+        if resp_len <= 0 or resp_len >= L:
             continue
-        # A (padded response logp) -> valid entries
-        Av = (A[rm] if (A is not None and rm is not None and rm.numel() == A.numel()) else (A[:resp_valid] if A is not None else None))
-        # B: full-seq logp. verl uses the ROLLED convention (log_probs[t] = logp of input_ids[t+1]), so the
-        # response tokens at abs pos [L-resp_valid, L-1] have their logp at indices [L-resp_valid-1, L-2].
-        if Bfull is not None:
-            if Bfull.numel() == L:
-                Bv = Bfull[L - resp_valid - 1:L - 1]
-            elif rm is not None and rm.numel() == Bfull.numel():
-                Bv = Bfull[rm]
-            else:
-                Bv = Bfull[-resp_valid:]
-        else:
-            Bv = None
+        prompt_len = L - resp_len
+        lo, hi = prompt_len - 1, L - 1
+        if prompt_len < 1:
+            continue
+
+        if R is not None and R.numel() == resp_len:
+            tail = ids_i[prompt_len:].detach().cpu()
+            tail_ok = bool(tail.numel() == R.numel() and torch.equal(tail, R.cpu()))
+            if not tail_ok:
+                _p(f"[ASYNC-BUNDLE] seq{i} WARNING: input_ids response tail != dumped responses; "
+                   f"alignment may be suspect (resp_len={resp_len}, prompt_len={prompt_len})")
         # split pixels for this seq (images appear in order; consume by patch count)
         n_img_tok = int((ids_i.cpu() == image_token_id).sum()) if image_token_id is not None else 0
         seq_grids, seq_pix, consumed = [], [], 0
@@ -278,7 +510,7 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
             img_cursor += 1
         grid_i = torch.stack(seq_grids).to(device) if seq_grids else None
         pix_i = torch.cat(seq_pix).to(device) if seq_pix else None
-        # fresh HF forward -> logp of the last `resp_valid` (response) tokens
+        # fresh HF forward -> logp of the response-frame tokens
         with torch.no_grad():
             kw = {"input_ids": ids_i.unsqueeze(0), "use_cache": False}
             if pix_i is not None:
@@ -298,19 +530,113 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
             elif i == 0:
                 _p(f"[ASYNC-BUNDLE] feed_pos={feed_pos}: {'letting HF recompute MRoPE positions' if not feed_pos else 'no position_ids in dump'}")
             lp = torch.log_softmax(hf(**kw).logits[0].float(), dim=-1)
-        Cm = torch.tensor(
-            [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
-        )
+        Dv = None
+        if align_mode == "response-window":
+            mask = rm[:resp_len].detach().cpu() if (rm is not None and rm.numel() >= resp_len) else torch.ones(resp_len, dtype=torch.bool)
+
+            def _resp_frame(x):
+                if x is None:
+                    return None
+                if x.numel() >= hi:
+                    return x[lo:hi].detach().cpu()
+                if x.numel() >= resp_len:
+                    return x[:resp_len].detach().cpu()
+                return None
+
+            Av0 = A[:resp_len].detach().cpu() if (A is not None and A.numel() >= resp_len) else None
+            Bv0 = _resp_frame(Bfull)
+            target = ids_i[prompt_len:L]
+            frames = torch.arange(lo, hi, device=device)
+            Cm0 = lp[frames, target].detach().cpu()
+
+            def _masked(x):
+                if x is None:
+                    return None
+                n = min(x.numel(), mask.numel())
+                return x[:n][mask[:n]]
+
+            Av = _masked(Av0)
+            Bv = _masked(Bv0)
+            Cm = _masked(Cm0)
+            if llm is not None:
+                try:
+                    if raw_images and i < len(raw_images) and raw_images[i]:
+                        images = raw_images[i]
+                        image_src = "raw_images"
+                    else:
+                        images = _pixels_to_reconstructed_images(seq_pix, seq_grids, processor) if seq_pix else []
+                        image_src = "pixel_values->PIL"
+                    unexpanded_full, n_runs = _collapse_image_runs(ids_i.detach().cpu().tolist(), image_token_id)
+                    if n_runs != len(images):
+                        _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM WARN: image runs={n_runs} images={len(images)} "
+                           f"src={image_src}; D may misalign")
+                    temp_i = _temp_for_seq(i)
+                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
+                    response_ids = ids_i[prompt_len:L].detach().cpu().tolist()
+                    Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_len)
+                    Dv = _masked(Dv0.float())
+                    if i == 0:
+                        _p(f"[ASYNC-BUNDLE] fresh-vLLM(D) image source: {image_src}; "
+                           f"valid_logprobs={int(torch.isfinite(Dv).sum())}/{Dv.numel()}")
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+
+                    _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM(D) failed: {e!r}")
+                    traceback.print_exc()
+        else:
+            # Ambiguous older bundle: no full response frame is available, so compare valid tail tokens.
+            Av = (A[rm] if (A is not None and rm is not None and rm.numel() == A.numel())
+                  else (A[:resp_valid] if A is not None else None))
+            if Bfull is not None:
+                if Bfull.numel() >= L - 1:
+                    Bv = Bfull[L - resp_valid - 1:L - 1].detach().cpu()
+                elif rm is not None and rm.numel() == Bfull.numel():
+                    Bv = Bfull[rm].detach().cpu()
+                else:
+                    Bv = Bfull[-resp_valid:].detach().cpu()
+            else:
+                Bv = None
+            Cm = torch.tensor(
+                [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
+            )
+            if llm is not None:
+                try:
+                    if raw_images and i < len(raw_images) and raw_images[i]:
+                        images = raw_images[i]
+                    else:
+                        images = _pixels_to_reconstructed_images(seq_pix, seq_grids, processor) if seq_pix else []
+                    unexpanded_full, _ = _collapse_image_runs(ids_i.detach().cpu().tolist(), image_token_id)
+                    temp_i = _temp_for_seq(i)
+                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
+                    response_ids = ids_i[L - resp_valid:L].detach().cpu().tolist()
+                    Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_valid).float()
+                    Dv = Dv0[rm] if (rm is not None and rm.numel() == Dv0.numel()) else Dv0[:resp_valid]
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+
+                    _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM(D) failed: {e!r}")
+                    traceback.print_exc()
         # defensive: align all to the common valid length
-        k = min(x.numel() for x in (Cm,) + ((Av,) if Av is not None else ()) + ((Bv,) if Bv is not None else ()))
+        k = min(
+            x.numel()
+            for x in (Cm,)
+            + ((Av,) if Av is not None else ())
+            + ((Bv,) if Bv is not None else ())
+            + ((Dv,) if Dv is not None else ())
+        )
+        if k == 0:
+            continue
         Cm = Cm[:k]
         Am = Av[:k] if Av is not None else None
         Bm = Bv[:k] if Bv is not None else None
+        Dm = Dv[:k] if Dv is not None else None
         if Am is not None:
             accA.append(Am)
         if Bm is not None:
             accB.append(Bm)
         accC.append(Cm)
+        if Dm is not None:
+            accD.append(Dm)
         seq_rows.append(
             {
                 "seq": i,
@@ -318,36 +644,59 @@ def _run_async_bundle(path, hf, processor, tokenizer, device, feed_pos=True):
                 "A": Am.detach().cpu() if Am is not None else None,
                 "B": Bm.detach().cpu() if Bm is not None else None,
                 "C": Cm.detach().cpu(),
-                "D": None,
+                "D": Dm.detach().cpu() if Dm is not None else None,
             }
         )
         dab = (Am - Bm).abs().mean().item() if (Am is not None and Bm is not None) else float("nan")
         dac = (Am - Cm).abs().mean().item() if Am is not None else float("nan")
         dbc = (Bm - Cm).abs().mean().item() if Bm is not None else float("nan")
-        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp_valid={resp_valid} imgtok={n_img_tok} | "
-           f"|A-B|async_gap={dab:.4f} |A-C|asyncVLLM_vs_freshFSDP={dac:.4f} |B-C|asyncFSDP_vs_freshFSDP={dbc:.4f}")
+        dad = _abs_stats(Am, Dm)[0] if (Am is not None and Dm is not None and _abs_stats(Am, Dm) is not None) else float("nan")
+        dcd = _abs_stats(Cm, Dm)[0] if (Dm is not None and _abs_stats(Cm, Dm) is not None) else float("nan")
+        kab = _rs_k3_mean(Am, Bm) if (Am is not None and Bm is not None) else float("nan")
+        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp_len={resp_len} resp_valid={resp_valid} "
+           f"prompt_len={prompt_len} align={align_mode}/{resp_len_src} imgtok={n_img_tok} | "
+           f"|A-B|dumpVLLM_vs_dumpFSDP={dab:.4f} |A-C|dumpVLLM_vs_freshHF={dac:.4f} "
+           f"|B-C|dumpFSDP_vs_freshHF={dbc:.4f} |A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
+           f"|C-D|freshHF_vs_freshVLLM={dcd:.4f}")
+        _p(f"[ASYNC-BUNDLE] seq{i} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
+           f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
 
-    A = torch.cat(accA) if accA else None
-    B = torch.cat(accB) if accB else None
-    C = torch.cat(accC)
+    if not accC:
+        _p("[ASYNC-BUNDLE] no comparable response tokens after alignment; check responses/response_mask lengths")
+        return
     _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
-    if A is not None and B is not None:
-        d = (A - B).abs()
-        _p(f"  |A-B| async recorded gap (vLLM vs FSDP): mean={d.mean():.4f} max={d.max():.4f}")
-    if A is not None:
-        d = (A - C).abs()
-        _p(f"  |A-C| async-vLLM(old) vs FRESH-HF/FSDP : mean={d.mean():.4f} max={d.max():.4f}")
-    if B is not None:
-        d = (B - C).abs()
-        _p(f"  |B-C| async-FSDP vs FRESH-HF (sanity)  : mean={d.mean():.4f} max={d.max():.4f}")
+
+    def _row_pair(a, bname):
+        xs, ys = [], []
+        for row in seq_rows:
+            x, y = row.get(a), row.get(bname)
+            if x is None or y is None:
+                continue
+            n = min(x.numel(), y.numel())
+            if n:
+                xs.append(x[:n])
+                ys.append(y[:n])
+        if not xs:
+            return None, None
+        return torch.cat(xs), torch.cat(ys)
+
+    def _print_pair(label, a, bname):
+        x, y = _row_pair(a, bname)
+        if x is not None:
+            _p(f"  {label}: {_fmt_abs(x, y)}")
+
+    _print_pair("|A-B| dump-vLLM vs dump-FSDP       ", "A", "B")
+    _print_pair("|A-C| dump-vLLM vs fresh-HF/FSDP    ", "A", "C")
+    _print_pair("|B-C| dump-FSDP vs fresh-HF (sanity)", "B", "C")
+    _print_pair("|A-D| dump-vLLM vs fresh-vLLM       ", "A", "D")
+    _print_pair("|B-D| dump-FSDP vs fresh-vLLM       ", "B", "D")
+    _print_pair("|C-D| fresh-HF vs fresh-vLLM        ", "C", "D")
     _print_k3_matrix("ASYNC-BUNDLE", seq_rows)
-    _p("[ASYNC-BUNDLE] D=fresh-vLLM is not available from this bundle: it stores processed pixel_values, "
-       "not raw images. Use --rollout-bundle or dump raw images to compare D against A.")
-    _p("  READ: with verl monkey_patch + the EXACT training position_ids fed, C reproduces training FSDP.")
-    _p("        |B-C| ~0 => microbench == training FSDP; |A-C| ~0 => training vLLM == FSDP == microbench.")
-    _p("        A ~0.28 gap only appears vs STOCK HF (no verl patch / wrong MRoPE positions) -> that was")
-    _p("        the artifact, NOT a real train-infer gap. If |B-C| is still large, the patch/positions")
-    _p("        aren't being applied (check the [VERL-PATCH] line and the position_ids shape print).")
+    if not accD:
+        _p("[ASYNC-BUNDLE] D=fresh-vLLM is unavailable because vLLM init/replay failed; A/B/C are still valid.")
+    _p("  READ: A=dump vLLM, B=dump FSDP, C=fresh HF/FSDP, D=fresh vLLM.")
+    _p("        |B-C| small => offline HF reproduces dumped FSDP. |A-D| small => dumped vLLM is reproducible.")
+    _p("        |C-D| is the clean fresh HF-vs-vLLM gap on the same reconstructed visual input.")
 
 
 def _run_prove_positions(path, hf, processor, tokenizer, device):
@@ -914,87 +1263,13 @@ def _run_rollout_bundle(path, model_path, hf, processor, tokenizer, device, gpu_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--image", default=None, help="Path to a screenshot; enables the TEXT+IMAGE test.")
-    ap.add_argument("--n-tokens", type=int, default=128)
-    ap.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Match training (1.0). At 1.0 vLLM's returned logprobs are raw (no temp scaling), so they "
-        "compare apples-to-apples with HF's log_softmax.",
-    )
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--async-bundle", required=True,
+                    help="Probe .pt with dump-vLLM, dump-FSDP, tokens, position_ids, pixel_values, image_grid_thw.")
     ap.add_argument("--attn", default="flash_attention_2", help="HF attn_implementation (match verl).")
-    ap.add_argument("--verl-patch", dest="verl_patch", action="store_true", default=True,
-                    help="Apply verl's monkey_patch to HF so its forward == the TRAINING FSDP forward (default on).")
-    ap.add_argument("--no-verl-patch", dest="verl_patch", action="store_false",
-                    help="Use STOCK transformers HF (the old behavior that differs from verl FSDP by ~0.28).")
-    ap.add_argument("--no-position-ids", dest="feed_pos", action="store_false", default=True,
-                    help="ASYNC-BUNDLE: do NOT feed the dumped training position_ids to HF (let HF recompute "
-                    "MRoPE itself). Use to isolate whether position_ids (not the patch) closes the |B-C| gap.")
-    ap.add_argument(
-        "--stock-hf-c",
-        dest="stock_hf_c",
-        action="store_true",
-        default=False,
-        help="ASYNC-BUNDLE convenience mode: make C a pure stock transformers HF forward and do NOT feed "
-        "dumped position_ids. Equivalent to --no-verl-patch --no-position-ids; tests whether stock HF's "
-        "own Qwen3-VL position computation matches dumped FSDP.",
-    )
-    ap.add_argument("--prove-positions", dest="prove_positions", default=None,
-                    help="Path to the async .pt bundle. PROVE the root cause: recompute position_ids the ASYNC "
-                    "way (with mm_token_type_ids) and the V1 way (without) and compare BOTH to the dumped "
-                    "ground-truth positions; then feed each to HF and show |A-C|. Shows exactly where v1 diverges.")
     ap.add_argument("--gpu-mem", type=float, default=0.6, help="vLLM gpu_memory_utilization.")
-    ap.add_argument("--dump", default=None, help="Optional probe .pt bundle -> report its train-side pixel stats.")
-    ap.add_argument(
-        "--async-bundle",
-        dest="async_bundle",
-        default=None,
-        help="A probe .pt dumped from the ASYNC run (tokens+pixels+old_log_probs[vLLM]+fsdp_log_probs[FSDP]). "
-        "Recompute a FRESH HF/FSDP logprob on the SAME data and 3-way compare A=async-vLLM(old), "
-        "B=async-FSDP(fsdp), C=fresh-HF. Answers: is the async old_log_prob vLLM-with-gap or FSDP-consistent, "
-        "and what is the real vLLM<->FSDP gap on actual GUI data. Runs HF only (no vLLM), then exits.",
-    )
-    ap.add_argument(
-        "--text-prompt",
-        default="Write a detailed, imaginative short story about a lighthouse keeper who discovers "
-        "something impossible washed up on the shore one foggy morning. Be creative and specific.",
-        help="A high-entropy open-ended text prompt (no image).",
-    )
-    ap.add_argument(
-        "--image-prompt",
-        default="You are a GUI agent. Look at this screenshot and describe, step by step and in "
-        "specific detail, what is on the screen and what you would click to open the main menu.",
-    )
-    ap.add_argument(
-        "--rollout-bundle",
-        dest="rollout_bundle",
-        default=None,
-        help="A ROLLOUT probe .pt (raw images + tokens + recorded vLLM logprobs). Recompute a FRESH vLLM (D) "
-        "and FRESH HF (C) on the SAME raw images/tokens and 3-way compare to A=recorded-vLLM. |A-D| tells "
-        "whether the recorded 'vLLM' logprob is a faithful vLLM recompute; |C-D| is the clean vLLM<->FSDP gap.",
-    )
     args = ap.parse_args()
-    if args.stock_hf_c:
-        args.verl_patch = False
-        args.feed_pos = False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # ---- offline pixel integrity check on a dumped bundle (train side) -------------------------
-    if args.dump:
-        _p(f"=== [DUMP] loading {args.dump} for train-side pixel integrity ===")
-        b = torch.load(args.dump, map_location="cpu", weights_only=False)
-        pv = b.get("pixel_values")
-        grid = b.get("image_grid_thw")
-        if pv is None:
-            _p("[DUMP] no pixel_values in bundle")
-        else:
-            _pixel_stats("dump-train-side", pv if isinstance(pv, torch.Tensor) else pv.values())
-            if grid is not None:
-                g = grid if isinstance(grid, torch.Tensor) else grid.values()
-                _p(f"[DUMP] image_grid_thw={tuple(g.shape)} sum(t*h*w)={int((g[:, 0] * g[:, 1] * g[:, 2]).sum())}")
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -1006,209 +1281,27 @@ def main():
         args.model, torch_dtype=torch.bfloat16, attn_implementation=args.attn, trust_remote_code=True
     ).eval().to(device)
 
-    # Apply verl's monkey_patch so the HF forward == the TRAINING FSDP forward (patched qwen3_vl_base_forward
-    # + _get_input_embeds etc.). Without this, HF is STOCK transformers, which differs from verl's FSDP by
-    # ~0.28 (the gap we chased). With it, C should reproduce B (async FSDP). --no-verl-patch to compare stock.
-    if args.verl_patch:
-        try:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
+    try:
+        from verl.models.transformers.monkey_patch import apply_monkey_patch
 
-            apply_monkey_patch(hf, use_remove_padding=True, use_fused_kernels=False)
-            _p("=== [VERL-PATCH] applied verl monkey_patch to HF -> C should now match TRAINING FSDP (B) ===")
-        except Exception as e:  # noqa: BLE001
-            _p(f"=== [VERL-PATCH] FAILED ({e!r}); HF stays STOCK transformers (C != training FSDP) ===")
-    else:
-        _p("=== [VERL-PATCH] disabled (--no-verl-patch): HF is STOCK transformers ===")
-        if args.stock_hf_c:
-            _p("=== [STOCK-HF-C] C uses stock HF forward and receives NO dumped position_ids; "
-               "stock HF should compute Qwen3-VL positions from input_ids + image_grid_thw ===")
+        apply_monkey_patch(hf, use_remove_padding=True, use_fused_kernels=False)
+        _p("=== [VERL-PATCH] applied verl monkey_patch to HF -> C matches TRAINING FSDP path ===")
+    except Exception as e:  # noqa: BLE001
+        _p(f"=== [VERL-PATCH] FAILED ({e!r}); C may not match training FSDP ===")
 
-    # ---- BUNDLE MODES: run BOTH in one shot when given, then exit (no generation needed) -------------
-    #   --async-bundle   : A=async-vLLM(old) / B=async-FSDP(fsdp) / C=fresh-HF   (HF only)
-    #   --rollout-bundle : A=recorded-vLLM   / C=fresh-HF        / D=fresh-vLLM  (loads vLLM)
-    if args.prove_positions:
-        _p("\n################## PROVE-POSITIONS (async-way vs v1-way vs dumped ground truth) ##################")
-        try:
-            _run_prove_positions(args.prove_positions, hf, processor, tokenizer, device)
-        except Exception as e:  # noqa: BLE001
-            import traceback
-
-            _p(f"[PROVE] FAILED: {e!r}")
-            traceback.print_exc()
-        return
-
-    if args.async_bundle or args.rollout_bundle:
-        if args.async_bundle:
-            _p("\n################## ASYNC-BUNDLE (A=async vLLM / B=async FSDP / C=fresh HF) ##################")
-            try:
-                _run_async_bundle(args.async_bundle, hf, processor, tokenizer, device, feed_pos=args.feed_pos)
-            except Exception as e:  # noqa: BLE001 - don't let it block the rollout-bundle below
-                import traceback
-
-                _p(f"[ASYNC-BUNDLE] FAILED: {e!r}")
-                traceback.print_exc()
-        if args.rollout_bundle:
-            _p("\n################## ROLLOUT-BUNDLE (A=recorded vLLM / C=fresh HF / D=fresh vLLM) ##################")
-            try:
-                _run_rollout_bundle(args.rollout_bundle, args.model, hf, processor, tokenizer, device, args.gpu_mem)
-            except Exception as e:  # noqa: BLE001
-                import traceback
-
-                _p(f"[ROLLOUT-BUNDLE] FAILED: {e!r}")
-                traceback.print_exc()
-        return
-
-    from vllm import LLM, SamplingParams
-
-    _p("=== loading vLLM (fresh, its own clean image processing) ===")
-    llm = LLM(
-        model=args.model,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        gpu_memory_utilization=args.gpu_mem,
-        max_model_len=32768,
-        limit_mm_per_prompt={"image": 4},
-        enforce_eager=True,  # determinism: skip cudagraph
+    _p("\n################## ABCD BENCH (A=dump vLLM / B=dump FSDP / C=fresh HF / D=fresh vLLM) ##################")
+    _run_async_bundle(
+        args.async_bundle,
+        args.model,
+        hf,
+        processor,
+        tokenizer,
+        device,
+        feed_pos=True,
+        with_vllm=True,
+        gpu_mem=args.gpu_mem,
+        max_seq=0,
     )
-    sp = SamplingParams(temperature=args.temperature, top_p=1.0, max_tokens=args.n_tokens, logprobs=1, seed=args.seed)
-
-    def hf_logp_for(full_ids, start, pixel_values=None, image_grid_thw=None):
-        """Teacher-force full_ids through HF; return logp of each token at positions [start, len).
-        logits[t-1] predicts token t -> logp for token at absolute pos t (t from `start`)."""
-        with torch.no_grad():
-            kw = {"input_ids": full_ids.unsqueeze(0).to(device), "use_cache": False}
-            if pixel_values is not None:
-                kw["pixel_values"] = pixel_values.to(hf.dtype).to(device)
-                kw["image_grid_thw"] = image_grid_thw.to(device)
-            logits = hf(**kw).logits[0].float()  # (L, V); let HF build mrope from ids+grid internally
-            lp = torch.log_softmax(logits, dim=-1)
-            out = []
-            for t in range(start, full_ids.numel()):
-                out.append(float(lp[t - 1, int(full_ids[t])]))
-            return out
-
-    results = {}
-
-    # ---------- TEXT-ONLY ----------
-    _p("\n########## TEXT-ONLY ##########")
-    msgs = [{"role": "user", "content": args.text_prompt}]
-    prompt_text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0]
-    out = llm.generate([{"prompt_token_ids": prompt_ids.tolist()}], sp)[0].outputs[0]
-    gen_ids = list(out.token_ids)
-    vllm_lp = [out.logprobs[i][gen_ids[i]].logprob for i in range(len(gen_ids))]
-    full = torch.cat([prompt_ids, torch.tensor(gen_ids, dtype=prompt_ids.dtype)])
-    hf_lp = hf_logp_for(full, start=prompt_ids.numel())
-    _p(f"[TEXT] response: {tokenizer.decode(gen_ids)[:300]!r}")
-    results["TEXT"] = _summ("TEXT", vllm_lp, hf_lp, gen_ids, tokenizer)
-
-    # ---------- TEXT+IMAGE ----------
-    if args.image:
-        from PIL import Image
-
-        _p("\n########## TEXT+IMAGE ##########")
-        img = Image.open(args.image).convert("RGB")
-        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": args.image_prompt}]}]
-        prompt_text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        # HF-side processed inputs (this is the CLEAN pixel reference)
-        proc = processor(text=[prompt_text], images=[img], return_tensors="pt")
-        prompt_ids = proc["input_ids"][0]
-        pixel_values = proc["pixel_values"]
-        image_grid_thw = proc["image_grid_thw"]
-        _pixel_stats("microbench-clean", pixel_values)
-        # vLLM generate on the same raw image (keep the full RequestOutput to read vLLM's own prompt)
-        vout = llm.generate([{"prompt": prompt_text, "multi_modal_data": {"image": img}}], sp)[0]
-        out = vout.outputs[0]
-
-        # PREPROCESSING vs ENCODER discriminator: compare how many image tokens each side expanded the
-        # picture into. HF uses `processor`; vLLM does its OWN preprocessing (smart_resize/patchify). If
-        # the counts differ, vLLM fed the vision tower a DIFFERENT-resolution image -> the gap is (at
-        # least partly) PREPROCESSING and is fixable by aligning the mm config (min/max pixels). If the
-        # counts MATCH but the logp gap stays, pixels agree -> the gap is the vision ENCODER numerics.
-        img_tok_id = getattr(processor, "image_token_id", None)
-        if img_tok_id is None:
-            img_tok_id = getattr(hf.config, "image_token_id", None)
-        n_img_hf = int((prompt_ids == img_tok_id).sum()) if img_tok_id is not None else -1
-        vllm_prompt_ids = list(vout.prompt_token_ids) if getattr(vout, "prompt_token_ids", None) else []
-        n_img_vllm = sum(1 for t in vllm_prompt_ids if t == img_tok_id) if img_tok_id is not None else -1
-        _p(
-            f"[IMG-TOKENS] HF processor={n_img_hf}  vLLM={n_img_vllm}  match={n_img_hf == n_img_vllm}  "
-            f"| pixel_values patches={pixel_values.shape[0]} (n_tokens=patches/merge^2); "
-            f"vLLM_prompt_len={len(vllm_prompt_ids)} HF_prompt_len={prompt_ids.numel()}  "
-            f"{'<- MISMATCH => vLLM preprocessing differs (resolution/resize)' if n_img_hf != n_img_vllm else '<- counts match => preprocessing same, gap is encoder numerics'}"
-        )
-
-        gen_ids = list(out.token_ids)
-        vllm_lp = [out.logprobs[i][gen_ids[i]].logprob for i in range(len(gen_ids))]
-        full = torch.cat([prompt_ids, torch.tensor(gen_ids, dtype=prompt_ids.dtype)])
-        hf_lp = hf_logp_for(full, start=prompt_ids.numel(), pixel_values=pixel_values, image_grid_thw=image_grid_thw)
-        _p(f"[IMAGE] response: {tokenizer.decode(gen_ids)[:300]!r}")
-        results["IMAGE"] = _summ("IMAGE", vllm_lp, hf_lp, gen_ids, tokenizer)
-
-        # ---------- fast_pos_embed_interpolate PATCH A/B ----------
-        # verl-v1 monkey-patches the vision pos-embed interpolation onto Qwen3-VL; verl-async does NOT.
-        # v1's train<->infer LOGPROB_GAP is ~0.28, async's is ~0.01. Test HERE whether that patch is the
-        # cause: (1) diff the STOCK method (what this HF model uses, == verl-async) vs verl's CUSTOM one;
-        # (2) if they differ, re-run the HF image logprob WITH the custom patch and see if the vLLM gap
-        # jumps toward v1's 0.28. IDENTICAL => patch inert, NOT the cause. DIFFERENT + gap jumps => cause.
-        try:
-            vision = getattr(hf, "visual", None) or getattr(getattr(hf, "model", None), "visual", None)
-            if vision is None or not hasattr(vision, "fast_pos_embed_interpolate"):
-                _p("[POSEMB] vision.fast_pos_embed_interpolate not found; A/B skipped")
-            else:
-                # import verl's custom impl (defensive: it lives in qwen3_vl.py or qwen3_5.py)
-                custom_fn = None
-                for mod in ("verl.models.transformers.qwen3_vl", "verl.models.transformers.qwen3_5"):
-                    try:
-                        custom_fn = __import__(mod, fromlist=["fast_pos_embed_interpolate"]).fast_pos_embed_interpolate
-                        _p(f"[POSEMB] loaded verl custom fast_pos_embed_interpolate from {mod}")
-                        break
-                    except Exception:  # noqa: BLE001
-                        continue
-                if custom_fn is None:
-                    _p("[POSEMB] could not import verl custom fast_pos_embed_interpolate; A/B skipped")
-                else:
-                    g = image_grid_thw.to(device)
-                    with torch.no_grad():
-                        stock_pe = vision.fast_pos_embed_interpolate(g).float()
-                        custom_pe = custom_fn(vision, g).float()
-                    pe_d = (stock_pe - custom_pe).abs()
-                    _p(
-                        f"[POSEMB] stock(=verl-async) vs verl-custom(=v1) output: "
-                        f"max_abs_d={pe_d.max().item():.6f} mean_abs_d={pe_d.mean().item():.6f} "
-                        f"shape={tuple(stock_pe.shape)}  "
-                        f"{'<- IDENTICAL => patch INERT, NOT the cause' if pe_d.max().item() < 1e-5 else '<- DIFFERENT => patch changes vision embeds'}"
-                    )
-                    # end-to-end: rerun HF image logprob with the custom patch installed on the class
-                    cls = type(vision)
-                    orig = cls.fast_pos_embed_interpolate
-                    cls.fast_pos_embed_interpolate = custom_fn
-                    try:
-                        hf_lp_custom = hf_logp_for(
-                            full, start=prompt_ids.numel(), pixel_values=pixel_values, image_grid_thw=image_grid_thw
-                        )
-                    finally:
-                        cls.fast_pos_embed_interpolate = orig
-                    _p("[POSEMB] re-running IMAGE gap with the verl-v1 CUSTOM pos-embed patch applied:")
-                    _summ("IMAGE+v1PosembPatch", vllm_lp, hf_lp_custom, gen_ids, tokenizer)
-        except Exception as e:  # noqa: BLE001
-            _p(f"[POSEMB] A/B failed ({e!r})")
-
-    # ---------- VERDICT ----------
-    _p("\n########## VERDICT ##########")
-    tmean, tmax = results["TEXT"]
-    _p(f"TEXT : mean_abs_d={tmean:.4f} max_abs_d={tmax:.4f}")
-    if "IMAGE" in results:
-        imean, imax = results["IMAGE"]
-        _p(f"IMAGE: mean_abs_d={imean:.4f} max_abs_d={imax:.4f}")
-        if tmean < 0.1 and imean > 3 * max(tmean, 1e-6):
-            _p(">> VISION path: text agrees, image diverges -> the gap is driven by the image/vision forward.")
-        elif imean < 2 * max(tmean, 1e-6):
-            _p(">> GENERAL numerics: image ~ text -> attention backend / mrope / logit-scale, NOT vision.")
-        else:
-            _p(">> Inconclusive: compare magnitudes above; also compare IMAGE(here) vs the pipeline LOGPROB_GAP.")
-    else:
-        _p("(no --image; run again with --image to get the vision-vs-text split.)")
 
 
 if __name__ == "__main__":
