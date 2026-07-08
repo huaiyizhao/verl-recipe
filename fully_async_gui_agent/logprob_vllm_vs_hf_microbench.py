@@ -546,6 +546,7 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             Av = _masked(Av0)
             Bv = _masked(Bv0)
             Cm = _masked(Cm0)
+            Tv = _masked(target.detach().cpu()).long()
         else:
             # Ambiguous older bundle: no full response frame is available, so compare valid tail tokens.
             mask = rm.detach().cpu() if rm is not None else None
@@ -563,6 +564,8 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             Cm = torch.tensor(
                 [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
             )
+            Tv0 = ids_i[L - resp_valid:L].detach().cpu()
+            Tv = Tv0[mask.bool()] if (torch.is_tensor(mask) and mask.numel() == Tv0.numel()) else Tv0[:resp_valid]
         # defensive: align all to the common valid length
         k = min(
             x.numel()
@@ -575,6 +578,7 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         Cm = Cm[:k]
         Am = Av[:k] if Av is not None else None
         Bm = Bv[:k] if Bv is not None else None
+        Tm = Tv[:k] if Tv is not None else None
         if Am is not None:
             accA.append(Am)
         if Bm is not None:
@@ -587,6 +591,7 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             "B": Bm.detach().cpu() if Bm is not None else None,
             "C": Cm.detach().cpu(),
             "D": None,
+            "tokens": Tm.detach().cpu() if Tm is not None else None,
             "L": L,
             "resp_len": resp_len,
             "resp_valid": resp_valid,
@@ -713,6 +718,8 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                     for name in ("A", "B", "C"):
                         if row.get(name) is not None:
                             row[name] = row[name][:k]
+                    if row.get("tokens") is not None:
+                        row["tokens"] = row["tokens"][:k]
                     row["D"] = Dv[:k].detach().cpu()
                     row["n"] = k
                     accD.append(row["D"])
@@ -730,6 +737,29 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         s = _abs_stats(x, y)
         return s[0] if s is not None else float("nan")
 
+    def _print_worst_pair(row, label, a_name, b_name, max_threshold=0.5, topk=5):
+        x, y = row.get(a_name), row.get(b_name)
+        if x is None or y is None:
+            return
+        n = min(x.numel(), y.numel())
+        if n == 0:
+            return
+        d = (x[:n].to(torch.float64) - y[:n].to(torch.float64)).abs()
+        finite = torch.isfinite(d).nonzero(as_tuple=True)[0]
+        if finite.numel() == 0 or float(d[finite].max()) < max_threshold:
+            return
+        order = finite[torch.argsort(d[finite], descending=True)[:topk]]
+        toks = row.get("tokens")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} tokens (pos | A B C D | token):")
+        for j in order.tolist():
+            vals = []
+            for name in ("A", "B", "C", "D"):
+                v = row.get(name)
+                vals.append("   nan" if v is None or j >= v.numel() else f"{float(v[j]):+7.3f}")
+            tok_id = int(toks[j]) if torch.is_tensor(toks) and j < toks.numel() else None
+            tok = tokenizer.decode([tok_id]) if tok_id is not None and tokenizer is not None else str(tok_id)
+            _p(f"    {j:4d} | {' '.join(vals)} | {tok!r}")
+
     for row in seq_rows:
         Am, Bm, Cm, Dm = row.get("A"), row.get("B"), row.get("C"), row.get("D")
         dab = _mean_abs_or_nan(Am, Bm)
@@ -746,6 +776,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
            f"|C-D|freshHF_vs_freshVLLM={dcd:.4f}")
         _p(f"[ASYNC-BUNDLE] seq{row['seq']} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
            f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
+        _print_worst_pair(row, "|A-B|", "A", "B")
+        _print_worst_pair(row, "|B-C|", "B", "C")
+        _print_worst_pair(row, "|A-D|", "A", "D")
+        _print_worst_pair(row, "|C-D|", "C", "D")
 
     _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
 
