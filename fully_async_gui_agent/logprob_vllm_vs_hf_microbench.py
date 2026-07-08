@@ -287,20 +287,43 @@ def _gather_logp_from_logits(logits, labels, temperature=1.0):
     return torch.log_softmax(x, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
 
+def _target_logit_lse_from_logits(logits, labels, temperature=1.0):
+    """Return selected target logits and logsumexp on the same scaled-logit frame as logprob."""
+    if temperature is None or temperature <= 0:
+        temperature = 1.0
+    x = logits.float()
+    if abs(float(temperature) - 1.0) > 1e-8:
+        x = x / float(temperature)
+    labels = labels.long()
+    target_logits = x.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    logsumexp = torch.logsumexp(x, dim=-1)
+    return target_logits, logsumexp
+
+
 def _print_k3_matrix(tag, seq_rows):
     """Print seq-level pairwise K3 in verl rollout-RS direction."""
     pairs = [
         ("A", "B"),
+        ("A", "Bprobe"),
         ("A", "Bref"),
+        ("A", "BrefProbe"),
         ("A", "C"),
         ("A", "Cpack"),
         ("A", "D"),
+        ("B", "Bprobe"),
         ("B", "Bref"),
+        ("B", "BrefProbe"),
         ("B", "C"),
         ("B", "Cpack"),
         ("B", "D"),
+        ("Bprobe", "BrefProbe"),
+        ("Bprobe", "C"),
+        ("Bprobe", "Cpack"),
+        ("Bref", "BrefProbe"),
         ("Bref", "C"),
         ("Bref", "Cpack"),
+        ("BrefProbe", "C"),
+        ("BrefProbe", "Cpack"),
         ("C", "Cpack"),
         ("C", "D"),
         ("Cpack", "D"),
@@ -353,12 +376,17 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     # Fields can be nested ({values, offsets}) OR plain padded tensors (n_seq, ...). Print + handle both.
     for k in ("input_ids", "position_ids", "responses", "old_log_probs", "rollout_log_probs", "fsdp_log_probs",
               "fsdp_log_probs_ref", "response_mask", "pixel_values", "image_grid_thw", "logprobs_mode",
-              "probe_maxk3"):
+              "probe_maxk3", "trainer_global_steps", "probe_parameter_sync_step", "probe_batch_tags", "fsdp_probe",
+              "fsdp_param_fingerprint"):
         v = b.get(k)
         if isinstance(v, dict) and "values" in v:
             _p(f"  {k}: nested values={tuple(v['values'].shape)} n_off={len(v['offsets'])}")
         elif torch.is_tensor(v):
             _p(f"  {k}: tensor {tuple(v.shape)} {v.dtype}")
+        elif isinstance(v, dict):
+            _p(f"  {k}: dict keys={sorted(v.keys())}")
+        elif isinstance(v, list):
+            _p(f"  {k}: list len={len(v)}")
         else:
             _p(f"  {k}: {type(v).__name__}")
 
@@ -411,6 +439,7 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     if isinstance(grid, dict) and "values" in grid:
         grid = grid["values"]
     raw_images = b.get("raw_images")
+    fsdp_probe = b.get("fsdp_probe") if isinstance(b.get("fsdp_probe"), dict) else None
     logprobs_mode = b.get("logprobs_mode") or "raw_logprobs"
     temperature = b.get("temperature")
     image_token_id = getattr(processor, "image_token_id", None)
@@ -418,6 +447,47 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         image_token_id = getattr(getattr(hf, "config", None), "image_token_id", None)
     merge = int(_processor_param(processor, "merge_size", None) or _processor_param(processor, "spatial_merge_size", 2) or 2)
     _p(f"[ASYNC-BUNDLE] n_seq={n_seq}")
+    if b.get("trainer_global_steps") is not None or b.get("probe_batch_tags") is not None:
+        tags = b.get("probe_batch_tags") or []
+        gs = b.get("trainer_global_steps")
+        pss = b.get("probe_parameter_sync_step")
+        tag_steps = [
+            (t.get("global_steps"), t.get("min_global_steps"), t.get("max_global_steps"))
+            for t in tags
+            if isinstance(t, dict)
+        ]
+        _p(f"[ASYNC-BUNDLE] trainer_global_steps={gs} parameter_sync_step={pss} "
+           f"tag_steps(first8 global/min/max)={tag_steps[:8]}")
+    if fsdp_probe is not None:
+        path = fsdp_probe.get("path")
+        reason = fsdp_probe.get("reason")
+        n_probe = int(fsdp_probe["rows"].numel()) if torch.is_tensor(fsdp_probe.get("rows")) else 0
+        n_valid_probe = int(fsdp_probe["valid_mask"].bool().sum()) if torch.is_tensor(fsdp_probe.get("valid_mask")) else 0
+        _p(f"[ASYNC-BUNDLE] fsdp_probe path={path} reason={reason} response_rows={n_probe} valid={n_valid_probe}")
+    fp = b.get("fsdp_param_fingerprint")
+    if isinstance(fp, list) and fp:
+        fp_desc = [
+            f"{x.get('name')}:{x.get('dtype')}:{tuple(x.get('local_shape', ()))}/"
+            f"sum={float(x.get('local_sum', float('nan'))):+.3e}"
+            for x in fp[:5]
+            if isinstance(x, dict)
+        ]
+        _p(f"[ASYNC-BUNDLE] fsdp_param_fingerprint(first5 rank0-local): {fp_desc}")
+
+    def _probe_seq(name, i, valid_only=True):
+        if fsdp_probe is None:
+            return None
+        seq_ids = fsdp_probe.get("seq_ids")
+        x = fsdp_probe.get(name)
+        if not torch.is_tensor(seq_ids) or not torch.is_tensor(x):
+            return None
+        m = seq_ids.long() == int(i)
+        valid = fsdp_probe.get("valid_mask")
+        if valid_only and torch.is_tensor(valid):
+            m = m & valid.bool()
+        if x.shape[0] != m.numel():
+            return None
+        return x[m].detach().cpu()
 
     img_cursor, patch_cursor = 0, 0
     accA, accB, accC, accD = [], [], [], []
@@ -508,9 +578,19 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                 Cpt0 = _gather_logp_from_logits(
                     logits_pack[lo:hi], target, temperature=float(job["temperature"])
                 ).detach().cpu()
+                CpTgt0, CpLse0 = _target_logit_lse_from_logits(logits_pack[lo:hi], target, temperature=1.0)
+                CptTgt0, CptLse0 = _target_logit_lse_from_logits(
+                    logits_pack[lo:hi], target, temperature=float(job["temperature"])
+                )
+                CpTgt0, CpLse0 = CpTgt0.detach().cpu(), CpLse0.detach().cpu()
+                CptTgt0, CptLse0 = CptTgt0.detach().cpu(), CptLse0.detach().cpu()
                 n = min(Cp0.numel(), mask.numel())
                 Cp = Cp0[:n][mask[:n]]
                 Cpt = Cpt0[:n][mask[:n]]
+                CpTgt = CpTgt0[:n][mask[:n]]
+                CpLse = CpLse0[:n][mask[:n]]
+                CptTgt = CptTgt0[:n][mask[:n]]
+                CptLse = CptLse0[:n][mask[:n]]
             else:
                 rv = int(job["resp_valid"])
                 lo, hi = offset + L - rv - 1, offset + L - 1
@@ -519,18 +599,36 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                 Cpt = _gather_logp_from_logits(
                     logits_pack[lo:hi], target, temperature=float(job["temperature"])
                 ).detach().cpu()
+                CpTgt, CpLse = _target_logit_lse_from_logits(logits_pack[lo:hi], target, temperature=1.0)
+                CptTgt, CptLse = _target_logit_lse_from_logits(
+                    logits_pack[lo:hi], target, temperature=float(job["temperature"])
+                )
+                CpTgt, CpLse = CpTgt.detach().cpu(), CpLse.detach().cpu()
+                CptTgt, CptLse = CptTgt.detach().cpu(), CptLse.detach().cpu()
                 mask = job["mask"]
                 if torch.is_tensor(mask) and mask.numel() == Cp.numel():
                     Cp = Cp[mask.bool().reshape(-1)]
                     Cpt = Cpt[mask.bool().reshape(-1)]
+                    CpTgt = CpTgt[mask.bool().reshape(-1)]
+                    CpLse = CpLse[mask.bool().reshape(-1)]
+                    CptTgt = CptTgt[mask.bool().reshape(-1)]
+                    CptLse = CptLse[mask.bool().reshape(-1)]
 
-            k = min(row["n"], Cp.numel(), Cpt.numel())
+            k = min(row["n"], Cp.numel(), Cpt.numel(), CpTgt.numel(), CpLse.numel(), CptTgt.numel(), CptLse.numel())
             if k > 0:
-                for name in ("A", "B", "Bref", "C", "Ctemp", "tokens"):
+                for name in (
+                    "A", "B", "Bprobe", "Bref", "BrefProbe", "C", "Ctemp", "tokens",
+                    "FtargetIds", "FtargetLogit", "Flogsumexp", "CtargetLogit", "Clogsumexp",
+                    "CtempTargetLogit", "CtempLogsumexp",
+                ):
                     if row.get(name) is not None:
                         row[name] = row[name][:k]
                 row["Cpack"] = Cp[:k]
                 row["CpackTemp"] = Cpt[:k]
+                row["CpackTargetLogit"] = CpTgt[:k]
+                row["CpackLogsumexp"] = CpLse[:k]
+                row["CpackTempTargetLogit"] = CptTgt[:k]
+                row["CpackTempLogsumexp"] = CptLse[:k]
                 row["n"] = k
             offset += L
 
@@ -652,6 +750,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             resp_logits = logits[frames]
             Cm0 = _gather_logp_from_logits(resp_logits, target, temperature=1.0).detach().cpu()
             Ct0 = _gather_logp_from_logits(resp_logits, target, temperature=_temp_for_seq(i)).detach().cpu()
+            Ctgt0, Clse0 = _target_logit_lse_from_logits(resp_logits, target, temperature=1.0)
+            Cttgt0, Ctlse0 = _target_logit_lse_from_logits(resp_logits, target, temperature=_temp_for_seq(i))
+            Ctgt0, Clse0 = Ctgt0.detach().cpu(), Clse0.detach().cpu()
+            Cttgt0, Ctlse0 = Cttgt0.detach().cpu(), Ctlse0.detach().cpu()
 
             def _masked(x):
                 if x is None:
@@ -664,6 +766,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             Brefv = _masked(Bref0)
             Cm = _masked(Cm0)
             Ctm = _masked(Ct0)
+            Ctgt = _masked(Ctgt0)
+            Clse = _masked(Clse0)
+            Cttgt = _masked(Cttgt0)
+            Ctlse = _masked(Ctlse0)
             Tv = _masked(target.detach().cpu()).long()
         else:
             # Ambiguous older bundle: no full response frame is available, so compare valid tail tokens.
@@ -693,8 +799,19 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             resp_logits = logits[frames]
             Cm = _gather_logp_from_logits(resp_logits, target, temperature=1.0).detach().cpu()
             Ctm = _gather_logp_from_logits(resp_logits, target, temperature=_temp_for_seq(i)).detach().cpu()
+            Ctgt, Clse = _target_logit_lse_from_logits(resp_logits, target, temperature=1.0)
+            Cttgt, Ctlse = _target_logit_lse_from_logits(resp_logits, target, temperature=_temp_for_seq(i))
+            Ctgt, Clse = Ctgt.detach().cpu(), Clse.detach().cpu()
+            Cttgt, Ctlse = Cttgt.detach().cpu(), Ctlse.detach().cpu()
             Tv0 = ids_i[L - resp_valid:L].detach().cpu()
-            Tv = Tv0[mask.bool()] if (torch.is_tensor(mask) and mask.numel() == Tv0.numel()) else Tv0[:resp_valid]
+            if torch.is_tensor(mask) and mask.numel() == Tv0.numel():
+                m = mask.bool()
+                Cm, Ctm = Cm[m], Ctm[m]
+                Ctgt, Clse = Ctgt[m], Clse[m]
+                Cttgt, Ctlse = Cttgt[m], Ctlse[m]
+                Tv = Tv0[m]
+            else:
+                Tv = Tv0[:resp_valid]
         # defensive: align all to the common valid length
         k = min(
             x.numel()
@@ -703,6 +820,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             + ((Bv,) if Bv is not None else ())
             + ((Brefv,) if Brefv is not None else ())
             + ((Ctm,) if Ctm is not None else ())
+            + ((Ctgt,) if Ctgt is not None else ())
+            + ((Clse,) if Clse is not None else ())
+            + ((Cttgt,) if Cttgt is not None else ())
+            + ((Ctlse,) if Ctlse is not None else ())
         )
         if k == 0:
             continue
@@ -712,6 +833,15 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         Bm = Bv[:k] if Bv is not None else None
         Brefm = Brefv[:k] if Brefv is not None else None
         Tm = Tv[:k] if Tv is not None else None
+        CtargetLogit = Ctgt[:k] if Ctgt is not None else None
+        Clogsumexp = Clse[:k] if Clse is not None else None
+        CtempTargetLogit = Cttgt[:k] if Cttgt is not None else None
+        CtempLogsumexp = Ctlse[:k] if Ctlse is not None else None
+        Bprobe = _probe_seq("current_log_probs", i)
+        BrefProbe = _probe_seq("ref_log_probs", i)
+        FtargetLogit = _probe_seq("target_logits", i)
+        Flogsumexp = _probe_seq("logsumexp", i)
+        FtargetIds = _probe_seq("target_ids", i)
         if Am is not None:
             accA.append(Am)
         if Bm is not None:
@@ -722,13 +852,26 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             "n": k,
             "A": Am.detach().cpu() if Am is not None else None,
             "B": Bm.detach().cpu() if Bm is not None else None,
+            "Bprobe": Bprobe.detach().cpu() if Bprobe is not None else None,
             "Bref": Brefm.detach().cpu() if Brefm is not None else None,
+            "BrefProbe": BrefProbe.detach().cpu() if BrefProbe is not None else None,
             "C": Cm.detach().cpu(),
             "Ctemp": Ctm.detach().cpu() if Ctm is not None else None,
             "Cpack": None,
             "CpackTemp": None,
             "D": None,
             "tokens": Tm.detach().cpu() if Tm is not None else None,
+            "FtargetIds": FtargetIds.detach().cpu().long() if FtargetIds is not None else None,
+            "FtargetLogit": FtargetLogit.detach().cpu() if FtargetLogit is not None else None,
+            "Flogsumexp": Flogsumexp.detach().cpu() if Flogsumexp is not None else None,
+            "CtargetLogit": CtargetLogit.detach().cpu() if CtargetLogit is not None else None,
+            "Clogsumexp": Clogsumexp.detach().cpu() if Clogsumexp is not None else None,
+            "CtempTargetLogit": CtempTargetLogit.detach().cpu() if CtempTargetLogit is not None else None,
+            "CtempLogsumexp": CtempLogsumexp.detach().cpu() if CtempLogsumexp is not None else None,
+            "CpackTargetLogit": None,
+            "CpackLogsumexp": None,
+            "CpackTempTargetLogit": None,
+            "CpackTempLogsumexp": None,
             "L": L,
             "resp_len": resp_len,
             "resp_valid": resp_valid,
@@ -866,16 +1009,19 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
                         else:
                             Dv = Dv0[:resp_valid]
 
-                    existing = [row[k] for k in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp")
-                                if row.get(k) is not None]
+                    trim_names = (
+                        "A", "B", "Bprobe", "Bref", "BrefProbe", "C", "Cpack", "Ctemp", "CpackTemp",
+                        "tokens", "FtargetIds", "FtargetLogit", "Flogsumexp",
+                        "CtargetLogit", "Clogsumexp", "CtempTargetLogit", "CtempLogsumexp",
+                        "CpackTargetLogit", "CpackLogsumexp", "CpackTempTargetLogit", "CpackTempLogsumexp",
+                    )
+                    existing = [row[name] for name in trim_names if row.get(name) is not None]
                     k = min([Dv.numel()] + [x.numel() for x in existing])
                     if k == 0:
                         continue
-                    for name in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp"):
+                    for name in trim_names:
                         if row.get(name) is not None:
                             row[name] = row[name][:k]
-                    if row.get("tokens") is not None:
-                        row["tokens"] = row["tokens"][:k]
                     row["D"] = Dv[:k].detach().cpu()
                     row["n"] = k
                     accD.append(row["D"])
@@ -906,29 +1052,59 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             return
         order = finite[torch.argsort(d[finite], descending=True)[:topk]]
         toks = row.get("tokens")
-        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} tokens (pos | A B Bref C Cp Ct Cpt D | token):")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} tokens "
+           f"(pos | A B Bp Bref Brp C Cp Ct Cpt D | token):")
         for j in order.tolist():
             vals = []
-            for name in ("A", "B", "Bref", "C", "Cpack", "Ctemp", "CpackTemp", "D"):
+            for name in ("A", "B", "Bprobe", "Bref", "BrefProbe", "C", "Cpack", "Ctemp", "CpackTemp", "D"):
                 v = row.get(name)
                 vals.append("   nan" if v is None or j >= v.numel() else f"{float(v[j]):+7.3f}")
             tok_id = int(toks[j]) if torch.is_tensor(toks) and j < toks.numel() else None
             tok = tokenizer.decode([tok_id]) if tok_id is not None and tokenizer is not None else str(tok_id)
             _p(f"    {j:4d} | {' '.join(vals)} | {tok!r}")
 
+    def _print_worst_diag_pair(row, label, a_name, b_name, max_threshold=0.5, topk=5):
+        x, y = row.get(a_name), row.get(b_name)
+        if x is None or y is None:
+            return
+        n = min(x.numel(), y.numel())
+        if n == 0:
+            return
+        d = (x[:n].to(torch.float64) - y[:n].to(torch.float64)).abs()
+        finite = torch.isfinite(d).nonzero(as_tuple=True)[0]
+        if finite.numel() == 0 or float(d[finite].max()) < max_threshold:
+            return
+        order = finite[torch.argsort(d[finite], descending=True)[:topk]]
+        toks = row.get("tokens")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} worst {label} diagnostics (pos | {a_name} {b_name} | token):")
+        for j in order.tolist():
+            tok_id = int(toks[j]) if torch.is_tensor(toks) and j < toks.numel() else None
+            tok = tokenizer.decode([tok_id]) if tok_id is not None and tokenizer is not None else str(tok_id)
+            _p(f"    {j:4d} | {float(x[j]):+10.4f} {float(y[j]):+10.4f} | {tok!r}")
+
     for row in seq_rows:
         Am, Bm = row.get("A"), row.get("B")
+        Bpm, Brpm = row.get("Bprobe"), row.get("BrefProbe")
         Brm, Cm = row.get("Bref"), row.get("C")
         Cpm, Ctm, Cptm, Dm = row.get("Cpack"), row.get("Ctemp"), row.get("CpackTemp"), row.get("D")
         dab = _mean_abs_or_nan(Am, Bm)
+        dabp = _mean_abs_or_nan(Am, Bpm)
         dabr = _mean_abs_or_nan(Am, Brm)
+        dabrp = _mean_abs_or_nan(Am, Brpm)
+        dbbp = _mean_abs_or_nan(Bm, Bpm)
         dac = _mean_abs_or_nan(Am, Cm)
         dacp = _mean_abs_or_nan(Am, Cpm)
         dbbr = _mean_abs_or_nan(Bm, Brm)
+        dbbrp = _mean_abs_or_nan(Bm, Brpm)
+        dbpbrp = _mean_abs_or_nan(Bpm, Brpm)
         dbc = _mean_abs_or_nan(Bm, Cm)
         dbcp = _mean_abs_or_nan(Bm, Cpm)
+        dbpc = _mean_abs_or_nan(Bpm, Cm)
+        dbpcp = _mean_abs_or_nan(Bpm, Cpm)
         dbrc = _mean_abs_or_nan(Brm, Cm)
         dbrcp = _mean_abs_or_nan(Brm, Cpm)
+        dbrpc = _mean_abs_or_nan(Brpm, Cm)
+        dbrpcp = _mean_abs_or_nan(Brpm, Cpm)
         dccp = _mean_abs_or_nan(Cm, Cpm)
         dbct = _mean_abs_or_nan(Bm, Ctm)
         dbcpt = _mean_abs_or_nan(Bm, Cptm)
@@ -936,6 +1112,12 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
         dcd = _mean_abs_or_nan(Cm, Dm)
         dcpd = _mean_abs_or_nan(Cpm, Dm)
         kab = _rs_k3_mean(Am, Bm) if (Am is not None and Bm is not None) else float("nan")
+        fids, toks = row.get("FtargetIds"), row.get("tokens")
+        target_mismatch = "n/a"
+        if torch.is_tensor(fids) and torch.is_tensor(toks):
+            n_tid = min(fids.numel(), toks.numel())
+            if n_tid:
+                target_mismatch = f"{int((fids[:n_tid].long() != toks[:n_tid].long()).sum())}/{n_tid}"
         _p(f"[ASYNC-BUNDLE] seq{row['seq']} L={row['L']} resp_len={row['resp_len']} "
            f"resp_valid={row['resp_valid']} prompt_len={row['prompt_len']} "
            f"align={row['align_mode']}/{row['resp_len_src']} imgtok={row['n_img_tok']} "
@@ -947,22 +1129,48 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
            f"|B-Ctemp|dumpFSDP_vs_HF/temp={dbct:.4f} |B-Cptemp|dumpFSDP_vs_PACK/temp={dbcpt:.4f} "
            f"|A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
            f"|C-D|freshHF_vs_freshVLLM={dcd:.4f} |Cp-D|freshHF_PACK_vs_freshVLLM={dcpd:.4f}")
+        if Bpm is not None or Brpm is not None:
+            _p(f"[ASYNC-BUNDLE] seq{row['seq']} FSDP-exact-row-probe: target_id_mismatch={target_mismatch} "
+               f"|B-Bprobe|slice_vs_exact={dbbp:.6f} |A-Bprobe|dumpVLLM_vs_exact={dabp:.4f} "
+               f"|Bprobe-BrefProbe|kernel_vs_torch_ref={dbpbrp:.6f} "
+               f"|Bprobe-C|exact_vs_freshHF={dbpc:.4f} |Bprobe-Cp|exact_vs_freshHF_PACK={dbpcp:.4f} "
+               f"|BrefProbe-C|ref_vs_freshHF={dbrpc:.4f} |BrefProbe-Cp|ref_vs_freshHF_PACK={dbrpcp:.4f}")
         if Brm is not None:
             _p(f"[ASYNC-BUNDLE] seq{row['seq']} FSDP-logprob-check: "
                f"|B-Bref|kernel_vs_torch_ref={dbbr:.6f} |A-Bref|dumpVLLM_vs_ref={dabr:.4f} "
+               f"|B-BrefProbe|slice_vs_exact_ref={dbbrp:.6f} |A-BrefProbe|dumpVLLM_vs_exact_ref={dabrp:.4f} "
                f"|Bref-C|torch_ref_vs_freshHF={dbrc:.4f} |Bref-Cp|torch_ref_vs_freshHF_PACK={dbrcp:.4f}")
+        Ftgt, Flse = row.get("FtargetLogit"), row.get("Flogsumexp")
+        Cttgt, Ctlse = row.get("CtempTargetLogit"), row.get("CtempLogsumexp")
+        Cpttgt, Cptlse = row.get("CpackTempTargetLogit"), row.get("CpackTempLogsumexp")
+        if Ftgt is not None and Flse is not None:
+            _p(f"[ASYNC-BUNDLE] seq{row['seq']} FSDP-logits-vs-HF(scaled by temp): "
+               f"|Ftarget-Ctarget|={_mean_abs_or_nan(Ftgt, Cttgt):.4f} "
+               f"|Flse-Clse|={_mean_abs_or_nan(Flse, Ctlse):.4f} "
+               f"|Ftarget-CpTarget|={_mean_abs_or_nan(Ftgt, Cpttgt):.4f} "
+               f"|Flse-CpLse|={_mean_abs_or_nan(Flse, Cptlse):.4f}")
         _p(f"[ASYNC-BUNDLE] seq{row['seq']} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
            f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
         _print_worst_pair(row, "|A-B|", "A", "B")
+        _print_worst_pair(row, "|B-Bprobe|", "B", "Bprobe")
         _print_worst_pair(row, "|B-Bref|", "B", "Bref")
+        _print_worst_pair(row, "|Bprobe-BrefProbe|", "Bprobe", "BrefProbe")
         _print_worst_pair(row, "|B-C|", "B", "C")
         _print_worst_pair(row, "|B-Cp|", "B", "Cpack")
+        _print_worst_pair(row, "|Bprobe-C|", "Bprobe", "C")
+        _print_worst_pair(row, "|Bprobe-Cp|", "Bprobe", "Cpack")
         _print_worst_pair(row, "|C-Cp|", "C", "Cpack")
         _print_worst_pair(row, "|Bref-C|", "Bref", "C")
         _print_worst_pair(row, "|Bref-Cp|", "Bref", "Cpack")
+        _print_worst_pair(row, "|BrefProbe-C|", "BrefProbe", "C")
+        _print_worst_pair(row, "|BrefProbe-Cp|", "BrefProbe", "Cpack")
         _print_worst_pair(row, "|A-D|", "A", "D")
         _print_worst_pair(row, "|C-D|", "C", "D")
         _print_worst_pair(row, "|Cp-D|", "Cpack", "D")
+        _print_worst_diag_pair(row, "|Ftarget-Ctarget|", "FtargetLogit", "CtempTargetLogit")
+        _print_worst_diag_pair(row, "|Flse-Clse|", "Flogsumexp", "CtempLogsumexp")
+        _print_worst_diag_pair(row, "|Ftarget-CpTarget|", "FtargetLogit", "CpackTempTargetLogit")
+        _print_worst_diag_pair(row, "|Flse-CpLse|", "Flogsumexp", "CpackTempLogsumexp")
 
     _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
 
@@ -986,14 +1194,23 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             _p(f"  {label}: {_fmt_abs(x, y)}")
 
     _print_pair("|A-B| dump-vLLM vs dump-FSDP       ", "A", "B")
+    _print_pair("|A-Bp| dump-vLLM vs FSDP exact-row ", "A", "Bprobe")
     _print_pair("|A-Br| dump-vLLM vs FSDP torch-ref ", "A", "Bref")
+    _print_pair("|A-Brp| dump-vLLM vs exact ref     ", "A", "BrefProbe")
     _print_pair("|A-C| dump-vLLM vs fresh-HF/FSDP    ", "A", "C")
     _print_pair("|A-Cp| dump-vLLM vs fresh-HF PACK   ", "A", "Cpack")
+    _print_pair("|B-Bp| FSDP sliced vs exact-row     ", "B", "Bprobe")
     _print_pair("|B-Br| FSDP kernel vs torch-ref     ", "B", "Bref")
+    _print_pair("|B-Brp| FSDP sliced vs exact ref    ", "B", "BrefProbe")
+    _print_pair("|Bp-Brp| exact kernel vs exact ref  ", "Bprobe", "BrefProbe")
     _print_pair("|B-C| dump-FSDP vs fresh-HF (sanity)", "B", "C")
     _print_pair("|B-Cp| dump-FSDP vs fresh-HF PACK   ", "B", "Cpack")
+    _print_pair("|Bp-C| exact FSDP vs fresh-HF       ", "Bprobe", "C")
+    _print_pair("|Bp-Cp| exact FSDP vs fresh-HF PACK ", "Bprobe", "Cpack")
     _print_pair("|Br-C| FSDP torch-ref vs fresh-HF   ", "Bref", "C")
     _print_pair("|Br-Cp| FSDP torch-ref vs HF PACK   ", "Bref", "Cpack")
+    _print_pair("|Brp-C| exact ref vs fresh-HF       ", "BrefProbe", "C")
+    _print_pair("|Brp-Cp| exact ref vs fresh-HF PACK ", "BrefProbe", "Cpack")
     _print_pair("|C-Cp| fresh-HF single vs HF PACK   ", "C", "Cpack")
     _print_pair("|B-Ct| dump-FSDP vs fresh-HF/temp   ", "B", "Ctemp")
     _print_pair("|B-Cpt| dump-FSDP vs HF PACK/temp   ", "B", "CpackTemp")
@@ -1001,12 +1218,19 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     _print_pair("|B-D| dump-FSDP vs fresh-vLLM       ", "B", "D")
     _print_pair("|C-D| fresh-HF vs fresh-vLLM        ", "C", "D")
     _print_pair("|Cp-D| fresh-HF PACK vs fresh-vLLM  ", "Cpack", "D")
+    _p("\n[ASYNC-BUNDLE] ===== aggregate FSDP logits diagnostics (FSDP logits are temp-scaled) =====")
+    _print_pair("|Ftarget-Ctarget| FSDP target-logit vs HF     ", "FtargetLogit", "CtempTargetLogit")
+    _print_pair("|Flse-Clse| FSDP logsumexp vs HF              ", "Flogsumexp", "CtempLogsumexp")
+    _print_pair("|Ftarget-CpTarget| FSDP target-logit vs HF PACK", "FtargetLogit", "CpackTempTargetLogit")
+    _print_pair("|Flse-CpLse| FSDP logsumexp vs HF PACK         ", "Flogsumexp", "CpackTempLogsumexp")
     _print_k3_matrix("ASYNC-BUNDLE", seq_rows)
     if not accD:
         _p("[ASYNC-BUNDLE] D=fresh-vLLM is unavailable because vLLM init/replay failed; A/B/C are still valid.")
     _p("  READ: A=dump vLLM, B=dump FSDP, C=fresh HF single-seq, Cp=fresh HF packed-varlen, D=fresh vLLM.")
-    _p("        |B-Cp| small while |C-Cp|/|B-C| large => the training packed/varlen path reproduces B.")
-    _p("        |B-Cp| large too => B differs beyond packing (weights/FSDP state/logprob kernel).")
+    _p("        |B-Bp| large => bench slicing/alignment or dumped fsdp_log_probs frame is wrong; trust Bp exact-row.")
+    _p("        |Bp-Brp| large while Ftarget/Flse match HF => FSDP logprobs_from_logits/gather path is wrong.")
+    _p("        Ftarget/Flse differ from C/Cp => FSDP forward logits/state differ from fresh HF, before logprob math.")
+    _p("        |C-Cp| nonzero => fresh packed replay differs from single replay; otherwise normal packing is clean.")
     _p("        |A-D| small => dumped vLLM is reproducible; |C-D|/|Cp-D| are clean HF-vs-vLLM gaps.")
 
 

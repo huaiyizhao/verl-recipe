@@ -235,6 +235,24 @@ default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
 
+# ---- One-shot FSDP/vLLM logprob root-cause probe ----
+# Enabled by default for this debug script. It dumps the first actor micro-batch whose
+# rollout-vs-FSDP RS-K3 crosses the mask threshold, including FSDP torch-reference
+# selected logprobs, selected logits/top-k diagnostics, actor tags/global-step info,
+# and a lightweight rank0 parameter fingerprint.
+logprob_probe_enabled=${logprob_probe_enabled:-True}
+if [ "${logprob_probe_enabled}" = "True" ]; then
+    export VERL_LOGPROB_PROBE_DUMP=1
+    export VERL_LOGPROB_PROBE_REF=1
+    export VERL_LOGPROB_PROBE_MAX=${VERL_LOGPROB_PROBE_MAX:-1}
+    export VERL_LOGPROB_PROBE_MIN_K3=${VERL_LOGPROB_PROBE_MIN_K3:-0.005}
+    export VERL_LOGPROB_PROBE_TOPK=${VERL_LOGPROB_PROBE_TOPK:-5}
+    export VERL_LOGPROB_PROBE_DIR=${VERL_LOGPROB_PROBE_DIR:-/efs/data/rl/logprob_probe_fsdp_${run_timestamp}}
+    export VERL_LOGPROB_PROBE_LOGPROBS_MODE=${rollout_logprobs_mode}
+    export VERL_LOGPROB_DEBUG_TOKENIZER=${HF_MODEL_PATH}
+    echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
+fi
+
 # ================= launch =================
 # Hydra config uses `hydra.searchpath: file://verl/trainer/config` (relative to
 # CWD), and the `recipe.*` agent-loop target must be importable; both rely on
