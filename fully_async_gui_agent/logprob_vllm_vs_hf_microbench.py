@@ -99,6 +99,24 @@ def _pixel_stats(tag, pv):
     )
 
 
+def _load_hf_model(model_path, attn, device):
+    from transformers import AutoModelForImageTextToText
+
+    _p(f"=== loading HF model (bf16, attn={attn}) — this IS the FSDP training-path numerics ===")
+    hf = AutoModelForImageTextToText.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, attn_implementation=attn, trust_remote_code=True
+    ).eval().to(device)
+
+    try:
+        from verl.models.transformers.monkey_patch import apply_monkey_patch
+
+        apply_monkey_patch(hf, use_remove_padding=True, use_fused_kernels=False)
+        _p("=== [VERL-PATCH] applied verl monkey_patch to HF -> C matches TRAINING FSDP path ===")
+    except Exception as e:  # noqa: BLE001
+        _p(f"=== [VERL-PATCH] FAILED ({e!r}); C may not match training FSDP ===")
+    return hf
+
+
 def _collapse_image_runs(ids, image_token_id):
     """vLLM wants one image placeholder per image; dumped input_ids have one per image patch token."""
     out, n_runs, prev = [], 0, False
@@ -301,6 +319,7 @@ def _print_k3_matrix(tag, seq_rows):
 
 
 def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_pos=True, with_vllm=True,
+                      attn="flash_attention_2",
                       gpu_mem=0.6, max_seq=0):
     """Load an async-run probe bundle and 3-way compare, per response token:
         A = async's recorded old_log_probs  (vLLM, since bypass_mode sets old = rollout_log_probs)
@@ -313,6 +332,8 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     |B-C| is a sanity check (async FSDP vs fresh HF; should be ~bf16 noise)."""
     _p(f"=== [ASYNC-BUNDLE] loading {path} ===")
     b = torch.load(path, map_location="cpu", weights_only=False)
+    if hf is None:
+        hf = _load_hf_model(model_path, attn, device)
 
     # Fields can be nested ({values, offsets}) OR plain padded tensors (n_seq, ...). Print + handle both.
     for k in ("input_ids", "position_ids", "responses", "old_log_probs", "rollout_log_probs", "fsdp_log_probs",
@@ -382,43 +403,10 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
     merge = int(_processor_param(processor, "merge_size", None) or _processor_param(processor, "spatial_merge_size", 2) or 2)
     _p(f"[ASYNC-BUNDLE] n_seq={n_seq}")
 
-    llm = SamplingParams = None
-    if with_vllm:
-        try:
-            from vllm import LLM, SamplingParams
-
-            if raw_images and any(raw_images):
-                max_imgs = max((len(x or []) for x in raw_images), default=1)
-                img_src_msg = "raw_images"
-            else:
-                max_imgs = int(grid.shape[0]) if torch.is_tensor(grid) else 1
-                img_src_msg = "reconstructed from pixel_values"
-            _p(f"[ASYNC-BUNDLE] loading fresh vLLM(D), images={img_src_msg}, "
-               f"logprobs_mode={logprobs_mode}, max_imgs={max(1, max_imgs)}, gpu_mem={gpu_mem}")
-            llm_kwargs = dict(
-                model=model_path,
-                dtype="bfloat16",
-                trust_remote_code=True,
-                gpu_memory_utilization=gpu_mem,
-                max_model_len=32768,
-                limit_mm_per_prompt={"image": max(1, max_imgs)},
-                enforce_eager=True,
-            )
-            try:
-                llm = LLM(logprobs_mode=logprobs_mode, **llm_kwargs)
-            except TypeError:
-                _p("[ASYNC-BUNDLE] this vLLM build does not accept logprobs_mode= on LLM(); using default")
-                llm = LLM(**llm_kwargs)
-        except Exception as e:  # noqa: BLE001
-            import traceback
-
-            _p(f"[ASYNC-BUNDLE] fresh vLLM(D) init failed: {e!r}; continuing with A/B/C only")
-            traceback.print_exc()
-            llm = None
-
     img_cursor, patch_cursor = 0, 0
     accA, accB, accC, accD = [], [], [], []
     seq_rows = []
+    d_jobs = []
 
     def _temp_for_seq(i):
         if temperature is None:
@@ -558,33 +546,9 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             Av = _masked(Av0)
             Bv = _masked(Bv0)
             Cm = _masked(Cm0)
-            if llm is not None:
-                try:
-                    if raw_images and i < len(raw_images) and raw_images[i]:
-                        images = raw_images[i]
-                        image_src = "raw_images"
-                    else:
-                        images = _pixels_to_reconstructed_images(seq_pix, seq_grids, processor) if seq_pix else []
-                        image_src = "pixel_values->PIL"
-                    unexpanded_full, n_runs = _collapse_image_runs(ids_i.detach().cpu().tolist(), image_token_id)
-                    if n_runs != len(images):
-                        _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM WARN: image runs={n_runs} images={len(images)} "
-                           f"src={image_src}; D may misalign")
-                    temp_i = _temp_for_seq(i)
-                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
-                    response_ids = ids_i[prompt_len:L].detach().cpu().tolist()
-                    Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_len)
-                    Dv = _masked(Dv0.float())
-                    if i == 0:
-                        _p(f"[ASYNC-BUNDLE] fresh-vLLM(D) image source: {image_src}; "
-                           f"valid_logprobs={int(torch.isfinite(Dv).sum())}/{Dv.numel()}")
-                except Exception as e:  # noqa: BLE001
-                    import traceback
-
-                    _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM(D) failed: {e!r}")
-                    traceback.print_exc()
         else:
             # Ambiguous older bundle: no full response frame is available, so compare valid tail tokens.
+            mask = rm.detach().cpu() if rm is not None else None
             Av = (A[rm] if (A is not None and rm is not None and rm.numel() == A.numel())
                   else (A[:resp_valid] if A is not None else None))
             if Bfull is not None:
@@ -599,71 +563,190 @@ def _run_async_bundle(path, model_path, hf, processor, tokenizer, device, feed_p
             Cm = torch.tensor(
                 [float(lp[L - resp_valid + j - 1, int(ids_i[L - resp_valid + j])]) for j in range(resp_valid)]
             )
-            if llm is not None:
-                try:
-                    if raw_images and i < len(raw_images) and raw_images[i]:
-                        images = raw_images[i]
-                    else:
-                        images = _pixels_to_reconstructed_images(seq_pix, seq_grids, processor) if seq_pix else []
-                    unexpanded_full, _ = _collapse_image_runs(ids_i.detach().cpu().tolist(), image_token_id)
-                    temp_i = _temp_for_seq(i)
-                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
-                    response_ids = ids_i[L - resp_valid:L].detach().cpu().tolist()
-                    Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_valid).float()
-                    Dv = Dv0[rm] if (rm is not None and rm.numel() == Dv0.numel()) else Dv0[:resp_valid]
-                except Exception as e:  # noqa: BLE001
-                    import traceback
-
-                    _p(f"[ASYNC-BUNDLE] seq{i} fresh-vLLM(D) failed: {e!r}")
-                    traceback.print_exc()
         # defensive: align all to the common valid length
         k = min(
             x.numel()
             for x in (Cm,)
             + ((Av,) if Av is not None else ())
             + ((Bv,) if Bv is not None else ())
-            + ((Dv,) if Dv is not None else ())
         )
         if k == 0:
             continue
         Cm = Cm[:k]
         Am = Av[:k] if Av is not None else None
         Bm = Bv[:k] if Bv is not None else None
-        Dm = Dv[:k] if Dv is not None else None
         if Am is not None:
             accA.append(Am)
         if Bm is not None:
             accB.append(Bm)
         accC.append(Cm)
-        if Dm is not None:
-            accD.append(Dm)
-        seq_rows.append(
-            {
-                "seq": i,
-                "n": k,
-                "A": Am.detach().cpu() if Am is not None else None,
-                "B": Bm.detach().cpu() if Bm is not None else None,
-                "C": Cm.detach().cpu(),
-                "D": Dm.detach().cpu() if Dm is not None else None,
-            }
-        )
-        dab = (Am - Bm).abs().mean().item() if (Am is not None and Bm is not None) else float("nan")
-        dac = (Am - Cm).abs().mean().item() if Am is not None else float("nan")
-        dbc = (Bm - Cm).abs().mean().item() if Bm is not None else float("nan")
-        dad = _abs_stats(Am, Dm)[0] if (Am is not None and Dm is not None and _abs_stats(Am, Dm) is not None) else float("nan")
-        dcd = _abs_stats(Cm, Dm)[0] if (Dm is not None and _abs_stats(Cm, Dm) is not None) else float("nan")
-        kab = _rs_k3_mean(Am, Bm) if (Am is not None and Bm is not None) else float("nan")
-        _p(f"[ASYNC-BUNDLE] seq{i} L={L} resp_len={resp_len} resp_valid={resp_valid} "
-           f"prompt_len={prompt_len} align={align_mode}/{resp_len_src} imgtok={n_img_tok} | "
-           f"|A-B|dumpVLLM_vs_dumpFSDP={dab:.4f} |A-C|dumpVLLM_vs_freshHF={dac:.4f} "
-           f"|B-C|dumpFSDP_vs_freshHF={dbc:.4f} |A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
-           f"|C-D|freshHF_vs_freshVLLM={dcd:.4f}")
-        _p(f"[ASYNC-BUNDLE] seq{i} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
-           f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
+        row = {
+            "seq": i,
+            "n": k,
+            "A": Am.detach().cpu() if Am is not None else None,
+            "B": Bm.detach().cpu() if Bm is not None else None,
+            "C": Cm.detach().cpu(),
+            "D": None,
+            "L": L,
+            "resp_len": resp_len,
+            "resp_valid": resp_valid,
+            "prompt_len": prompt_len,
+            "align_mode": align_mode,
+            "resp_len_src": resp_len_src,
+            "n_img_tok": n_img_tok,
+        }
+        seq_rows.append(row)
+        if with_vllm:
+            d_jobs.append(
+                {
+                    "row": row,
+                    "ids": ids_i.detach().cpu(),
+                    "resp_len": resp_len,
+                    "resp_valid": resp_valid,
+                    "prompt_len": prompt_len,
+                    "align_mode": align_mode,
+                    "mask": mask.detach().cpu() if torch.is_tensor(mask) else mask,
+                    "seq_pix": [p.detach().cpu() for p in seq_pix],
+                    "seq_grids": [g.detach().cpu() for g in seq_grids],
+                    "raw_images": raw_images[i] if raw_images and i < len(raw_images) and raw_images[i] else None,
+                    "temperature": _temp_for_seq(i),
+                }
+            )
 
     if not accC:
         _p("[ASYNC-BUNDLE] no comparable response tokens after alignment; check responses/response_mask lengths")
         return
+
+    if with_vllm and d_jobs:
+        import gc
+
+        ids_i = grid_i = pix_i = lp = kw = pos_i = target = frames = None
+        _p("[ASYNC-BUNDLE] finished HF(C); releasing HF before loading fresh vLLM(D)")
+        del hf
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:  # noqa: BLE001
+                pass
+
+        llm = SamplingParams = None
+        try:
+            from vllm import LLM, SamplingParams
+
+            raw_img_counts = [len(j["raw_images"] or []) for j in d_jobs if j["raw_images"]]
+            grid_img_counts = [len(j["seq_grids"]) for j in d_jobs]
+            max_imgs = max(raw_img_counts + grid_img_counts + [1])
+            img_src_msg = "raw_images/pixel_values->PIL" if raw_img_counts else "reconstructed from pixel_values"
+            _p(f"[ASYNC-BUNDLE] loading fresh vLLM(D), images={img_src_msg}, "
+               f"logprobs_mode={logprobs_mode}, max_imgs={max_imgs}, gpu_mem={gpu_mem}")
+            llm_kwargs = dict(
+                model=model_path,
+                dtype="bfloat16",
+                trust_remote_code=True,
+                gpu_memory_utilization=gpu_mem,
+                max_model_len=32768,
+                limit_mm_per_prompt={"image": max_imgs},
+                enforce_eager=True,
+            )
+            try:
+                llm = LLM(logprobs_mode=logprobs_mode, **llm_kwargs)
+            except TypeError:
+                _p("[ASYNC-BUNDLE] this vLLM build does not accept logprobs_mode= on LLM(); using default")
+                llm = LLM(**llm_kwargs)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            _p(f"[ASYNC-BUNDLE] fresh vLLM(D) init failed: {e!r}; continuing with A/B/C only")
+            traceback.print_exc()
+            llm = None
+
+        first_d = True
+        if llm is not None:
+            for job in d_jobs:
+                row = job["row"]
+                try:
+                    ids_cpu = job["ids"].long().reshape(-1)
+                    L = ids_cpu.numel()
+                    if job["raw_images"]:
+                        images = job["raw_images"]
+                        image_src = "raw_images"
+                    else:
+                        images = (
+                            _pixels_to_reconstructed_images(job["seq_pix"], job["seq_grids"], processor)
+                            if job["seq_pix"]
+                            else []
+                        )
+                        image_src = "pixel_values->PIL"
+                    unexpanded_full, n_runs = _collapse_image_runs(ids_cpu.tolist(), image_token_id)
+                    if n_runs != len(images):
+                        _p(f"[ASYNC-BUNDLE] seq{row['seq']} fresh-vLLM WARN: image runs={n_runs} images={len(images)} "
+                           f"src={image_src}; D may misalign")
+                    temp_i = float(job["temperature"])
+                    sp = SamplingParams(temperature=temp_i if temp_i > 0 else 1.0, max_tokens=1, prompt_logprobs=1)
+                    if job["align_mode"] == "response-window":
+                        resp_len = int(job["resp_len"])
+                        prompt_len = int(job["prompt_len"])
+                        response_ids = ids_cpu[prompt_len:L].tolist()
+                        Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_len).float()
+                        mask = job["mask"]
+                        if not torch.is_tensor(mask):
+                            mask = torch.ones(resp_len, dtype=torch.bool)
+                        mask = mask.bool().reshape(-1)
+                        n = min(Dv0.numel(), mask.numel())
+                        Dv = Dv0[:n][mask[:n]]
+                    else:
+                        resp_valid = int(job["resp_valid"])
+                        response_ids = ids_cpu[L - resp_valid:L].tolist()
+                        Dv0 = _vllm_seq_logprobs(llm, sp, unexpanded_full, images, response_ids, resp_valid).float()
+                        mask = job["mask"]
+                        if torch.is_tensor(mask) and mask.numel() == Dv0.numel():
+                            Dv = Dv0[mask.bool().reshape(-1)]
+                        else:
+                            Dv = Dv0[:resp_valid]
+
+                    existing = [row[k] for k in ("A", "B", "C") if row.get(k) is not None]
+                    k = min([Dv.numel()] + [x.numel() for x in existing])
+                    if k == 0:
+                        continue
+                    for name in ("A", "B", "C"):
+                        if row.get(name) is not None:
+                            row[name] = row[name][:k]
+                    row["D"] = Dv[:k].detach().cpu()
+                    row["n"] = k
+                    accD.append(row["D"])
+                    if first_d:
+                        first_d = False
+                        _p(f"[ASYNC-BUNDLE] fresh-vLLM(D) image source: {image_src}; "
+                           f"valid_logprobs={int(torch.isfinite(row['D']).sum())}/{row['D'].numel()}")
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+
+                    _p(f"[ASYNC-BUNDLE] seq{row['seq']} fresh-vLLM(D) failed: {e!r}")
+                    traceback.print_exc()
+
+    def _mean_abs_or_nan(x, y):
+        s = _abs_stats(x, y)
+        return s[0] if s is not None else float("nan")
+
+    for row in seq_rows:
+        Am, Bm, Cm, Dm = row.get("A"), row.get("B"), row.get("C"), row.get("D")
+        dab = _mean_abs_or_nan(Am, Bm)
+        dac = _mean_abs_or_nan(Am, Cm)
+        dbc = _mean_abs_or_nan(Bm, Cm)
+        dad = _mean_abs_or_nan(Am, Dm)
+        dcd = _mean_abs_or_nan(Cm, Dm)
+        kab = _rs_k3_mean(Am, Bm) if (Am is not None and Bm is not None) else float("nan")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} L={row['L']} resp_len={row['resp_len']} "
+           f"resp_valid={row['resp_valid']} prompt_len={row['prompt_len']} "
+           f"align={row['align_mode']}/{row['resp_len_src']} imgtok={row['n_img_tok']} | "
+           f"|A-B|dumpVLLM_vs_dumpFSDP={dab:.4f} |A-C|dumpVLLM_vs_freshHF={dac:.4f} "
+           f"|B-C|dumpFSDP_vs_freshHF={dbc:.4f} |A-D|dumpVLLM_vs_freshVLLM={dad:.4f} "
+           f"|C-D|freshHF_vs_freshVLLM={dcd:.4f}")
+        _p(f"[ASYNC-BUNDLE] seq{row['seq']} RS-K3(A=vLLM||B=FSDP)={_fmt(kab)} "
+           f"({'MASKED' if kab > 0.005 else 'kept'} @0.005)")
+
     _p("\n[ASYNC-BUNDLE] ===== AGGREGATE over all response tokens =====")
 
     def _row_pair(a, bname):
@@ -1271,34 +1354,22 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     tokenizer = processor.tokenizer
-
-    _p(f"=== loading HF model (bf16, attn={args.attn}) — this IS the FSDP training-path numerics ===")
-    hf = AutoModelForImageTextToText.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, attn_implementation=args.attn, trust_remote_code=True
-    ).eval().to(device)
-
-    try:
-        from verl.models.transformers.monkey_patch import apply_monkey_patch
-
-        apply_monkey_patch(hf, use_remove_padding=True, use_fused_kernels=False)
-        _p("=== [VERL-PATCH] applied verl monkey_patch to HF -> C matches TRAINING FSDP path ===")
-    except Exception as e:  # noqa: BLE001
-        _p(f"=== [VERL-PATCH] FAILED ({e!r}); C may not match training FSDP ===")
 
     _p("\n################## ABCD BENCH (A=dump vLLM / B=dump FSDP / C=fresh HF / D=fresh vLLM) ##################")
     _run_async_bundle(
         args.async_bundle,
         args.model,
-        hf,
+        None,
         processor,
         tokenizer,
         device,
         feed_pos=True,
         with_vllm=True,
+        attn=args.attn,
         gpu_mem=args.gpu_mem,
         max_seq=0,
     )
