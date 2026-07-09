@@ -219,10 +219,14 @@ if [ "${image_dedup_enabled}" = "True" ]; then
 fi
 
 # ================= performance =================
-# Keep TP=1 by default for this debug/probe script. TP=2 currently hits vLLM's
-# custom_all_reduce CUDA path on this cluster and can fail before the FSDP probe
-# reaches actor update; TP=1 avoids that unrelated rollout-server init failure.
-infer_tp=${infer_tp:-1}
+# vLLM rollout tensor parallelism. TP=2 uses two GPUs per rollout engine.
+infer_tp=${infer_tp:-2}
+# FSDP ZeRO-2 semantics: keep full params after forward and shard gradients/optimizer states.
+# In torch FSDP this is controlled by reshard_after_forward=False.
+actor_reshard_after_forward=${actor_reshard_after_forward:-False}
+# vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
+# compatibility issues on some clusters. Disable it by default for the debug recipe.
+vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-True}
 actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
@@ -306,6 +310,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${actor_reshard_after_forward} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
@@ -347,6 +352,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     actor_rollout_ref.rollout.disable_log_stats=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=${vllm_disable_custom_all_reduce} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
