@@ -219,7 +219,10 @@ if [ "${image_dedup_enabled}" = "True" ]; then
 fi
 
 # ================= performance =================
-infer_tp=${infer_tp:-2}
+# Keep TP=1 by default for this debug/probe script. TP=2 currently hits vLLM's
+# custom_all_reduce CUDA path on this cluster and can fail before the FSDP probe
+# reaches actor update; TP=1 avoids that unrelated rollout-server init failure.
+infer_tp=${infer_tp:-1}
 actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
