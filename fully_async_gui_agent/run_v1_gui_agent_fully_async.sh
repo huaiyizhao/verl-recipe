@@ -220,13 +220,13 @@ fi
 
 # ================= performance =================
 # vLLM rollout tensor parallelism. TP=2 uses two GPUs per rollout engine.
-infer_tp=${infer_tp:-2}
+infer_tp=${infer_tp:-1}
 # FSDP ZeRO-2 semantics: keep full params after forward and shard gradients/optimizer states.
 # In torch FSDP this is controlled by reshard_after_forward=False.
 actor_reshard_after_forward=${actor_reshard_after_forward:-False}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
 # compatibility issues on some clusters. Disable it by default for the debug recipe.
-vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-True}
+vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
 actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
