@@ -2,7 +2,6 @@ import copy
 import json
 from typing import Any
 
-
 _COMPUTER_USE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -29,16 +28,24 @@ _COMPUTER_USE_TOOL: dict[str, Any] = {
                 "action": {
                     "description": (
                         "\n"
-                        "* `key`: Performs key down presses on the arguments passed in order, then performs key releases in reverse order.\n"
+                        "* `key`: Performs key down presses on the arguments passed in order, then performs "
+                        "key releases in reverse order.\n"
                         "* `type`: Type a string of text on the keyboard.\n"
                         "* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
-                        "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate on the screen (simulated as double-click since it's the closest action).\n"
-                        "* `scroll`: Performs a scroll of the mouse scroll wheel. If `coordinate` is provided, first move the mouse to that coordinate, then scroll.\n"
+                        "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate "
+                        "on the screen.\n"
+                        "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate "
+                        "on the screen.\n"
+                        "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate "
+                        "on the screen.\n"
+                        "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate "
+                        "on the screen.\n"
+                        "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate "
+                        "on the screen.\n"
+                        "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate "
+                        "on the screen (simulated as double-click since it's the closest action).\n"
+                        "* `scroll`: Performs a scroll of the mouse scroll wheel. If `coordinate` is provided, "
+                        "first move the mouse to that coordinate, then scroll.\n"
                         "* `hscroll`: Performs a horizontal scroll (mapped to regular scroll).\n"
                         "* `wait`: Wait specified seconds for the change to happen.\n"
                         "* `terminate`: Terminate the current task and report its completion status.\n"
@@ -99,13 +106,16 @@ def build_computer_use_tool_dict(screen_width: int = 1000, screen_height: int = 
 def build_computer_use_system_prompt(screen_width: int = 1000, screen_height: int = 1000) -> str:
     """Build the Qwen-style XML tool prompt used by dataset rows."""
     tools_def = build_computer_use_tool_dict(screen_width, screen_height)
-    return """# Tools
+    return (
+        """# Tools
 
 You may call one or more functions to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-""" + json.dumps(tools_def) + """
+"""
+        + json.dumps(tools_def)
+        + """
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -117,10 +127,25 @@ For each function call, return a json object with function name and arguments wi
 
 Response format for every step:
 1) Action: a short imperative describing what to do in the UI.
-2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+2) A single <tool_call>...</tool_call> block containing only the JSON:
+   {"name": <function-name>, "arguments": <args-json-object>}.
 
 Rules:
 - Output exactly in the order: Action, <tool_call>.
 - Be brief: one sentence for Action.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""
+    )
+
+
+def build_computer_use_behavior_prompt() -> str:
+    """Build a system prompt that leaves tool schema rendering to the chat template."""
+    return """You are a GUI agent controlling a desktop computer.
+
+For every step, decide the next desktop action from the current screenshot and task instruction.
+Use the available computer_use tool when interacting with the desktop.
+
+Rules:
+- Be concise.
+- If the task is complete, call computer_use with action=terminate.
+- Do not invent unavailable tools or actions."""

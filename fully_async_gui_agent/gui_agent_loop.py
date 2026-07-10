@@ -51,6 +51,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.tools.tool_registry import initialize_tools_from_config
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -117,6 +118,7 @@ class GUIAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
         self.max_env_reruns = int(self.rollout_config.agent.get("max_env_reruns", 1) or 0)
+        self.use_chat_template_tools = bool(self.rollout_config.agent.get("use_chat_template_tools", False))
         self._rerun_released_instances: set[str] = set()
 
         # Tool registration (expects computer_use / DesktopEnvTool).
@@ -467,8 +469,10 @@ class GUIAgentLoop(AgentLoopBase):
                 # 2. Tokenize prompt for this turn.
                 multi_modal_data = await self.process_vision_info(messages)
                 image_data = multi_modal_data.get("images")
+                template_tools = self.tool_schemas if self.use_chat_template_tools else None
                 prompt_ids = await self.apply_chat_template(
                     messages,
+                    tools=template_tools,
                     images=image_data if image_data else None,
                 )
                 original_prompt_len = len(prompt_ids)
@@ -556,8 +560,7 @@ class GUIAgentLoop(AgentLoopBase):
                     )
                     tool_calls = []
                     parse_error_text = (
-                        "Error: invalid tool call format. "
-                        "Please emit exactly one valid computer_use tool call."
+                        "Error: invalid tool call format. Please emit exactly one valid computer_use tool call."
                     )
                 if tool_calls:
                     for tool_call_idx, tool_call in enumerate(tool_calls, start=1):
@@ -580,21 +583,21 @@ class GUIAgentLoop(AgentLoopBase):
                             )
                 if not tool_args_list:
                     _log(
-                        f"{log_tag}[turn={turn}] No valid tool call parsed; "
-                        "continuing without environment step",
+                        f"{log_tag}[turn={turn}] No valid tool call parsed; continuing without environment step",
                         debug=True,
                     )
 
                 if tool_args_list:
-                    _log(
-                        f"{log_tag}[turn={turn}] Tool calls: "
-                        f"{[(args.get('action', ''), {k: v for k, v in args.items() if k != 'action'}) for args in tool_args_list]}"
-                    )
+                    tool_call_summary = [
+                        (args.get("action", ""), {k: v for k, v in args.items() if k != "action"})
+                        for args in tool_args_list
+                    ]
+                    _log(f"{log_tag}[turn={turn}] Tool calls: {tool_call_summary}")
 
                 # Decode assistant text and extract low_level_instruction.
                 assistant_text = await self.loop.run_in_executor(
                     None,
-                    lambda ids=response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
+                    guard_stop_iteration(lambda ids=response_ids: self.tokenizer.decode(ids, skip_special_tokens=True)),
                 )
                 low_level_instruction = self._extract_low_level_instruction(
                     assistant_text, fallback_action=actions[0] if actions else None
@@ -791,18 +794,19 @@ class GUIAgentLoop(AgentLoopBase):
             # Build the final-turn output and assemble the full trajectory list.
             # Every turn shares the episode reward; the worker writes each as its
             # own row, differing only by ``trajectory_role`` / ``turn_number``.
-            final_output = self._make_turn_output(
-                last_turn_ctx, role="final", metrics=self._build_metrics(metrics)
-            )
+            final_output = self._make_turn_output(last_turn_ctx, role="final", metrics=self._build_metrics(metrics))
             final_output.reward_score = shared_reward
             reward_extra_info = {
+                "reward": shared_reward,
                 "base_reward": base_reward,
                 "turn_penalty": turn_penalty,
                 "effective_turn_penalty": effective_turn_penalty,
             }
+            final_output.extra_fields["reward"] = shared_reward
             final_output.extra_fields["reward_extra_info"] = reward_extra_info
             for traj in self._trajectories:
                 traj.reward_score = shared_reward
+                traj.extra_fields["reward"] = shared_reward
                 traj.extra_fields["reward_extra_info"] = reward_extra_info
             # Screenshots/text now render in the mlflow trace via rollout_trace_op's OpenAI-chat
             # serialization of run()'s output (each AgentLoopOutput.multi_modal_data image ->
@@ -877,7 +881,10 @@ class GUIAgentLoop(AgentLoopBase):
                 try:
                     await asyncio.shield(self.desktop_tool.release(instance_id))
                 except asyncio.CancelledError:
-                    _log(f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}", level="ERROR")
+                    _log(
+                        f"[GUIAgentLoop] release shielded but coroutine cancelled for {task_id} {log_tag}",
+                        level="ERROR",
+                    )
                     raise
                 except Exception:
                     _log(

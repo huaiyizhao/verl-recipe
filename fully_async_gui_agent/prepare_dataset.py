@@ -73,11 +73,10 @@ import json
 import os
 import random
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
 from typing import Any
-
 
 DEFAULT_TASK_FILE = "test_stable.json"
 
@@ -91,13 +90,15 @@ def _load_computer_use_schema_module():
         module_path = os.path.join(os.path.dirname(__file__), "computer_use_schema.py")
         spec = importlib.util.spec_from_file_location("_gui_agent_computer_use_schema", module_path)
         if spec is None or spec.loader is None:
-            raise RuntimeError(f"Unable to load computer_use_schema.py from {module_path}")
+            raise RuntimeError(f"Unable to load computer_use_schema.py from {module_path}") from None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
 
 
-DEFAULT_SYSTEM_PROMPT = _load_computer_use_schema_module().build_computer_use_system_prompt()
+_COMPUTER_USE_SCHEMA = _load_computer_use_schema_module()
+DEFAULT_SYSTEM_PROMPT = _COMPUTER_USE_SCHEMA.build_computer_use_system_prompt()
+CHAT_TEMPLATE_TOOLS_SYSTEM_PROMPT = _COMPUTER_USE_SCHEMA.build_computer_use_behavior_prompt()
 
 
 # ---------------------------------------------------------------------------
@@ -289,9 +290,7 @@ def write_parquet(rows: list[dict[str, Any]], path: str) -> None:
     try:
         import pandas as pd  # noqa: WPS433
     except ImportError as exc:
-        raise RuntimeError(
-            "pandas is required to write parquet; install pandas + pyarrow"
-        ) from exc
+        raise RuntimeError("pandas is required to write parquet; install pandas + pyarrow") from exc
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     df = pd.DataFrame(rows)
@@ -355,9 +354,15 @@ def parse_args() -> argparse.Namespace:
         help="Explicit task_file for test rows. Overrides --test-split when set.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Keep only the first N tasks (after filter). 0 = all.")
-    parser.add_argument("--train-limit", type=int, default=0, help="Train limit in --from-proxy-splits mode. 0 falls back to --limit.")
-    parser.add_argument("--test-limit", type=int, default=0, help="Test limit in --from-proxy-splits mode. 0 falls back to --limit.")
-    parser.add_argument("--train-ratio", type=float, default=0.95, help="Fraction of tasks for train split (default 0.95).")
+    parser.add_argument(
+        "--train-limit", type=int, default=0, help="Train limit in --from-proxy-splits mode. 0 falls back to --limit."
+    )
+    parser.add_argument(
+        "--test-limit", type=int, default=0, help="Test limit in --from-proxy-splits mode. 0 falls back to --limit."
+    )
+    parser.add_argument(
+        "--train-ratio", type=float, default=0.95, help="Fraction of tasks for train split (default 0.95)."
+    )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed.")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
     parser.add_argument(
@@ -366,22 +371,27 @@ def parse_args() -> argparse.Namespace:
         help="System prompt to embed in every row.",
     )
     parser.add_argument(
+        "--use-chat-template-tools",
+        action="store_true",
+        help=(
+            "Use a behavior-only system prompt and let the model chat template render tool definitions "
+            "from the tools= argument. Use this for Qwen3.5/qwen3_coder style tool calls."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="/efs/data/cua/rl/osworld",
         help="Directory to write train.parquet / test.parquet.",
     )
-    parser.add_argument(
-        "--train-name", default="train.parquet", help="Train parquet filename inside --output-dir."
-    )
-    parser.add_argument(
-        "--test-name", default="test.parquet", help="Test parquet filename inside --output-dir."
-    )
+    parser.add_argument("--train-name", default="train.parquet", help="Train parquet filename inside --output-dir.")
+    parser.add_argument("--test-name", default="test.parquet", help="Test parquet filename inside --output-dir.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     task_file_was_explicit = any(arg == "--task-file" or arg.startswith("--task-file=") for arg in sys.argv[1:])
+    system_prompt = CHAT_TEMPLATE_TOOLS_SYSTEM_PROMPT if args.use_chat_template_tools else args.system_prompt
 
     if args.from_proxy_splits:
         train_task_file = args.train_task_file
@@ -418,8 +428,8 @@ def main() -> int:
         test_limit = args.test_limit or args.limit
         train_tasks = limit_tasks(train_tasks, train_limit, label="train")
         test_tasks = limit_tasks(test_tasks, test_limit, label="test")
-        train_rows = build_rows(train_tasks, split="train", system_prompt=args.system_prompt)
-        test_rows = build_rows(test_tasks, split="test", system_prompt=args.system_prompt)
+        train_rows = build_rows(train_tasks, split="train", system_prompt=system_prompt)
+        test_rows = build_rows(test_tasks, split="test", system_prompt=system_prompt)
         print(
             f"[prepare_dataset] Proxy splits: train={len(train_rows)} "
             f"test={len(test_rows)} (train_split={args.train_split!r}, test_split={args.test_split!r})"
@@ -431,10 +441,7 @@ def main() -> int:
             return 1
 
         tasks = limit_tasks(tasks, args.limit, label="tasks")
-        rows = [
-            build_row(task, index=i, system_prompt=args.system_prompt)
-            for i, task in enumerate(tasks)
-        ]
+        rows = [build_row(task, index=i, system_prompt=system_prompt) for i, task in enumerate(tasks)]
 
         train_rows, test_rows = split_train_test(rows, args.train_ratio, args.seed)
         # Stamp each row's split label now that we know train vs test.
@@ -443,8 +450,7 @@ def main() -> int:
         for row in test_rows:
             row["extra_info"]["split"] = "test"
         print(
-            f"[prepare_dataset] Local split: train={len(train_rows)} "
-            f"test={len(test_rows)} (ratio={args.train_ratio})"
+            f"[prepare_dataset] Local split: train={len(train_rows)} test={len(test_rows)} (ratio={args.train_ratio})"
         )
 
     train_path = os.path.join(args.output_dir, args.train_name)
@@ -462,9 +468,9 @@ def main() -> int:
         print(f"  prompt (roles)         = {[m['role'] for m in sample['prompt']]}")
         print(f"  extra_info.task_id     = {sample['extra_info']['task_id']}")
         print(f"  extra_info.domain      = {sample['extra_info']['domain']}")
-        question = sample['extra_info']['question']
+        question = sample["extra_info"]["question"]
         print(f"  extra_info.question    = {question[:80]!r}{'...' if len(question) > 80 else ''}")
-        ck = sample['extra_info']['tools_kwargs']['computer_use']['create_kwargs']
+        ck = sample["extra_info"]["tools_kwargs"]["computer_use"]["create_kwargs"]
         print(f"  create_kwargs keys     = {sorted(ck.keys())}")
 
     return 0

@@ -47,7 +47,7 @@
 #
 # Prerequisites (unchanged):
 #   1. A running desktop-env service (DESKTOP_API_BASE_URL).
-#   2. A VLM checkpoint (e.g. Qwen3-VL-8B-Instruct).
+#   2. A VLM checkpoint (e.g. Qwen3-VL-8B-Instruct or Qwen3.5-27B).
 #   3. A parquet dataset with prompt / extra_info.task_id / extra_info.question.
 #   4. A verl-v1 checkout (V1 trainer with the `fully_async` mode) plus
 #      `transfer_queue` (TransferQueue) on EVERY Ray node, and this recipe
@@ -96,6 +96,14 @@ n_gpus_rollout=${n_gpus_rollout:-8}
 HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3-VL-8B-Instruct"}
 train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
+model_path_lc=$(printf '%s' "${HF_MODEL_PATH}" | tr '[:upper:]' '[:lower:]')
+if [[ "${model_path_lc}" == *"qwen3.5"* || "${model_path_lc}" == *"qwen3_5"* || "${model_path_lc}" == *"qwen3-5"* || "${model_path_lc}" == *"qwen35"* ]]; then
+    multi_turn_format=${multi_turn_format:-qwen3_coder}
+    use_chat_template_tools=${use_chat_template_tools:-True}
+else
+    multi_turn_format=${multi_turn_format:-hermes}
+    use_chat_template_tools=${use_chat_template_tools:-False}
+fi
 
 # ================= desktop env service =================
 export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://172.31.13.38:2354}
@@ -115,7 +123,7 @@ agent_loop_config_path=${agent_loop_config_path:-${RECIPE_DIR}/agent.yaml}
 adv_estimator=grpo
 
 max_turns=${max_turns:-50}
-max_prompt_length=${max_prompt_length:-20480}
+max_prompt_length=${max_prompt_length:-24567}
 max_response_length=${max_response_length:-4096}
 actor_lr=${actor_lr:-5e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
@@ -135,7 +143,7 @@ loss_scale_factor=${loss_scale_factor:-55}
 # V1 separate_async/fully_async assert data.train_batch_size == actor.ppo_mini_batch_size.
 # This is the consumption batch (prompt groups per trainer step) AND the unit the
 # streaming feeder dispatches into TransferQueue.
-train_prompt_bsz=${train_prompt_bsz:-8}
+train_prompt_bsz=${train_prompt_bsz:-24}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
 n_resp_per_prompt=${n_resp_per_prompt:-8}
 total_training_steps=${total_training_steps:-100000}
@@ -239,7 +247,11 @@ infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_fully_async}
+if [[ "${model_path_lc}" == *"qwen3.5"* || "${model_path_lc}" == *"qwen3_5"* || "${model_path_lc}" == *"qwen3-5"* || "${model_path_lc}" == *"qwen35"* ]]; then
+    experiment_name=${experiment_name:-qwen35_27b_3nodes_8rollout_16train_v1_fully_async}
+else
+    experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_fully_async}
+fi
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
@@ -357,13 +369,14 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=${vllm_disable_custom_all_reduce} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.multi_turn.format=${multi_turn_format} \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
     actor_rollout_ref.rollout.agent.num_workers=32 \
+    +actor_rollout_ref.rollout.agent.use_chat_template_tools=${use_chat_template_tools} \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
