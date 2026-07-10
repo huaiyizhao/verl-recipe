@@ -47,7 +47,7 @@
 #
 # Prerequisites (unchanged):
 #   1. A running desktop-env service (DESKTOP_API_BASE_URL).
-#   2. A VLM checkpoint (e.g. Qwen3-VL-8B-Instruct).
+#   2. A Qwen3.5 VLM checkpoint (default: /efs/data/models/Qwen3.5-27B).
 #   3. A parquet dataset with prompt / extra_info.task_id / extra_info.question.
 #   4. A verl-v1 checkout (V1 trainer with the `fully_async` mode) plus
 #      `transfer_queue` (TransferQueue) on EVERY Ray node, and this recipe
@@ -93,9 +93,11 @@ rollout_nnodes=${rollout_nnodes:-1}
 n_gpus_rollout=${n_gpus_rollout:-8}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3-VL-8B-Instruct"}
-train_files=${train_files:-/efs/data/cua/rl/osworld/train.parquet}
-test_files=${test_files:-/efs/data/cua/rl/osworld/test.parquet}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3.5-27B"}
+train_files=${train_files:-/efs/data/cua/rl/osworld_qwen35/train.parquet}
+test_files=${test_files:-/efs/data/cua/rl/osworld_qwen35/test.parquet}
+multi_turn_format=${multi_turn_format:-qwen3_coder}
+use_chat_template_tools=${use_chat_template_tools:-True}
 
 # ================= desktop env service =================
 export DESKTOP_API_BASE_URL=${DESKTOP_API_BASE_URL:-http://172.31.13.38:2354}
@@ -239,7 +241,7 @@ infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen3vl_8b_3nodes_8rollout_16train_v1_fully_async}
+experiment_name=${experiment_name:-qwen35_27b_3nodes_8rollout_16train_v1_fully_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
@@ -357,13 +359,14 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=${vllm_disable_custom_all_reduce} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.multi_turn.format=${multi_turn_format} \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
     actor_rollout_ref.rollout.agent.num_workers=32 \
+    +actor_rollout_ref.rollout.agent.use_chat_template_tools=${use_chat_template_tools} \
     trainer.logger='["console", "mlflow"]' \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
