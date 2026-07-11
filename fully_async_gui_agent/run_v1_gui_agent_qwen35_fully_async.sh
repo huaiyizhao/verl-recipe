@@ -93,7 +93,7 @@ rollout_nnodes=${rollout_nnodes:-1}
 n_gpus_rollout=${n_gpus_rollout:-8}
 
 # ================= data / model =================
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3.5-27B"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/efs/data/models/Qwen3.5-9B"}
 train_files=${train_files:-/efs/data/cua/rl/osworld_qwen35/train.parquet}
 test_files=${test_files:-/efs/data/cua/rl/osworld_qwen35/test.parquet}
 multi_turn_format=${multi_turn_format:-qwen3_coder}
@@ -205,7 +205,7 @@ esac
 
 # entropy_coeff=0 for this recipe, so keep the extra entropy/compiled-logits path
 # disabled by default while stabilizing Qwen3.5 FSDP actor updates.
-calculate_entropy=${calculate_entropy:-False}
+calculate_entropy=${calculate_entropy:-True}
 
 # ---- Per-image dedup (opt-in; ppo/v1 untouched, enabled via subclass selection) ----
 # On (image_dedup_enabled=True): selects a dedup-aware agent-loop manager + replay
@@ -237,7 +237,7 @@ actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
 # Disable rmpad/packed varlen forward by default for Qwen3.5 until the packed
 # path is proven stable. Override model_use_remove_padding=True to re-test pack.
-model_use_remove_padding=${model_use_remove_padding:-False}
+model_use_remove_padding=${model_use_remove_padding:-True}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=${actor_ppo_max_token_len:-32768}
