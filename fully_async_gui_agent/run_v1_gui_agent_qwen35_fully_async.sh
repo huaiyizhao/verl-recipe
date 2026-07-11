@@ -166,7 +166,7 @@ max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-4}
 # Temporarily OFF: A/B test for the train<->infer logprob gap. bf16 pixel storage is a v1-only
 # feature (pre-v1 didn't have it) and a suspect for the elevated uncertain-token divergence.
 # NOTE: doubles image storage footprint -> only safe at the reduced bs=16.
-multimodal_storage_bf16=${multimodal_storage_bf16:-False}
+multimodal_storage_bf16=${multimodal_storage_bf16:-True}
 # TransferQueue total capacity in ENTRIES (rows + unique images), across all partitions/units.
 # The default (100000) is too small here and causes ring-buffer EVICTION of still-referenced images
 # -> "key ... not found in field 'image_grid_thw'" crashes. Size for the worst-case in-flight volume:
@@ -236,7 +236,7 @@ ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
 # ZeRO-2 keeps full parameters resident after forward, so the actor dynamic
 # micro-batch must be smaller than the ZeRO-3 setting to avoid backward OOM.
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-50000}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-32768}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
@@ -283,7 +283,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.v1.sampler.max_off_policy_strategy=${max_off_policy_strategy} \
     transfer_queue.enable=True \
     transfer_queue.backend.storage_backend=SimpleStorage \
-    transfer_queue.backend.SimpleStorage.num_data_storage_units=$((trainer_nnodes + rollout_nnodes)) \
+    transfer_queue.backend.SimpleStorage.num_data_storage_units=6 \
     transfer_queue.backend.SimpleStorage.total_storage_size=${tq_storage_size} \
     "${dedup_args[@]}" \
     algorithm.adv_estimator=${adv_estimator} \
