@@ -203,7 +203,9 @@ case "${rollout_correction_bypass_mode}" in
         ;;
 esac
 
-calculate_entropy=${calculate_entropy:-True}
+# entropy_coeff=0 for this recipe, so keep the extra entropy/compiled-logits path
+# disabled by default while stabilizing Qwen3.5 FSDP actor updates.
+calculate_entropy=${calculate_entropy:-False}
 
 # ---- Per-image dedup (opt-in; ppo/v1 untouched, enabled via subclass selection) ----
 # On (image_dedup_enabled=True): selects a dedup-aware agent-loop manager + replay
@@ -232,6 +234,7 @@ vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
 actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
+actor_use_torch_compile=${actor_use_torch_compile:-False}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
 # ZeRO-2 keeps full parameters resident after forward, so the actor dynamic
@@ -313,7 +316,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.use_torch_compile=${actor_use_torch_compile} \
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${actor_reshard_after_forward} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
