@@ -63,7 +63,7 @@ ulimit -c unlimited || true
 
 export WANDB_API_KEY=${WANDB_API_KEY:-}
 export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
-export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-expandable_segments:True}}
 
 # ================= paths =================
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -205,7 +205,7 @@ esac
 
 # entropy_coeff=0 for this recipe, so keep the extra entropy/compiled-logits path
 # disabled by default while stabilizing Qwen3.5 FSDP actor updates.
-calculate_entropy=${calculate_entropy:-True}
+calculate_entropy=${calculate_entropy:-False}
 
 # ---- Per-image dedup (opt-in; ppo/v1 untouched, enabled via subclass selection) ----
 # On (image_dedup_enabled=True): selects a dedup-aware agent-loop manager + replay
@@ -235,12 +235,18 @@ actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
+actor_model_dtype=${actor_model_dtype:-bfloat16}
 # Disable rmpad/packed varlen forward by default for Qwen3.5 until the packed
 # path is proven stable. Override model_use_remove_padding=True to re-test pack.
-model_use_remove_padding=${model_use_remove_padding:-True}
+model_use_remove_padding=${model_use_remove_padding:-False}
+# Use the Qwen3.5 fused linear-CE/logprob path by default. This avoids materializing
+# the full [tokens, vocab] logits tensor in the actor loss path; ZeRO-3 does not shard
+# that activation/logits memory.
+model_use_fused_kernels=${model_use_fused_kernels:-True}
+model_fused_kernel_backend=${model_fused_kernel_backend:-triton}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-32768}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-24000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
@@ -266,6 +272,15 @@ if [ "${logprob_probe_enabled}" = "True" ]; then
     export VERL_LOGPROB_PROBE_LOGPROBS_MODE=${rollout_logprobs_mode}
     export VERL_LOGPROB_DEBUG_TOKENIZER=${HF_MODEL_PATH}
     echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
+fi
+
+# One-shot actor-side GPU memory attribution. Rank0-only by default; set
+# VERL_FSDP_MEM_DEBUG_RANKS=all to print every training rank.
+fsdp_mem_debug=${fsdp_mem_debug:-True}
+if [ "${fsdp_mem_debug}" = "True" ]; then
+    export VERL_FSDP_MEM_DEBUG=1
+    export VERL_FSDP_MEM_DEBUG_MAX_MICRO=${VERL_FSDP_MEM_DEBUG_MAX_MICRO:-4}
+    export VERL_FSDP_MEM_DEBUG_RANKS=${VERL_FSDP_MEM_DEBUG_RANKS:-0}
 fi
 
 # ================= launch =================
@@ -309,6 +324,8 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=${model_use_remove_padding} \
+    actor_rollout_ref.model.use_fused_kernels=${model_use_fused_kernels} \
+    actor_rollout_ref.model.fused_kernel_options.impl_backend=${model_fused_kernel_backend} \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
@@ -319,6 +336,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=${actor_model_dtype} \
     actor_rollout_ref.actor.fsdp_config.use_torch_compile=${actor_use_torch_compile} \
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${actor_reshard_after_forward} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
