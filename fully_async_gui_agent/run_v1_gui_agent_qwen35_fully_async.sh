@@ -225,9 +225,9 @@ fi
 # ================= performance =================
 # vLLM rollout tensor parallelism. TP=2 uses two GPUs per rollout engine.
 infer_tp=${infer_tp:-1}
-# FSDP ZeRO-2 semantics: keep full params after forward and shard gradients/optimizer states.
-# In torch FSDP this is controlled by reshard_after_forward=False.
-actor_reshard_after_forward=${actor_reshard_after_forward:-False}
+# Conservative FSDP default while stabilizing Qwen3.5: ZeRO-3 reshards after
+# forward. Override actor_reshard_after_forward=False to re-test ZeRO-2.
+actor_reshard_after_forward=${actor_reshard_after_forward:-True}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
 # compatibility issues on some clusters. Disable it by default for the debug recipe.
 vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
@@ -235,10 +235,11 @@ actor_param_offload=${actor_param_offload:-False}
 actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
+# Disable rmpad/packed varlen forward by default for Qwen3.5 until the packed
+# path is proven stable. Override model_use_remove_padding=True to re-test pack.
+model_use_remove_padding=${model_use_remove_padding:-False}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
-# ZeRO-2 keeps full parameters resident after forward, so the actor dynamic
-# micro-batch must be smaller than the ZeRO-3 setting to avoid backward OOM.
 actor_ppo_max_token_len=${actor_ppo_max_token_len:-32768}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
@@ -307,7 +308,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
-    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.use_remove_padding=${model_use_remove_padding} \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
