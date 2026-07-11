@@ -301,7 +301,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.return_raw_chat=True \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.truncation='error' \
     actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
