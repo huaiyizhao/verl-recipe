@@ -236,13 +236,10 @@ actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
-# Disable rmpad/packed varlen forward by default for Qwen3.5 until the packed
-# path is proven stable. Override model_use_remove_padding=True to re-test pack.
-model_use_remove_padding=${model_use_remove_padding:-False}
-# Use the Qwen3.5 fused linear-CE/logprob path by default. This avoids materializing
-# the full [tokens, vocab] logits tensor in the actor loss path; ZeRO-3 does not shard
-# that activation/logits memory.
-model_use_fused_kernels=${model_use_fused_kernels:-True}
+# Use the standard rmpad path without fused kernels for debugging. This keeps the
+# training path closer to the existing verl FSDP implementation, even if it OOMs.
+model_use_remove_padding=${model_use_remove_padding:-True}
+model_use_fused_kernels=${model_use_fused_kernels:-False}
 model_fused_kernel_backend=${model_fused_kernel_backend:-triton}
 ref_offload=${ref_offload:-False}
 fsdp_size=${n_gpus_training}
