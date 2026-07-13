@@ -471,8 +471,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.num_workers=32 \
     actor_rollout_ref.rollout.agent.use_chat_template_tools=${use_chat_template_tools} \
     trainer.logger='["console"]' \
-    # actor_rollout_ref.rollout.trace.backend=mlflow \
-    # actor_rollout_ref.rollout.trace.token2text=True \
     actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=null \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
