@@ -47,7 +47,7 @@
 #
 # Prerequisites (unchanged):
 #   1. A running desktop-env service (DESKTOP_API_BASE_URL).
-#   2. A Qwen3.5 VLM checkpoint (default: /efs/data/models/Qwen3.5-27B).
+#   2. A Qwen3.5 VLM checkpoint (default: /efs/data/models/Qwen3.5-9B).
 #   3. A parquet dataset with prompt / extra_info.task_id / extra_info.question.
 #   4. A verl-v1 checkout (V1 trainer with the `fully_async` mode) plus
 #      `transfer_queue` (TransferQueue) on EVERY Ray node, and this recipe
@@ -225,30 +225,47 @@ fi
 # ================= performance =================
 # vLLM rollout tensor parallelism. TP=2 uses two GPUs per rollout engine.
 infer_tp=${infer_tp:-1}
-# Conservative FSDP default while stabilizing Qwen3.5: ZeRO-3 reshards after
-# forward. Override actor_reshard_after_forward=False to re-test ZeRO-2.
-actor_reshard_after_forward=${actor_reshard_after_forward:-True}
+# Megatron training mesh. Defaults target the dense Qwen3.5-9B/27B path. For MoE
+# checkpoints, override train_ep/train_etp explicitly.
+train_tp=${train_tp:-${ACTOR_TP:-2}}
+train_pp=${train_pp:-${ACTOR_PP:-1}}
+train_cp=${train_cp:-${ACTOR_CP:-1}}
+train_ep=${train_ep:-${ACTOR_EP:-1}}
+train_etp=${train_etp:-${ACTOR_ETP:-1}}
+megatron_all_offload=${megatron_all_offload:-True}
+megatron_use_mbridge=${megatron_use_mbridge:-True}
+megatron_vanilla_mbridge=${megatron_vanilla_mbridge:-True}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
 # compatibility issues on some clusters. Disable it by default for the debug recipe.
 vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
-actor_param_offload=${actor_param_offload:-False}
-actor_optimizer_offload=${actor_optimizer_offload:-False}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
-# Use the standard rmpad path without fused kernels for debugging. This keeps the
-# training path closer to the existing verl FSDP implementation, even if it OOMs.
-model_use_remove_padding=${model_use_remove_padding:-True}
+# Qwen3.5 Megatron currently uses BSHD/no-rmpad; packed THD is not the stable
+# path for its native multimodal/GDN stack.
+actor_use_dynamic_bsz=${actor_use_dynamic_bsz:-False}
+model_use_remove_padding=${model_use_remove_padding:-False}
+megatron_use_remove_padding=${megatron_use_remove_padding:-False}
 model_use_fused_kernels=${model_use_fused_kernels:-False}
 model_fused_kernel_backend=${model_fused_kernel_backend:-triton}
-ref_offload=${ref_offload:-False}
-fsdp_size=${n_gpus_training}
 actor_ppo_max_token_len=${actor_ppo_max_token_len:-24000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
+total_train_gpus=$((trainer_nnodes * n_gpus_training))
+train_mesh_denom=$((train_tp * train_pp * train_cp))
+if (( train_mesh_denom <= 0 || total_train_gpus % train_mesh_denom != 0 )); then
+    echo "ERROR: invalid Megatron mesh: total_train_gpus=${total_train_gpus}, train_tp=${train_tp}, train_pp=${train_pp}, train_cp=${train_cp}" >&2
+    exit 1
+fi
+if (( train_ep <= 0 || train_etp <= 0 )); then
+    echo "ERROR: train_ep/train_etp must be positive, got train_ep=${train_ep}, train_etp=${train_etp}" >&2
+    exit 1
+fi
+echo "[MEGATRON] train_gpus=${total_train_gpus} tp=${train_tp} pp=${train_pp} cp=${train_cp} ep=${train_ep} etp=${train_etp} offload=${megatron_all_offload}"
+
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen35_27b_3nodes_8rollout_16train_v1_fully_async}
+experiment_name=${experiment_name:-qwen35_9b_megatron_3nodes_8rollout_16train_v1_fully_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
@@ -258,7 +275,7 @@ resume_mode=${resume_mode:-auto}
 # rollout-vs-FSDP RS-K3 crosses the mask threshold, including FSDP torch-reference
 # selected logprobs, selected logits/top-k diagnostics, actor tags/global-step info,
 # and a lightweight rank0 parameter fingerprint.
-logprob_probe_enabled=${logprob_probe_enabled:-True}
+logprob_probe_enabled=${logprob_probe_enabled:-False}
 if [ "${logprob_probe_enabled}" = "True" ]; then
     export VERL_LOGPROB_PROBE_DUMP=1
     export VERL_LOGPROB_PROBE_REF=1
@@ -271,13 +288,24 @@ if [ "${logprob_probe_enabled}" = "True" ]; then
     echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
 fi
 
-# One-shot actor-side GPU memory attribution. Rank0-only by default; set
-# VERL_FSDP_MEM_DEBUG_RANKS=all to print every training rank.
-fsdp_mem_debug=${fsdp_mem_debug:-True}
+# FSDP-only diagnostics. Megatron does not use this path; keep disabled unless
+# explicitly re-testing the FSDP backend from this script.
+fsdp_mem_debug=${fsdp_mem_debug:-False}
+cuda_launch_blocking=${cuda_launch_blocking:-False}
+ray_env_args=()
 if [ "${fsdp_mem_debug}" = "True" ]; then
     export VERL_FSDP_MEM_DEBUG=1
     export VERL_FSDP_MEM_DEBUG_MAX_MICRO=${VERL_FSDP_MEM_DEBUG_MAX_MICRO:-4}
-    export VERL_FSDP_MEM_DEBUG_RANKS=${VERL_FSDP_MEM_DEBUG_RANKS:-0}
+    export VERL_FSDP_MEM_DEBUG_RANKS=${VERL_FSDP_MEM_DEBUG_RANKS:-all}
+    ray_env_args+=(
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_FSDP_MEM_DEBUG=1
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_FSDP_MEM_DEBUG_MAX_MICRO=${VERL_FSDP_MEM_DEBUG_MAX_MICRO}
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_FSDP_MEM_DEBUG_RANKS=${VERL_FSDP_MEM_DEBUG_RANKS}
+    )
+fi
+if [ "${cuda_launch_blocking}" = "True" ]; then
+    export CUDA_LAUNCH_BLOCKING=1
+    ray_env_args+=(+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_LAUNCH_BLOCKING=1)
 fi
 
 # ================= launch =================
@@ -287,6 +315,8 @@ fi
 cd "${VERL_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
+    "${ray_env_args[@]}" \
+    model_engine=megatron \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=fully_async \
     trainer.v1.fully_async.num_warmup_batches=${num_warmup_batches} \
@@ -325,19 +355,29 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.fused_kernel_options.impl_backend=${model_fused_kernel_backend} \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
+    actor_rollout_ref.actor.optim.clip_grad=2.0 \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.use_dynamic_bsz=${actor_use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
-    actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile} \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
-    actor_rollout_ref.actor.fsdp_config.model_dtype=${actor_model_dtype} \
-    actor_rollout_ref.actor.fsdp_config.use_torch_compile=${actor_use_torch_compile} \
-    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${actor_reshard_after_forward} \
-    actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
+    actor_rollout_ref.actor.megatron.use_mbridge=${megatron_use_mbridge} \
+    actor_rollout_ref.actor.megatron.vanilla_mbridge=${megatron_vanilla_mbridge} \
+    actor_rollout_ref.actor.megatron.use_remove_padding=${megatron_use_remove_padding} \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
+    actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=${train_ep} \
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp} \
+    actor_rollout_ref.actor.megatron.param_offload=${megatron_all_offload} \
+    actor_rollout_ref.actor.megatron.optimizer_offload=${megatron_all_offload} \
+    actor_rollout_ref.actor.megatron.grad_offload=${megatron_all_offload} \
+    actor_rollout_ref.actor.megatron.dtype=${actor_model_dtype} \
+    ++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.loss_scale_factor=${loss_scale_factor} \
@@ -348,7 +388,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
-    actor_rollout_ref.actor.grad_clip=2.0 \
     +actor_rollout_ref.actor.use_rollout_log_probs=True \
     actor_rollout_ref.actor.policy_loss.loss_mode=${actor_policy_loss_mode} \
     +actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
@@ -356,11 +395,18 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=${rollout_correction_is} \
     +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_correction_rs} \
     +actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_correction_rs_threshold} \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${actor_use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.ref.strategy=fsdp2 \
-    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
+    actor_rollout_ref.ref.megatron.use_mbridge=${megatron_use_mbridge} \
+    actor_rollout_ref.ref.megatron.vanilla_mbridge=${megatron_vanilla_mbridge} \
+    actor_rollout_ref.ref.megatron.use_remove_padding=${megatron_use_remove_padding} \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
+    actor_rollout_ref.ref.megatron.context_parallel_size=${train_cp} \
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep} \
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${train_etp} \
+    actor_rollout_ref.ref.megatron.param_offload=${megatron_all_offload} \
+    actor_rollout_ref.ref.megatron.dtype=${actor_model_dtype} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.nnodes=${rollout_nnodes} \
