@@ -65,6 +65,39 @@ export WANDB_API_KEY=${WANDB_API_KEY:-}
 export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-expandable_segments:True}}
 
+# vLLM loads CUDA runtime through ctypes. If tilelang's libcudart_stub.so appears
+# before the real CUDA runtime, vLLM may crash on missing symbols such as
+# cudaDeviceReset. Prefer real libcudart locations and drop tilelang's stub path.
+cuda_runtime_dirs=()
+for cuda_runtime_dir in \
+    /usr/local/cuda/lib64 \
+    /usr/local/cuda/targets/x86_64-linux/lib \
+    /usr/local/cuda-*/lib64 \
+    /usr/local/cuda-*/targets/x86_64-linux/lib \
+    /usr/local/lib/python*/dist-packages/nvidia/cuda_runtime/lib \
+    /usr/local/lib/python*/site-packages/nvidia/cuda_runtime/lib \
+    /usr/lib/x86_64-linux-gnu; do
+    if [[ -e "${cuda_runtime_dir}/libcudart.so" || -e "${cuda_runtime_dir}/libcudart.so.12" ]]; then
+        cuda_runtime_dirs+=("${cuda_runtime_dir}")
+    fi
+done
+clean_ld_dirs=()
+IFS=':' read -ra ld_dirs <<< "${LD_LIBRARY_PATH:-}"
+for ld_dir in "${ld_dirs[@]}"; do
+    [[ -z "${ld_dir}" ]] && continue
+    [[ "${ld_dir}" == *"/tilelang/lib"* ]] && continue
+    clean_ld_dirs+=("${ld_dir}")
+done
+LD_LIBRARY_PATH=
+for ld_dir in "${cuda_runtime_dirs[@]}" "${clean_ld_dirs[@]}"; do
+    if [[ -z "${LD_LIBRARY_PATH}" ]]; then
+        LD_LIBRARY_PATH="${ld_dir}"
+    else
+        LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${ld_dir}"
+    fi
+done
+export LD_LIBRARY_PATH
+
 # ================= paths =================
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z "${VERL_ROOT:-}" ]]; then
@@ -293,6 +326,9 @@ fi
 fsdp_mem_debug=${fsdp_mem_debug:-False}
 cuda_launch_blocking=${cuda_launch_blocking:-False}
 ray_env_args=()
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    ray_env_args+=(+ray_kwargs.ray_init.runtime_env.env_vars.LD_LIBRARY_PATH="${LD_LIBRARY_PATH}")
+fi
 if [ "${fsdp_mem_debug}" = "True" ]; then
     export VERL_FSDP_MEM_DEBUG=1
     export VERL_FSDP_MEM_DEBUG_MAX_MICRO=${VERL_FSDP_MEM_DEBUG_MAX_MICRO:-4}
