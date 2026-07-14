@@ -20,6 +20,19 @@ env_vars:
   RAY_USE_UVLOOP: "0"
   VLLM_USE_V1: "1"
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
+  # Node-role resources are advertised at `ray start --resources=...`; these
+  # env vars tell verl which resource names to request for rollout-side actors.
+  VERL_ROLLOUT_NODE_RESOURCE: "rollout_node"
+  VERL_TRAIN_NODE_RESOURCE: "train_node"
+  # TransferQueue SimpleStorage placement/data-plane defaults. Storage units are
+  # balanced across Ray nodes; image payloads are stored as compressed bytes and
+  # re-processed on the trainer side.
+  VERL_TQ_STORAGE_PLACEMENT: "balanced"
+  VERL_TQ_STORAGE_BALANCE_RESOURCE: "none"
+  VERL_TQ_STORAGE_NODE_RESOURCE: "none"
+  VERL_TQ_STORAGE_RESOURCE_AMOUNT: "0.001"
+  VERL_TQ_IMAGE_FORMAT: "PNG"
+  VERL_TQ_IMAGE_PNG_COMPRESS_LEVEL: "1"
   VERL_TRAIN_TIMING_LOG: "1"
   VERL_TRAIN_TIMING_RANKS: "0,4,8,12"
   # Heavy custom diagnostics ([POSTPROC_PROFILE], [MATERIALIZE_PROFILE],

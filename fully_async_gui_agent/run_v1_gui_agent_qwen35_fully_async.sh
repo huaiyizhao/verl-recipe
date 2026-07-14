@@ -52,6 +52,8 @@
 #   4. A verl-v1 checkout (V1 trainer with the `fully_async` mode) plus
 #      `transfer_queue` (TransferQueue) on EVERY Ray node, and this recipe
 #      importable as `recipe.fully_async_gui_agent` (use the v1-gui-agent branch).
+#   5. For multi-node disaggregation, tag rollout nodes with a custom Ray resource
+#      (default: `rollout_node`) so AgentLoopWorkers can be pinned there.
 
 set -xeuo pipefail
 export HYDRA_FULL_ERROR=1
@@ -214,6 +216,11 @@ multimodal_storage_bf16=${multimodal_storage_bf16:-True}
 # It's a count cap, not a preallocation, so headroom is cheap (actual RAM is bounded by the feeder
 # staleness budget, not by this number).
 tq_storage_size=${tq_storage_size:-500000}
+# Static TransferQueue placement/image-format envs live in runtime_env.yaml. This
+# one is dynamic because it tracks the model selected for this run.
+export VERL_TQ_IMAGE_PROCESSOR_PATH=${HF_MODEL_PATH}
+echo "[TQ_PLACEMENT] placement=${VERL_TQ_STORAGE_PLACEMENT:-<runtime_env unset>} balance_resource=${VERL_TQ_STORAGE_BALANCE_RESOURCE:-<runtime_env unset>} node_resource=${VERL_TQ_STORAGE_NODE_RESOURCE:-<runtime_env unset>} resource_amount=${VERL_TQ_STORAGE_RESOURCE_AMOUNT:-<runtime_env unset>}"
+echo "[TQ_IMAGE] format=${VERL_TQ_IMAGE_FORMAT:-<runtime_env unset>} png_compress_level=${VERL_TQ_IMAGE_PNG_COMPRESS_LEVEL:-<runtime_env unset>} processor=${VERL_TQ_IMAGE_PROCESSOR_PATH}"
 # none: no trainer-side staleness gate — sample the oldest ready prompts and rely
 # on the feeder budget + rollout correction (vs separate_async's default `drop`).
 max_off_policy_strategy=${max_off_policy_strategy:-none}
@@ -293,7 +300,7 @@ model_use_remove_padding=${model_use_remove_padding:-False}
 megatron_use_remove_padding=${megatron_use_remove_padding:-False}
 model_use_fused_kernels=${model_use_fused_kernels:-False}
 model_fused_kernel_backend=${model_fused_kernel_backend:-triton}
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-24000}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-50000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 total_train_gpus=$((trainer_nnodes * n_gpus_training))
@@ -315,6 +322,28 @@ default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
 
+# ---- Rollout-vs-train logprob gap diagnostics ----
+# Keep this on for the current debugging run. The high-gap quota is separate from the
+# low-gap quota so step-1 clean batches cannot consume all LOGPROB_GAP prints before
+# rollout correction starts masking heavily.
+logprob_debug=${logprob_debug:-True}
+logprob_debug_max=${logprob_debug_max:-8}
+logprob_debug_high_max=${logprob_debug_high_max:-80}
+logprob_debug_threshold=${logprob_debug_threshold:-${rollout_correction_rs_threshold}}
+case "${logprob_debug}" in
+    True|true|TRUE|1)
+        export VERL_LOGPROB_DEBUG=1
+        ;;
+    *)
+        export VERL_LOGPROB_DEBUG=0
+        ;;
+esac
+export VERL_LOGPROB_DEBUG_MAX=${logprob_debug_max}
+export VERL_LOGPROB_DEBUG_HIGH_MAX=${logprob_debug_high_max}
+export VERL_LOGPROB_DEBUG_THRESHOLD=${logprob_debug_threshold}
+export VERL_LOGPROB_DEBUG_TOKENIZER=${HF_MODEL_PATH}
+echo "[LOGPROB_GAP] enabled=${VERL_LOGPROB_DEBUG} low_max=${VERL_LOGPROB_DEBUG_MAX} high_max=${VERL_LOGPROB_DEBUG_HIGH_MAX} threshold=${VERL_LOGPROB_DEBUG_THRESHOLD} tokenizer=${VERL_LOGPROB_DEBUG_TOKENIZER}"
+
 # ---- One-shot FSDP/vLLM logprob root-cause probe ----
 # Enabled by default for this debug script. It dumps the first actor micro-batch whose
 # rollout-vs-FSDP RS-K3 crosses the mask threshold, including FSDP torch-reference
@@ -329,8 +358,10 @@ if [ "${logprob_probe_enabled}" = "True" ]; then
     export VERL_LOGPROB_PROBE_TOPK=${VERL_LOGPROB_PROBE_TOPK:-5}
     export VERL_LOGPROB_PROBE_DIR=${VERL_LOGPROB_PROBE_DIR:-/efs/data/rl/logprob_probe_fsdp_${run_timestamp}}
     export VERL_LOGPROB_PROBE_LOGPROBS_MODE=${rollout_logprobs_mode}
-    export VERL_LOGPROB_DEBUG_TOKENIZER=${HF_MODEL_PATH}
     echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
+else
+    export VERL_LOGPROB_PROBE_DUMP=0
+    export VERL_LOGPROB_PROBE_REF=0
 fi
 
 # FSDP-only diagnostics. Megatron does not use this path; keep disabled unless
@@ -340,6 +371,25 @@ cuda_launch_blocking=${cuda_launch_blocking:-False}
 ray_env_args=()
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     ray_env_args+=(+ray_kwargs.ray_init.runtime_env.env_vars.LD_LIBRARY_PATH="${LD_LIBRARY_PATH}")
+fi
+ray_env_args+=(
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG="'${VERL_LOGPROB_DEBUG}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_MAX="'${VERL_LOGPROB_DEBUG_MAX}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_HIGH_MAX="'${VERL_LOGPROB_DEBUG_HIGH_MAX}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_THRESHOLD="'${VERL_LOGPROB_DEBUG_THRESHOLD}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_TOKENIZER="'${VERL_LOGPROB_DEBUG_TOKENIZER}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_DUMP="'${VERL_LOGPROB_PROBE_DUMP}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_REF="'${VERL_LOGPROB_PROBE_REF}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_TQ_IMAGE_PROCESSOR_PATH="'${VERL_TQ_IMAGE_PROCESSOR_PATH}'"
+)
+if [ "${logprob_probe_enabled}" = "True" ]; then
+    ray_env_args+=(
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_MAX="'${VERL_LOGPROB_PROBE_MAX}'"
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_MIN_K3="'${VERL_LOGPROB_PROBE_MIN_K3}'"
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_TOPK="'${VERL_LOGPROB_PROBE_TOPK}'"
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_DIR="'${VERL_LOGPROB_PROBE_DIR}'"
+        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_LOGPROBS_MODE="'${VERL_LOGPROB_PROBE_LOGPROBS_MODE}'"
+    )
 fi
 if [ "${fsdp_mem_debug}" = "True" ]; then
     export VERL_FSDP_MEM_DEBUG=1
