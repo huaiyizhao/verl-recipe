@@ -282,6 +282,7 @@ megatron_vanilla_mbridge=${megatron_vanilla_mbridge:-True}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
 # compatibility issues on some clusters. Disable it by default for the debug recipe.
 vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
+rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization:-0.85}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
@@ -400,7 +401,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=${model_use_remove_padding} \
     actor_rollout_ref.model.use_fused_kernels=${model_use_fused_kernels} \
     actor_rollout_ref.model.fused_kernel_options.impl_backend=${model_fused_kernel_backend} \
-    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     actor_rollout_ref.actor.optim.clip_grad=2.0 \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
@@ -468,7 +469,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${actor_use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization} \
     actor_rollout_ref.rollout.max_model_len=32768 \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     actor_rollout_ref.rollout.disable_log_stats=False \
