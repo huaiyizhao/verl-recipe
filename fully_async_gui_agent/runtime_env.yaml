@@ -41,23 +41,18 @@ env_vars:
   # Lightweight step/sample timing ([SAMPLE_PROFILE], [RESOLVE_PROFILE],
   # [FBP_PROFILE]). Keep off for normal training logs.
   VERL_STEP_PROFILE: "0"
-  # Model dir for the LOGPROB_GAP diagnostic to lazily load a tokenizer and print DECODED token
-  # text inline (worst token + per-token dump), instead of raw ids you'd decode by hand.
-  VERL_LOGPROB_DEBUG_TOKENIZER: "/efs/data/models/Qwen3-VL-8B-Instruct"
-  # One-shot root-cause probe: dump ONE real micro-batch to disk (TRAINER-side only) so the vLLM<->FSDP
-  # logprob divergence can be localized OFFLINE. The bundle carries old_log_probs(vLLM=A), fsdp_log_probs
-  # (FSDP=B), pixel_values + position_ids (for HF+position=C, and to reconstruct the image for fresh vLLM=D).
-  # No raw images are pulled from the rollouter (that path risked stalling training).
-  VERL_LOGPROB_PROBE_DUMP: "1"
-  # New dir so we DON'T overwrite earlier bundles (keep for compare). Bump when re-dumping.
-  VERL_LOGPROB_PROBE_DIR: "/efs/data/rl/logprob_probe_masked_v2"
+  # Rollout-vs-train logprob diagnostics. Keep the lightweight LOGPROB_GAP
+  # prints on; leave the heavy one-shot probe disabled unless explicitly needed.
+  VERL_LOGPROB_DEBUG: "1"
+  VERL_LOGPROB_DEBUG_MAX: "8"
+  VERL_LOGPROB_DEBUG_HIGH_MAX: "80"
+  VERL_LOGPROB_DEBUG_THRESHOLD: "0.005"
+  VERL_LOGPROB_PROBE_DUMP: "0"
+  VERL_LOGPROB_PROBE_REF: "0"
   VERL_LOGPROB_PROBE_MAX: "1"
-  # Gate on max per-seq mean-k3. 0.005 (the mask floor) only catches early threshold-grazing batches that
-  # reproduce ~0 gap offline; raise to 0.05 (~ observed masked seq-mean-k3) to capture a GENUINELY divergent
-  # batch worth root-causing. Raise further to chase the tail (step-6 max was ~0.55).
-  VERL_LOGPROB_PROBE_MIN_K3: "0.05"
-  # Rollout logprobs_mode stamped into the dump so the offline fresh-vLLM(D) replays with the SAME mode
-  # and |A-D| is faithful. MUST match actor_rollout_ref.rollout.logprobs_mode (this run: raw_logprobs).
+  VERL_LOGPROB_PROBE_MIN_K3: "0.005"
+  VERL_LOGPROB_PROBE_TOPK: "5"
+  VERL_LOGPROB_PROBE_DIR: "/efs/data/rl/logprob_probe_fsdp"
   VERL_LOGPROB_PROBE_LOGPROBS_MODE: "raw_logprobs"
   VERL_LOGGING_LEVEL: "DEBUG"
   # Train-side pixel integrity self-check in resolve_image_ids (dedup consume).
@@ -65,7 +60,6 @@ env_vars:
   VERL_PIXEL_FINGERPRINT: "0"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
-  VERL_LOGGING_LEVEL: "DEBUG"
   MLFLOW_TRACKING_URI: "http://172.20.70.149:29004"  # MLflow server 地址
   HF_HOME: "/efs/data/hf"
 

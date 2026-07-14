@@ -322,47 +322,12 @@ default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}
 
-# ---- Rollout-vs-train logprob gap diagnostics ----
-# Keep this on for the current debugging run. The high-gap quota is separate from the
-# low-gap quota so step-1 clean batches cannot consume all LOGPROB_GAP prints before
-# rollout correction starts masking heavily.
-logprob_debug=${logprob_debug:-True}
-logprob_debug_max=${logprob_debug_max:-8}
-logprob_debug_high_max=${logprob_debug_high_max:-80}
-logprob_debug_threshold=${logprob_debug_threshold:-${rollout_correction_rs_threshold}}
-case "${logprob_debug}" in
-    True|true|TRUE|1)
-        export VERL_LOGPROB_DEBUG=1
-        ;;
-    *)
-        export VERL_LOGPROB_DEBUG=0
-        ;;
-esac
-export VERL_LOGPROB_DEBUG_MAX=${logprob_debug_max}
-export VERL_LOGPROB_DEBUG_HIGH_MAX=${logprob_debug_high_max}
-export VERL_LOGPROB_DEBUG_THRESHOLD=${logprob_debug_threshold}
-export VERL_LOGPROB_DEBUG_TOKENIZER=${HF_MODEL_PATH}
-echo "[LOGPROB_GAP] enabled=${VERL_LOGPROB_DEBUG} low_max=${VERL_LOGPROB_DEBUG_MAX} high_max=${VERL_LOGPROB_DEBUG_HIGH_MAX} threshold=${VERL_LOGPROB_DEBUG_THRESHOLD} tokenizer=${VERL_LOGPROB_DEBUG_TOKENIZER}"
-
-# ---- One-shot FSDP/vLLM logprob root-cause probe ----
-# Enabled by default for this debug script. It dumps the first actor micro-batch whose
-# rollout-vs-FSDP RS-K3 crosses the mask threshold, including FSDP torch-reference
-# selected logprobs, selected logits/top-k diagnostics, actor tags/global-step info,
-# and a lightweight rank0 parameter fingerprint.
-logprob_probe_enabled=${logprob_probe_enabled:-False}
-if [ "${logprob_probe_enabled}" = "True" ]; then
-    export VERL_LOGPROB_PROBE_DUMP=1
-    export VERL_LOGPROB_PROBE_REF=1
-    export VERL_LOGPROB_PROBE_MAX=${VERL_LOGPROB_PROBE_MAX:-1}
-    export VERL_LOGPROB_PROBE_MIN_K3=${VERL_LOGPROB_PROBE_MIN_K3:-0.005}
-    export VERL_LOGPROB_PROBE_TOPK=${VERL_LOGPROB_PROBE_TOPK:-5}
-    export VERL_LOGPROB_PROBE_DIR=${VERL_LOGPROB_PROBE_DIR:-/efs/data/rl/logprob_probe_fsdp_${run_timestamp}}
-    export VERL_LOGPROB_PROBE_LOGPROBS_MODE=${rollout_logprobs_mode}
-    echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
-else
-    export VERL_LOGPROB_PROBE_DUMP=0
-    export VERL_LOGPROB_PROBE_REF=0
-fi
+# ---- Rollout-vs-train logprob diagnostics ----
+# Static LOGPROB_* switches live in runtime_env.yaml so Ray workers see the same
+# values as the job driver. Only the tokenizer path is model-dependent.
+export VERL_LOGPROB_DEBUG_TOKENIZER=${VERL_LOGPROB_DEBUG_TOKENIZER:-${HF_MODEL_PATH}}
+echo "[LOGPROB_GAP] enabled=${VERL_LOGPROB_DEBUG:-<runtime_env/default>} low_max=${VERL_LOGPROB_DEBUG_MAX:-<runtime_env/default>} high_max=${VERL_LOGPROB_DEBUG_HIGH_MAX:-<runtime_env/default>} threshold=${VERL_LOGPROB_DEBUG_THRESHOLD:-<runtime_env/default>} tokenizer=${VERL_LOGPROB_DEBUG_TOKENIZER}"
+echo "[LOGPROB_PROBE] dump=${VERL_LOGPROB_PROBE_DUMP:-<runtime_env/default>} ref=${VERL_LOGPROB_PROBE_REF:-<runtime_env/default>} dir=${VERL_LOGPROB_PROBE_DIR:-<runtime_env/default>} min_k3=${VERL_LOGPROB_PROBE_MIN_K3:-<runtime_env/default>}"
 
 # FSDP-only diagnostics. Megatron does not use this path; keep disabled unless
 # explicitly re-testing the FSDP backend from this script.
@@ -373,24 +338,9 @@ if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     ray_env_args+=(+ray_kwargs.ray_init.runtime_env.env_vars.LD_LIBRARY_PATH="${LD_LIBRARY_PATH}")
 fi
 ray_env_args+=(
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG="'${VERL_LOGPROB_DEBUG}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_MAX="'${VERL_LOGPROB_DEBUG_MAX}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_HIGH_MAX="'${VERL_LOGPROB_DEBUG_HIGH_MAX}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_THRESHOLD="'${VERL_LOGPROB_DEBUG_THRESHOLD}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_TOKENIZER="'${VERL_LOGPROB_DEBUG_TOKENIZER}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_DUMP="'${VERL_LOGPROB_PROBE_DUMP}'"
-    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_REF="'${VERL_LOGPROB_PROBE_REF}'"
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_TQ_IMAGE_PROCESSOR_PATH="'${VERL_TQ_IMAGE_PROCESSOR_PATH}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_TOKENIZER="'${VERL_LOGPROB_DEBUG_TOKENIZER}'"
 )
-if [ "${logprob_probe_enabled}" = "True" ]; then
-    ray_env_args+=(
-        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_MAX="'${VERL_LOGPROB_PROBE_MAX}'"
-        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_MIN_K3="'${VERL_LOGPROB_PROBE_MIN_K3}'"
-        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_TOPK="'${VERL_LOGPROB_PROBE_TOPK}'"
-        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_DIR="'${VERL_LOGPROB_PROBE_DIR}'"
-        +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_PROBE_LOGPROBS_MODE="'${VERL_LOGPROB_PROBE_LOGPROBS_MODE}'"
-    )
-fi
 if [ "${fsdp_mem_debug}" = "True" ]; then
     export VERL_FSDP_MEM_DEBUG=1
     export VERL_FSDP_MEM_DEBUG_MAX_MICRO=${VERL_FSDP_MEM_DEBUG_MAX_MICRO:-4}
