@@ -64,6 +64,7 @@ ulimit -c unlimited || true
 export WANDB_API_KEY=${WANDB_API_KEY:-}
 export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-expandable_segments:True}}
+export VERL_TRAIN_MEM_DEBUG=${VERL_TRAIN_MEM_DEBUG:-1}
 
 # vLLM loads CUDA runtime through ctypes. If tilelang's libcudart_stub.so appears
 # before the real CUDA runtime, vLLM may crash on missing symbols such as
@@ -271,7 +272,11 @@ train_pp=${train_pp:-${ACTOR_PP:-1}}
 train_cp=${train_cp:-${ACTOR_CP:-1}}
 train_ep=${train_ep:-${ACTOR_EP:-1}}
 train_etp=${train_etp:-${ACTOR_ETP:-1}}
-megatron_all_offload=${megatron_all_offload:-True}
+megatron_sequence_parallel=${megatron_sequence_parallel:-True}
+megatron_param_offload=${megatron_param_offload:-False}
+megatron_optimizer_offload=${megatron_optimizer_offload:-False}
+megatron_grad_offload=${megatron_grad_offload:-False}
+megatron_ref_param_offload=${megatron_ref_param_offload:-False}
 megatron_use_mbridge=${megatron_use_mbridge:-True}
 megatron_vanilla_mbridge=${megatron_vanilla_mbridge:-True}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
@@ -300,7 +305,7 @@ if (( train_ep <= 0 || train_etp <= 0 )); then
     echo "ERROR: train_ep/train_etp must be positive, got train_ep=${train_ep}, train_etp=${train_etp}" >&2
     exit 1
 fi
-echo "[MEGATRON] train_gpus=${total_train_gpus} tp=${train_tp} pp=${train_pp} cp=${train_cp} ep=${train_ep} etp=${train_etp} offload=${megatron_all_offload}"
+echo "[MEGATRON] train_gpus=${total_train_gpus} tp=${train_tp} pp=${train_pp} cp=${train_cp} ep=${train_ep} etp=${train_etp} sp=${megatron_sequence_parallel} actor_offload=param:${megatron_param_offload},optim:${megatron_optimizer_offload},grad:${megatron_grad_offload} ref_param_offload=${megatron_ref_param_offload}"
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
@@ -410,16 +415,18 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
+    actor_rollout_ref.actor.megatron.sequence_parallel=${megatron_sequence_parallel} \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=${train_ep} \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp} \
-    actor_rollout_ref.actor.megatron.param_offload=${megatron_all_offload} \
-    actor_rollout_ref.actor.megatron.optimizer_offload=${megatron_all_offload} \
-    actor_rollout_ref.actor.megatron.grad_offload=${megatron_all_offload} \
+    actor_rollout_ref.actor.megatron.param_offload=${megatron_param_offload} \
+    actor_rollout_ref.actor.megatron.optimizer_offload=${megatron_optimizer_offload} \
+    actor_rollout_ref.actor.megatron.grad_offload=${megatron_grad_offload} \
     actor_rollout_ref.actor.megatron.dtype=${actor_model_dtype} \
     ++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=${megatron_sequence_parallel} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.loss_scale_factor=${loss_scale_factor} \
@@ -445,9 +452,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.context_parallel_size=${train_cp} \
+    actor_rollout_ref.ref.megatron.sequence_parallel=${megatron_sequence_parallel} \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep} \
     actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${train_etp} \
-    actor_rollout_ref.ref.megatron.param_offload=${megatron_all_offload} \
+    actor_rollout_ref.ref.megatron.param_offload=${megatron_ref_param_offload} \
     actor_rollout_ref.ref.megatron.dtype=${actor_model_dtype} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
