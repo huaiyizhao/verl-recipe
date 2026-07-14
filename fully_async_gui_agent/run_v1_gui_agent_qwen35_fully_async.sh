@@ -177,6 +177,12 @@ total_training_steps=${total_training_steps:-100000}
 total_epochs=100000
 test_freq=-1  # disabled: validation competes for desktop-env containers
 
+# ================= logging / trace =================
+trainer_logger=${trainer_logger:-'["console", "mlflow"]'}
+trace_backend=${trace_backend:-mlflow}
+trace_token2text=${trace_token2text:-True}
+trace_max_samples_per_step_per_worker=${trace_max_samples_per_step_per_worker:-null}
+
 # ---- V1 fully_async streaming / staleness controls ----
 # Streaming: the feeder is the sole producer and fills the pipeline itself, so no
 # warmup backlog (warmup only injects stale gs~0 prompts that age past budget).
@@ -470,8 +476,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
     actor_rollout_ref.rollout.agent.num_workers=32 \
     actor_rollout_ref.rollout.agent.use_chat_template_tools=${use_chat_template_tools} \
-    trainer.logger='["console"]' \
-    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=null \
+    trainer.logger="${trainer_logger}" \
+    actor_rollout_ref.rollout.trace.backend=${trace_backend} \
+    actor_rollout_ref.rollout.trace.token2text=${trace_token2text} \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=${trace_max_samples_per_step_per_worker} \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \

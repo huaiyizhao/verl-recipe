@@ -22,16 +22,12 @@ env_vars:
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
   VERL_TRAIN_TIMING_LOG: "1"
   VERL_TRAIN_TIMING_RANKS: "0,4,8,12"
-  # VERL_PROFILE: master switch for the HEAVY custom diagnostics — rollout-worker postprocess
-  # ([POSTPROC_PROFILE]), forward-pass per-row image check ([MM_ROWCHECK]), materialization
-  # ([MATERIALIZE_PROFILE]) and dedup resolve ([RESOLVE_PROFILE]). These add overhead and skew the
-  # timing, so keep it OFF while measuring step speed; flip to "1" only to chase a dedup/correctness bug.
-  # ON now for the train<->infer divergence hunt: enables [MM_ROWCHECK] (detects dedup image
-  # misalignment/wrap — the prime suspect) plus [MATERIALIZE_PROFILE]/[RESOLVE_PROFILE]/[POSTPROC_PROFILE].
-  VERL_PROFILE: "1"
-  # Lightweight per-step / per-sample timing breakdown ([STEP_PROFILE] / [SAMPLE_PROFILE]) plus
-  # [FBP_PROFILE]. ON for the localization pass.
-  VERL_STEP_PROFILE: "1"
+  # Heavy custom diagnostics ([POSTPROC_PROFILE], [MATERIALIZE_PROFILE],
+  # [RESOLVE_PROFILE], etc.). Keep off unless chasing a correctness bug.
+  VERL_PROFILE: "0"
+  # Lightweight step/sample timing ([SAMPLE_PROFILE], [RESOLVE_PROFILE],
+  # [FBP_PROFILE]). Keep off for normal training logs.
+  VERL_STEP_PROFILE: "0"
   # Model dir for the LOGPROB_GAP diagnostic to lazily load a tokenizer and print DECODED token
   # text inline (worst token + per-token dump), instead of raw ids you'd decode by hand.
   VERL_LOGPROB_DEBUG_TOKENIZER: "/efs/data/models/Qwen3-VL-8B-Instruct"
@@ -51,10 +47,9 @@ env_vars:
   # and |A-D| is faithful. MUST match actor_rollout_ref.rollout.logprobs_mode (this run: raw_logprobs).
   VERL_LOGPROB_PROBE_LOGPROBS_MODE: "raw_logprobs"
   VERL_LOGGING_LEVEL: "DEBUG"
-  # Train-side pixel integrity self-check in resolve_image_ids (dedup consume). Prints [PIXEL_FP] for
-  # the first ~40 images: hash_match=False => store returned the WRONG image for a key (train sees a
-  # different screenshot than vLLM used at rollout); bf16_roundtrip=True => stored pixels are bf16.
-  VERL_PIXEL_FINGERPRINT: "1"
+  # Train-side pixel integrity self-check in resolve_image_ids (dedup consume).
+  # Keep off by default; enable only when chasing image-store corruption.
+  VERL_PIXEL_FINGERPRINT: "0"
   VERL_IMAGE_REF_STORAGE_MODE: "per_image"
   WANDB_API_KEY: "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"
   VERL_LOGGING_LEVEL: "DEBUG"
