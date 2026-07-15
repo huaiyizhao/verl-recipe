@@ -155,7 +155,7 @@ adv_estimator=grpo
 max_turns=${max_turns:-50}
 max_prompt_length=${max_prompt_length:-24567}
 max_response_length=${max_response_length:-4096}
-actor_lr=${actor_lr:-5e-6}
+actor_lr=${actor_lr:-1e-6}
 clip_ratio_low=${clip_ratio_low:-0.2}
 clip_ratio_high=${clip_ratio_high:-0.28}
 # turn_penalty_coef is NOT passed yet: it is not a field on verl AgentLoopConfig, so the
@@ -240,7 +240,7 @@ rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.01}
 online_filter_reward_std=${online_filter_reward_std:-True}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
