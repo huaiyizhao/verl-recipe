@@ -67,6 +67,8 @@ export WANDB_API_KEY=${WANDB_API_KEY:-}
 export RAY_USE_UVLOOP=${RAY_USE_UVLOOP:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-expandable_segments:True}}
 export VERL_TRAIN_MEM_DEBUG=${VERL_TRAIN_MEM_DEBUG:-1}
+export VERL_TRAIN_MEM_DEBUG_RANKS=${VERL_TRAIN_MEM_DEBUG_RANKS:-all}
+export VERL_TRAIN_MEM_DEBUG_MAX=${VERL_TRAIN_MEM_DEBUG_MAX:-8}
 
 # vLLM loads CUDA runtime through ctypes. If tilelang's libcudart_stub.so appears
 # before the real CUDA runtime, vLLM may crash on missing symbols such as
@@ -296,7 +298,7 @@ actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
 # Qwen3.5 Megatron currently uses BSHD/no-rmpad; packed THD is not the stable
 # path for its native multimodal/GDN stack.
-actor_use_dynamic_bsz=${actor_use_dynamic_bsz:-True}
+actor_use_dynamic_bsz=${actor_use_dynamic_bsz:-False}
 model_use_remove_padding=${model_use_remove_padding:-False}
 megatron_use_remove_padding=${megatron_use_remove_padding:-False}
 model_use_fused_kernels=${model_use_fused_kernels:-False}
@@ -428,9 +430,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.grad_offload=${megatron_grad_offload} \
     actor_rollout_ref.actor.megatron.dtype=${actor_model_dtype} \
     ++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=24 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=${megatron_sequence_parallel} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \

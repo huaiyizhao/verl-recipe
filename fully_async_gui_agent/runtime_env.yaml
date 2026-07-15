@@ -35,6 +35,11 @@ env_vars:
   VERL_TQ_IMAGE_PNG_COMPRESS_LEVEL: "1"
   VERL_TRAIN_TIMING_LOG: "1"
   VERL_TRAIN_TIMING_RANKS: "0,4,8,12"
+  # Tensor-level trainer GPU diagnostics. Each rank logs only its first few
+  # train batches/microbatches to expose BSHD padding amplification and logits size.
+  VERL_TRAIN_MEM_DEBUG: "1"
+  VERL_TRAIN_MEM_DEBUG_RANKS: "all"
+  VERL_TRAIN_MEM_DEBUG_MAX: "8"
   # Heavy custom diagnostics ([POSTPROC_PROFILE], [MATERIALIZE_PROFILE],
   # [RESOLVE_PROFILE], etc.). Keep off unless chasing a correctness bug.
   VERL_PROFILE: "0"
