@@ -301,7 +301,7 @@ model_use_remove_padding=${model_use_remove_padding:-False}
 megatron_use_remove_padding=${megatron_use_remove_padding:-False}
 model_use_fused_kernels=${model_use_fused_kernels:-False}
 model_fused_kernel_backend=${model_fused_kernel_backend:-triton}
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-50000}
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-30000}
 infer_ppo_max_token_len=${infer_ppo_max_token_len:-100000}
 
 total_train_gpus=$((trainer_nnodes * n_gpus_training))
