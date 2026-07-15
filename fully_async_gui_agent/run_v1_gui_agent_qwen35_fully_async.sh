@@ -241,6 +241,7 @@ rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
 rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
+online_filter_reward_std=${online_filter_reward_std:-True}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
@@ -295,7 +296,7 @@ actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
 # Qwen3.5 Megatron currently uses BSHD/no-rmpad; packed THD is not the stable
 # path for its native multimodal/GDN stack.
-actor_use_dynamic_bsz=${actor_use_dynamic_bsz:-False}
+actor_use_dynamic_bsz=${actor_use_dynamic_bsz:-True}
 model_use_remove_padding=${model_use_remove_padding:-False}
 megatron_use_remove_padding=${megatron_use_remove_padding:-False}
 model_use_fused_kernels=${model_use_fused_kernels:-False}
@@ -384,6 +385,9 @@ python3 -m verl.trainer.main_ppo \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     algorithm.grpo_adv_std_floor=${grpo_adv_std_floor} \
     algorithm.use_kl_in_reward=False \
+    ++algorithm.filter_groups.enable=${online_filter_reward_std} \
+    ++algorithm.filter_groups.metric=seq_reward \
+    ++algorithm.filter_groups.max_num_gen_batches=0 \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
     algorithm.rollout_correction.rollout_is=${rollout_correction_is} \

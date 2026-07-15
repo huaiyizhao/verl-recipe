@@ -192,6 +192,7 @@ rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
 rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
+online_filter_reward_std=${online_filter_reward_std:-True}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
         actor_policy_loss_mode=${actor_policy_loss_mode:-bypass_mode}
@@ -262,6 +263,18 @@ if [ "${logprob_probe_enabled}" = "True" ]; then
     echo "[LOGPROB_PROBE] enabled: dir=${VERL_LOGPROB_PROBE_DIR} min_k3=${VERL_LOGPROB_PROBE_MIN_K3}"
 fi
 
+export VERL_TQ_IMAGE_PROCESSOR_PATH=${VERL_TQ_IMAGE_PROCESSOR_PATH:-${HF_MODEL_PATH}}
+export VERL_LOGPROB_DEBUG_TOKENIZER=${VERL_LOGPROB_DEBUG_TOKENIZER:-${HF_MODEL_PATH}}
+echo "[TQ_IMAGE] processor=${VERL_TQ_IMAGE_PROCESSOR_PATH}"
+
+ray_env_args=(
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_TQ_IMAGE_PROCESSOR_PATH="'${VERL_TQ_IMAGE_PROCESSOR_PATH}'"
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGPROB_DEBUG_TOKENIZER="'${VERL_LOGPROB_DEBUG_TOKENIZER}'"
+)
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    ray_env_args+=(+ray_kwargs.ray_init.runtime_env.env_vars.LD_LIBRARY_PATH="${LD_LIBRARY_PATH}")
+fi
+
 # ================= launch =================
 # Hydra config uses `hydra.searchpath: file://verl/trainer/config` (relative to
 # CWD), and the `recipe.*` agent-loop target must be importable; both rely on
@@ -269,6 +282,7 @@ fi
 cd "${VERL_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
+    "${ray_env_args[@]}" \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=fully_async \
     trainer.v1.fully_async.num_warmup_batches=${num_warmup_batches} \
@@ -288,6 +302,9 @@ python3 -m verl.trainer.main_ppo \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     algorithm.grpo_adv_std_floor=${grpo_adv_std_floor} \
     algorithm.use_kl_in_reward=False \
+    ++algorithm.filter_groups.enable=${online_filter_reward_std} \
+    ++algorithm.filter_groups.metric=seq_reward \
+    ++algorithm.filter_groups.max_num_gen_batches=0 \
     algorithm.rollout_correction.bypass_mode=${rollout_correction_bypass_mode} \
     algorithm.rollout_correction.loss_type=${rollout_correction_loss_type} \
     algorithm.rollout_correction.rollout_is=${rollout_correction_is} \
