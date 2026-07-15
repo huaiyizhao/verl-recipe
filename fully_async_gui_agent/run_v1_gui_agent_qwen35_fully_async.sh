@@ -175,7 +175,7 @@ loss_scale_factor=${loss_scale_factor:-55}
 # V1 separate_async/fully_async assert data.train_batch_size == actor.ppo_mini_batch_size.
 # This is the consumption batch (prompt groups per trainer step) AND the unit the
 # streaming feeder dispatches into TransferQueue.
-train_prompt_bsz=${train_prompt_bsz:-24}
+train_prompt_bsz=${train_prompt_bsz:-32}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-${train_prompt_bsz}}
 n_resp_per_prompt=${n_resp_per_prompt:-8}
 total_training_steps=${total_training_steps:-100000}
@@ -193,12 +193,11 @@ trace_max_samples_per_step_per_worker=${trace_max_samples_per_step_per_worker:-n
 # warmup backlog (warmup only injects stale gs~0 prompts that age past budget).
 num_warmup_batches=${num_warmup_batches:-0}
 # Every N steps the trainer pushes new weights to the standalone rollout pool.
-# Force 1 for on-policy debugging; otherwise rollout can lag the actor between
-# sync points even when staleness_threshold=0.
-parameter_sync_step=1
-# Off-policy staleness budget (in parameter-sync units). Force 0 for on-policy
-# debugging; raise this only when intentionally measuring async throughput.
-staleness_threshold=0
+parameter_sync_step=2
+# Feeder run-ahead budget in parameter-sync units. This bounds queued prompts but is
+# not a hard sample-age filter while max_off_policy_strategy=none. With the current
+# values the budget is (1 + 1) * 2 * train_batch_size = 96 prompts.
+staleness_threshold=1
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
 # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
@@ -412,7 +411,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.clip_grad=2.0 \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_dynamic_bsz=${actor_use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile} \
@@ -430,9 +429,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.grad_offload=${megatron_grad_offload} \
     actor_rollout_ref.actor.megatron.dtype=${actor_model_dtype} \
     ++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=24 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=${megatron_sequence_parallel} \
     actor_rollout_ref.actor.freeze_vision_tower=${actor_freeze_vision_tower} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
