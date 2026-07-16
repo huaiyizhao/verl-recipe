@@ -25,7 +25,7 @@ tools:
       connect_retry_jitter_max: 8
       retry_interval: 30
       create_jitter_seconds: 5
-      max_concurrent_sessions: 128
+      max_concurrent_sessions: 160
       concurrency_limiter_name: gui_agent_desktop_env_limiter
       create_status_max_retries: 1
       create_status_retry_interval: 30

@@ -112,8 +112,8 @@ class GUIAgentLoop(AgentLoopBase):
         self.max_turns = self.rollout_config.multi_turn.max_assistant_turns or 20
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns or 20
         self.turn_penalty_coef = float(self.rollout_config.agent.get("turn_penalty_coef", 0.0) or 0.0)
-        self.keep_last_k = 3  # default; can be overridden per-task via create_kwargs
-        self.history_n = 4  # default; can be overridden per-task via create_kwargs
+        self.keep_last_k = 2  # default; can be overridden per-task via create_kwargs
+        self.history_n = 2  # historical screenshots; current screenshot is added separately
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length

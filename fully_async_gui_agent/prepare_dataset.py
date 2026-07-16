@@ -208,11 +208,11 @@ def build_row(task: dict[str, Any], index: int, system_prompt: str) -> dict[str,
     ]
 
     # ``create_kwargs`` forwarded to ``DesktopEnvTool.create()``. ``task_id``
-    # uniquely selects the task. Extra knobs (``keep_last_k_images``) are read
-    # by the agent loop / context strategy.
+    # uniquely selects the task. ``history_n`` controls how many historical
+    # screenshots the agent loop retains in addition to the current screenshot.
     create_kwargs = {
         "task_id": task_id,
-        "keep_last_k_images": 3,
+        "history_n": 2,
     }
 
     extra_info: dict[str, Any] = {

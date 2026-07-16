@@ -193,17 +193,17 @@ trace_max_samples_per_step_per_worker=${trace_max_samples_per_step_per_worker:-n
 # warmup backlog (warmup only injects stale gs~0 prompts that age past budget).
 num_warmup_batches=${num_warmup_batches:-0}
 # Every N steps the trainer pushes new weights to the standalone rollout pool.
-parameter_sync_step=2
+parameter_sync_step=4
 # Feeder run-ahead budget in parameter-sync units. This bounds queued prompts but is
 # not a hard sample-age filter while max_off_policy_strategy=none. With the current
-# values the budget is (1 + 1) * 2 * train_batch_size = 96 prompts.
+# values the budget is (1 + 1) * 4 * train_batch_size = 256 prompts.
 staleness_threshold=1
 # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-wait).
 feeder_poll_interval=${feeder_poll_interval:-1.0}
 # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
 # Rollouts are dispatched one session at a time across the worker pool; total concurrency
 # is num_workers * this. Keep it modest so a single AgentLoopWorker process isn't GIL-bound.
-max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-4}
+max_concurrent_rollouts_per_worker=${max_concurrent_rollouts_per_worker:-5}
 # Store multimodal pixel tensors as bf16 in TransferQueue (~halves their RAM footprint in the
 # storage-unit actors; the model consumes bf16 anyway). Set False to keep float32.
 # Temporarily OFF: A/B test for the train<->infer logprob gap. bf16 pixel storage is a v1-only
@@ -213,7 +213,7 @@ multimodal_storage_bf16=${multimodal_storage_bf16:-True}
 # TransferQueue total capacity in ENTRIES (rows + unique images), across all partitions/units.
 # The default (100000) is too small here and causes ring-buffer EVICTION of still-referenced images
 # -> "key ... not found in field 'image_grid_thw'" crashes. Size for the worst-case in-flight volume:
-#   overshoot_budget(~96 prompts) * n(16) * max_turns(50) * 2 (train rows + rollout_images) ~= 154k.
+#   overshoot_budget(~256 prompts) * n(8) * max_turns(50) * 2 (train rows + rollout_images) ~= 205k.
 # It's a count cap, not a preallocation, so headroom is cheap (actual RAM is bounded by the feeder
 # staleness budget, not by this number).
 tq_storage_size=${tq_storage_size:-500000}
@@ -241,7 +241,7 @@ rollout_correction_bypass_mode=${rollout_correction_bypass_mode:-True}
 rollout_correction_loss_type=${rollout_correction_loss_type:-ppo_clip}
 rollout_correction_is=${rollout_correction_is:-null}
 rollout_correction_rs=${rollout_correction_rs:-seq_mean_k3}
-rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.01}
+rollout_correction_rs_threshold=${rollout_correction_rs_threshold:-0.005}
 online_filter_reward_std=${online_filter_reward_std:-True}
 case "${rollout_correction_bypass_mode}" in
     True|true|TRUE|1)
@@ -291,7 +291,7 @@ megatron_vanilla_mbridge=${megatron_vanilla_mbridge:-True}
 # vLLM's custom all-reduce can be faster, but TP>1 may hit CUDA/custom-allreduce
 # compatibility issues on some clusters. Disable it by default for the debug recipe.
 vllm_disable_custom_all_reduce=${vllm_disable_custom_all_reduce:-False}
-rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization:-0.85}
+rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization:-0.9}
 actor_freeze_vision_tower=${actor_freeze_vision_tower:-True}
 actor_use_torch_compile=${actor_use_torch_compile:-False}
 actor_model_dtype=${actor_model_dtype:-bfloat16}
@@ -411,7 +411,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.clip_grad=2.0 \
     'actor_rollout_ref.actor.checkpoint.load_contents=["model"]' \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=${actor_use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile} \
@@ -476,7 +476,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization} \
     actor_rollout_ref.rollout.max_model_len=32768 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=65536 \
+    actor_rollout_ref.rollout.max_num_seqs=32 \
     actor_rollout_ref.rollout.disable_log_stats=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=${vllm_disable_custom_all_reduce} \
