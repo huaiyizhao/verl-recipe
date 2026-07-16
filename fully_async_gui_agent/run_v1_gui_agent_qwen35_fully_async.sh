@@ -125,7 +125,7 @@ fi
 # generating). Both must be > 0.
 #   trainer pool   -> trainer.{nnodes,n_gpus_per_node}
 #   standalone pool-> actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
-trainer_nnodes=${trainer_nnodes:-2}
+trainer_nnodes=${trainer_nnodes:-1}
 n_gpus_training=${n_gpus_training:-8}
 rollout_nnodes=${rollout_nnodes:-1}
 n_gpus_rollout=${n_gpus_rollout:-8}
@@ -319,7 +319,7 @@ echo "[MEGATRON] train_gpus=${total_train_gpus} tp=${train_tp} pp=${train_pp} cp
 
 run_timestamp=$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)
 project_name=${project_name:-v1_gui_agent_${run_timestamp}}
-experiment_name=${experiment_name:-qwen35_9b_megatron_3nodes_8rollout_16train_v1_fully_async}
+experiment_name=${experiment_name:-qwen35_9b_megatron_2nodes_8rollout_8train_v1_fully_async}
 default_local_dir=${default_local_dir:-/efs/data/rl/checkpoints/${project_name}/${experiment_name}}
 save_freq=${save_freq:-30}
 resume_mode=${resume_mode:-auto}

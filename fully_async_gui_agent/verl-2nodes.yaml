@@ -1,0 +1,123 @@
+resources:
+  # Optional; if left out, automatically pick the cheapest cloud.
+  infra: k8s
+  # 8x NVIDIA H200 GPU
+  accelerators: H200:8
+  memory: 1800+
+  cpus: 184+
+  image_id: verlai/verl:vllm023.dev1
+
+num_nodes: 2
+
+envs:
+  VERL_ROLLOUT_NODE_RESOURCE: rollout_node
+  VERL_TRAIN_NODE_RESOURCE: train_node
+
+# Working directory containing the project codebase. Its contents are synced to
+# ~/sky_workdir/ on the cluster.
+workdir: .
+
+setup: |
+  echo "Setup"
+
+  cd && git clone https://github.com/huaiyizhao/verl/
+  cd ~/verl
+  git checkout v1-gui-agent
+  pip3 install Transferqueue
+  pip3 install cupy-cuda13x
+  pip3 install mlflow-skinny
+  pip3 install flash-linear-attention
+  pip3 install --no-deps -e .
+
+  git clone https://github.com/huaiyizhao/verl-recipe recipe
+  cd ~/verl/recipe
+  git checkout v1-gui-agent
+
+  sudo tee /etc/apt/sources.list.d/ubuntu.sources > /dev/null <<EOF
+  Types: deb
+  URIs: http://archive.ubuntu.com/ubuntu/
+  Suites: noble noble-updates noble-backports
+  Components: main restricted universe multiverse
+  Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+  Types: deb
+  URIs: http://security.ubuntu.com/ubuntu/
+  Suites: noble-security
+  Components: main restricted universe multiverse
+  Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+  EOF
+
+  apt-get update
+  apt-get install -y iproute2 ethtool dmidecode udev libudev-dev lsb-release
+  curl -O https://s3-us-west-2.amazonaws.com/aws-efa-installer/aws-efa-installer-latest.tar.gz \
+    && tar -xf aws-efa-installer-latest.tar.gz \
+    && cd aws-efa-installer \
+    && ./efa_installer.sh -y --skip-kmod --no-verify \
+    && cd .. \
+    && rm -rf aws-efa-installer*
+
+run: |
+  set -xeuo pipefail
+
+  # Raise the FD limit before Ray starts. Raylet and workers inherit it.
+  ulimit -n 1048576 || true
+
+  # Ray / gRPC SIGABRT mitigation.
+  export RAY_RAYLET_ULIMIT_NOFILE=1048576
+  export GRPC_POLL_STRATEGY=poll
+  export GRPC_VERBOSITY=ERROR
+  export RAY_task_events_report_interval_ms=10000
+  export RAY_task_events_max_num_status_events_buffer_on_worker=1024
+
+  echo "driver nofile before ray start:"
+  ulimit -n
+
+  # Defensive head-IP resolution.
+  head_ip=${SKYPILOT_HEAD_IP:-""}
+  num_nodes=2
+  if [ -z "$head_ip" ]; then
+    echo "Error: SKYPILOT_HEAD_IP is empty, falling back to parsing..."
+    head_ip=$(echo "$SKYPILOT_NODE_IPS" | head -n1 | tr -d '[:space:]')
+  fi
+  echo "Resolved Head IP: $head_ip"
+
+  # Disaggregated role assignment:
+  #   rank 0 -> Ray head and trainer node
+  #   rank 1 -> standalone rollout node
+  if [ "$SKYPILOT_NODE_RANK" = "1" ]; then
+    NODE_RES='{"rollout_node": 100}'
+    NODE_ROLE=rollout
+  else
+    NODE_RES='{"train_node": 100}'
+    NODE_ROLE=train
+  fi
+  OBJ_STORE=200000000000  # 200 GB on both nodes
+
+  if [ "$SKYPILOT_NODE_RANK" = "0" ]; then
+    echo "Starting Ray head node ($NODE_ROLE, $NODE_RES, object-store=$OBJ_STORE)..."
+    ray start --head --disable-usage-stats \
+          --port=6379 \
+          --dashboard-host=0.0.0.0 \
+          --dashboard-port=8265 \
+          --dashboard-agent-listen-port=52366 \
+          --dashboard-agent-grpc-port=52367 \
+          --min-worker-port=10002 --max-worker-port=19999 \
+          --resources="$NODE_RES" \
+          --object-store-memory=$OBJ_STORE
+
+    while [ $(RAY_ADDRESS='127.0.0.1:6379' ray status 2>/dev/null | grep -c "node_") -lt $num_nodes ]; do
+      current=$(RAY_ADDRESS='127.0.0.1:6379' ray status 2>/dev/null | grep -c "node_")
+      echo "Waiting for all nodes to join (Custom Cluster 6379)... ($current/$num_nodes)"
+      sleep 5
+    done
+  else
+    sleep 10
+    echo "Starting Ray worker node (rank=$SKYPILOT_NODE_RANK, $NODE_ROLE, $NODE_RES, object-store=$OBJ_STORE)..."
+    ps aux | grep ray | grep "$head_ip:6379" &> /dev/null || ray start --address "$head_ip:6379" --disable-usage-stats \
+          --dashboard-agent-listen-port=52366 \
+          --dashboard-agent-grpc-port=52367 \
+          --min-worker-port=10002 --max-worker-port=19999 \
+          --resources="$NODE_RES" \
+          --object-store-memory=$OBJ_STORE
+    sleep 5
+  fi
